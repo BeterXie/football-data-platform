@@ -128,6 +128,31 @@ def test_cli_golden_failure_reports_failed_run_manifest(tmp_path: Path, capsys) 
     assert payload["checkpoint"] == "before-completion"
 
 
+def test_cli_missing_registry_still_persists_failed_run_manifest(tmp_path: Path, capsys) -> None:
+    data_root = tmp_path / "data"
+    missing_registry = tmp_path / "missing-registry.toml"
+
+    assert (
+        main(
+            [
+                "init",
+                "--data-root",
+                str(data_root),
+                "--registry",
+                str(missing_registry),
+            ]
+        )
+        == 1
+    )
+
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["status"] == "failed"
+    manifest = DerivedArchive(DataLayout(data_root)).load_run_manifest(payload["run_id"])
+    assert manifest.status == "failed"
+    assert manifest.checkpoint == "operation-failed"
+    assert f"missing-file:{missing_registry.resolve()}" in manifest.input_refs
+
+
 def test_cli_fetch_failure_archives_empty_body_and_counts_only_new_attempts(
     tmp_path: Path,
     capsys,
