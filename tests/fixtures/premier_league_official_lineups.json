@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "source": "golden-official-lineup-fixture",
+  "schedule_published_at": "2025-06-18T08:00:00Z",
+  "published_at": "2025-08-23T12:55:00Z",
+  "teams": [
+    {
+      "source_team_id": "cff3d9bb",
+      "starters": [
+        {"source_player_id": "chelsea01", "name": "Chelsea Player 01"},
+        {"source_player_id": "chelsea02", "name": "Chelsea Player 02"},
+        {"source_player_id": "chelsea03", "name": "Chelsea Player 03"},
+        {"source_player_id": "chelsea04", "name": "Chelsea Player 04"},
+        {"source_player_id": "chelsea05", "name": "Chelsea Player 05"},
+        {"source_player_id": "chelsea06", "name": "Chelsea Player 06"},
+        {"source_player_id": "chelsea07", "name": "Chelsea Player 07"},
+        {"source_player_id": "chelsea08", "name": "Chelsea Player 08"},
+        {"source_player_id": "chelsea09", "name": "Chelsea Player 09"},
+        {"source_player_id": "chelsea10", "name": "Chelsea Player 10"},
+        {"source_player_id": "chelsea11", "name": "Chelsea Player 11"}
+      ]
+    },
+    {
+      "source_team_id": "18bb7c10",
+      "starters": [
+        {"source_player_id": "arsenal01", "name": "Arsenal Player 01"},
+        {"source_player_id": "arsenal02", "name": "Arsenal Player 02"},
+        {"source_player_id": "arsenal03", "name": "Arsenal Player 03"},
+        {"source_player_id": "arsenal04", "name": "Arsenal Player 04"},
+        {"source_player_id": "arsenal05", "name": "Arsenal Player 05"},
+        {"source_player_id": "arsenal06", "name": "Arsenal Player 06"},
+        {"source_player_id": "arsenal07", "name": "Arsenal Player 07"},
+        {"source_player_id": "arsenal08", "name": "Arsenal Player 08"},
+        {"source_player_id": "arsenal09", "name": "Arsenal Player 09"},
+        {"source_player_id": "arsenal10", "name": "Arsenal Player 10"},
+        {"source_player_id": "arsenal11", "name": "Arsenal Player 11"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+"""Rebuildable static reports."""

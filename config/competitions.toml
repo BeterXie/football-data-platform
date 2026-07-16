@@ -1,0 +1,26 @@
+schema_version = 1
+
+[[competitions]]
+id = "competition:eng.1"
+name = "Premier League"
+country_code = "ENG"
+kind = "domestic_league"
+timezone = "Europe/London"
+
+[[competitions.seasons]]
+id = "season:eng.1.2025-26"
+label = "2025-26"
+starts_on = 2025-08-15
+ends_on = 2026-05-24
+expected_teams = 20
+expected_matches = 380
+
+[[competitions.seasons.sources]]
+source = "fbref"
+competition_id = "9"
+season_id = "2025-2026"
+
+[[competitions.seasons.sources]]
+source = "football-data"
+competition_id = "E0"
+season_id = "2526"
