@@ -5,6 +5,8 @@ from pathlib import Path
 
 from football_data_platform.config import load_competition_registry
 from football_data_platform.pipelines.results_backfill import ingest_results_backfill
+from football_data_platform.pipelines.schedule import ingest_fbref_schedule
+from football_data_platform.sources.fbref import schedule_url
 from football_data_platform.sources.football_data_csv import (
     parse_results_csv,
     results_url,
@@ -68,3 +70,40 @@ def test_results_backfill_is_raw_first_and_idempotent(tmp_path: Path) -> None:
     with canonical.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM match_results_90").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM fact_evidence").fetchone()[0] == 4
+
+
+def test_football_data_reuses_fbref_teams_and_matches(tmp_path: Path) -> None:
+    registry, competition, season = _registration()
+    layout = DataLayout(tmp_path / "data")
+    archive = RawArchive(layout)
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    canonical.initialize()
+    canonical.register_registry(registry, registered_at=OBSERVED_AT)
+    schedule = ingest_fbref_schedule(
+        (ROOT / "tests/fixtures/fbref_premier_league_schedule.html").read_bytes(),
+        page_url=schedule_url(competition, season),
+        competition=competition,
+        season=season,
+        observed_at=OBSERVED_AT,
+        archive=archive,
+        canonical=canonical,
+    )
+    before = canonical.counts()
+    content = (
+        b"Div,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        b"E0,15/08/2025,20:00,Arsenal,Chelsea,2,1,H\n"
+        b"E0,23/08/2025,15:00,Chelsea,Arsenal,1,1,D\n"
+    )
+
+    backfill = ingest_results_backfill(
+        content,
+        page_url=results_url(season),
+        competition=competition,
+        season=season,
+        observed_at=OBSERVED_AT.replace(minute=5),
+        archive=archive,
+        canonical=canonical,
+    )
+
+    assert canonical.counts() == before
+    assert backfill.canonical_match_ids == schedule.canonical_match_ids

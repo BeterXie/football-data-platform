@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.models import MatchStatus
+from football_data_platform.domain.ids import MatchId
+from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus
 from football_data_platform.pipelines.schedule import (
     assess_season_coverage,
     ingest_fbref_schedule,
@@ -110,10 +112,74 @@ def test_schedule_pipeline_archives_before_normalizing_and_replays_idempotently(
     assert first.coverage.actual_matches == 2
     assert len(first.coverage.missing_collection_attempts) == 2
 
+    canonical.record_collection_attempt(
+        match_id=MatchId(first.canonical_match_ids[0]),
+        source="football-data-results",
+        target_url="https://football-data.example/results.csv",
+        outcome=CollectionAttemptOutcome.BLOCKED,
+        observed_at=OBSERVED_AT,
+        collector_version="football-data-results/test",
+        diagnostic_code="network_error",
+    )
+    wrong_source_attempt = assess_season_coverage(
+        first.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+    )
+    assert len(wrong_source_attempt.missing_collection_attempts) == 2
 
-def test_premier_league_season_gate_requires_20_teams_380_matches_and_attempts() -> None:
+    for fixture, match_id in zip(first.parsed.matches, first.canonical_match_ids, strict=True):
+        canonical.record_collection_attempt(
+            match_id=MatchId(match_id),
+            source="fbref-match-report",
+            target_url=fixture.report_url or f"https://fbref.example/{fixture.source_fixture_id}",
+            outcome=CollectionAttemptOutcome.BLOCKED,
+            observed_at=OBSERVED_AT,
+            collector_version="fbref-match-report/test",
+            diagnostic_code="blocked_by_access_control",
+        )
+    persisted_attempts = assess_season_coverage(
+        first.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+    )
+    assert persisted_attempts.missing_collection_attempts == ()
+
+
+def test_round_change_keeps_match_identity_and_adds_version(tmp_path: Path) -> None:
+    registry, competition, season = _registration()
+    content = (ROOT / "tests/fixtures/fbref_premier_league_schedule.html").read_bytes()
+    changed_round = content.replace(b"Matchweek 1", b"Matchweek 9")
+    layout = DataLayout(tmp_path / "data")
+    archive = RawArchive(layout)
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    canonical.initialize()
+    canonical.register_registry(registry, registered_at=OBSERVED_AT)
+    arguments = {
+        "page_url": schedule_url(competition, season),
+        "competition": competition,
+        "season": season,
+        "archive": archive,
+        "canonical": canonical,
+    }
+
+    first = ingest_fbref_schedule(content, observed_at=OBSERVED_AT, **arguments)
+    second = ingest_fbref_schedule(
+        changed_round,
+        observed_at=OBSERVED_AT.replace(minute=5),
+        **arguments,
+    )
+
+    assert second.canonical_match_ids == first.canonical_match_ids
+    versions = canonical.match_versions(MatchId(first.canonical_match_ids[0]))
+    assert [version.round_name for version in versions] == ["Matchweek 1", "Matchweek 9"]
+
+
+def test_premier_league_season_gate_rejects_unpersisted_attempt_ids() -> None:
     _, _, season = _registration()
-    team_ids = [f"team-{index:02d}" for index in range(20)]
+    team_ids = [team.source("fbref").source_id for team in season.teams]
     matches = []
     match_number = 0
     for home_index, home in enumerate(team_ids):
@@ -140,18 +206,64 @@ def test_premier_league_season_gate_requires_20_teams_380_matches_and_attempts()
     parsed = ScheduleParseResult(tuple(matches), (), rows_seen=380)
     fixture_ids = {match.source_fixture_id for match in matches}
 
-    complete = assess_season_coverage(
+    unverified_attempts = assess_season_coverage(
         parsed,
         season,
         attempted_fixture_ids=fixture_ids,
     )
-    missing_attempt = assess_season_coverage(
-        parsed,
+
+    assert unverified_attempts.schedule_complete
+    assert not unverified_attempts.complete
+    assert len(unverified_attempts.missing_collection_attempts) == 380
+
+    fake_ids = {team_id: f"unregistered-{index:02d}" for index, team_id in enumerate(team_ids)}
+    unregistered = assess_season_coverage(
+        ScheduleParseResult(
+            tuple(
+                replace(
+                    match,
+                    home_source_id=fake_ids[match.home_source_id],
+                    away_source_id=fake_ids[match.away_source_id],
+                )
+                for match in matches
+            ),
+            (),
+            rows_seen=380,
+        ),
         season,
-        attempted_fixture_ids=fixture_ids - {"fixture-001"},
+        source="fbref",
+    )
+    assert not unregistered.schedule_complete
+    assert len(unregistered.unregistered_team_ids) == 20
+    assert len(unregistered.missing_registered_teams) == 20
+
+
+def test_premier_league_season_gate_rejects_380_rows_with_only_10_matchups() -> None:
+    _, _, season = _registration()
+    team_ids = [team.source("fbref").source_id for team in season.teams]
+    matchups = [(team_ids[index], team_ids[(index + 1) % 20]) for index in range(10)]
+    matches = tuple(
+        ScheduleMatch(
+            source_fixture_id=f"fixture-{index:03d}",
+            source_match_id=f"report-{index:03d}",
+            round_name=f"Matchweek {index // 10 + 1}",
+            kickoff_at=OBSERVED_AT,
+            home_source_id=matchups[index % len(matchups)][0],
+            home_name=matchups[index % len(matchups)][0],
+            away_source_id=matchups[index % len(matchups)][1],
+            away_name=matchups[index % len(matchups)][1],
+            status=MatchStatus.FINISHED,
+            home_goals=1,
+            away_goals=0,
+            report_url=f"https://fbref.example/matches/{index:03d}",
+        )
+        for index in range(380)
     )
 
-    assert complete.schedule_complete
-    assert complete.complete
-    assert not missing_attempt.complete
-    assert missing_attempt.missing_collection_attempts == ("fixture-001",)
+    coverage = assess_season_coverage(
+        ScheduleParseResult(matches, (), rows_seen=380),
+        season,
+    )
+
+    assert not coverage.schedule_complete
+    assert "duplicate_directed_matchups" in coverage.structural_violations

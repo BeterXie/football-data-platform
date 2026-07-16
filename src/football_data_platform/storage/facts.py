@@ -12,9 +12,19 @@ from typing import Any
 from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.lifecycle import (
     MatchAvailability,
+    PlayerObservationAvailability,
     SnapshotAvailability,
 )
 from football_data_platform.domain.models import MatchStatus, require_utc
+from football_data_platform.domain.predictions import MatchResult90
+from football_data_platform.sources.prematch import (
+    NewsEvidenceDTO,
+    OfficialLineupDTO,
+    PrematchEventDTO,
+    SourceKind,
+    SourceRegistry,
+    classify_confirmation,
+)
 from football_data_platform.storage.canonical import CanonicalStore
 
 
@@ -25,8 +35,14 @@ class StoredFact:
 
 
 class CanonicalFactStore:
-    def __init__(self, canonical: CanonicalStore) -> None:
+    def __init__(
+        self,
+        canonical: CanonicalStore,
+        *,
+        source_registry: SourceRegistry | None = None,
+    ) -> None:
         self.canonical = canonical
+        self.source_registry = source_registry or SourceRegistry()
 
     def append_result_90(
         self,
@@ -41,6 +57,13 @@ class CanonicalFactStore:
     ) -> StoredFact:
         if home_goals < 0 or away_goals < 0:
             raise ValueError("goals must be non-negative")
+        with self.canonical.connect() as connection:
+            _require_match_version(
+                connection,
+                match_id=match_id,
+                match_version=match_version,
+                require_finished=True,
+            )
         payload = {
             "match_id": match_id.value,
             "match_version": match_version,
@@ -56,6 +79,31 @@ class CanonicalFactStore:
             scope={"match_id": match_id.value, "match_version": match_version},
         )
 
+    def verify_match_result(self, result: MatchResult90) -> None:
+        """Verify a settlement result against one immutable canonical fact."""
+
+        if not isinstance(result, MatchResult90):
+            raise TypeError("result must be a MatchResult90")
+        with self.canonical.connect() as connection:
+            row = connection.execute(
+                "SELECT m.record_id, m.match_id, m.home_goals, m.away_goals, "
+                "m.known_at, e.record_id AS evidence_record_id "
+                "FROM match_results_90 AS m "
+                "JOIN raw_assets AS r ON r.raw_asset_id = m.raw_asset_id "
+                "LEFT JOIN fact_evidence AS e ON e.record_id = m.record_id "
+                "WHERE m.record_id = ?",
+                (result.source_ref,),
+            ).fetchone()
+        if row is None or row["evidence_record_id"] != result.source_ref:
+            raise ValueError("result source_ref does not identify a canonical fact")
+        if (
+            row["match_id"] != result.match_id.value
+            or int(row["home_goals"]) != result.home_goals
+            or int(row["away_goals"]) != result.away_goals
+            or _parse_timestamp(row["known_at"]) != result.known_at
+        ):
+            raise ValueError("result does not match its canonical fact")
+
     def append_team_observation(
         self,
         *,
@@ -68,6 +116,14 @@ class CanonicalFactStore:
         raw_asset_id: RawAssetId,
     ) -> StoredFact:
         _validate_metrics(stats, "stats")
+        with self.canonical.connect() as connection:
+            match_row = _require_match_version(
+                connection,
+                match_id=match_id,
+                match_version=match_version,
+                require_finished=True,
+            )
+            _require_match_team(match_row, team_id)
         payload = {
             "match_id": match_id.value,
             "match_version": match_version,
@@ -104,6 +160,22 @@ class CanonicalFactStore:
         if not math.isfinite(minutes) or minutes < 0:
             raise ValueError("minutes must be finite and non-negative")
         _validate_metrics(metrics, "metrics")
+        with self.canonical.connect() as connection:
+            match_row = _require_match_version(
+                connection,
+                match_id=match_id,
+                match_version=match_version,
+                require_finished=True,
+            )
+            _require_match_team(match_row, team_id)
+            _require_registered_player(connection, player_id)
+            _require_player_assignment(
+                connection,
+                match_id=match_id,
+                match_version=match_version,
+                player_id=player_id,
+                team_id=team_id,
+            )
         payload = {
             "match_id": match_id.value,
             "match_version": match_version,
@@ -141,6 +213,7 @@ class CanonicalFactStore:
     ) -> StoredFact:
         if lineup_role not in {"starter", "bench"}:
             raise ValueError("lineup_role must be starter or bench")
+        _require_temporal_order(known_at, observed_at)
         payload = {
             "match_id": match_id.value,
             "match_version": match_version,
@@ -152,26 +225,22 @@ class CanonicalFactStore:
             "observed_at": _timestamp(observed_at),
             "raw_asset_id": raw_asset_id.value,
         }
-        record_id = _record_id("lineup", _semantic_payload(payload))
         with self.canonical.connect() as connection:
-            _require_temporal_order(known_at, observed_at)
-            existing = connection.execute(
-                "SELECT record_id FROM lineup_facts WHERE record_id = ?", (record_id,)
-            ).fetchone()
-            if existing is None:
-                columns = ", ".join(("record_id", *payload.keys()))
-                placeholders = ", ".join("?" for _ in range(len(payload) + 1))
-                connection.execute(
-                    f"INSERT INTO lineup_facts({columns}) VALUES ({placeholders})",
-                    (record_id, *payload.values()),
-                )
-            _link_evidence(
+            match_row = _require_match_version(
                 connection,
-                record_id=record_id,
-                raw_asset_id=raw_asset_id.value,
-                observed_at=payload["observed_at"],
+                match_id=match_id,
+                match_version=match_version,
             )
-        return StoredFact(record_id, None)
+            _require_match_team(match_row, team_id)
+            _require_registered_player(connection, player_id)
+            _require_player_assignment(
+                connection,
+                match_id=match_id,
+                match_version=match_version,
+                player_id=player_id,
+                team_id=team_id,
+            )
+            return _insert_lineup_payload(connection, payload)
 
     def add_news_evidence(
         self,
@@ -183,7 +252,29 @@ class CanonicalFactStore:
         observed_at: datetime,
         raw_asset_id: RawAssetId,
     ) -> StoredFact:
+        _require_text(source, "source")
+        _require_text(url, "url")
+        _require_text(title, "title")
         _require_temporal_order(published_at, observed_at)
+        self.source_registry.validate_url(source, url)
+        with self.canonical.connect() as connection:
+            raw = connection.execute(
+                "SELECT source, url, observed_at FROM raw_assets WHERE raw_asset_id = ?",
+                (raw_asset_id.value,),
+            ).fetchone()
+            if raw is None:
+                raise KeyError(f"raw asset {raw_asset_id} is not registered")
+            if raw["observed_at"] != _timestamp(observed_at):
+                raise ValueError("news observed_at must match the raw archive observation")
+            descriptor = self.source_registry.get(source)
+            if descriptor is not None and raw["source"] != source:
+                message = (
+                    f"raw asset source {raw['source']!r} does not match "
+                    f"registered source {source!r}"
+                )
+                raise ValueError(message)
+            if descriptor is not None and raw["url"] != url:
+                raise ValueError("news URL does not match the registered raw archive")
         payload = {
             "source": source,
             "url": url,
@@ -196,6 +287,18 @@ class CanonicalFactStore:
         self._insert_unversioned("news_evidence", record_id, payload)
         return StoredFact(record_id, None)
 
+    def add_news_evidence_dto(self, evidence: NewsEvidenceDTO) -> StoredFact:
+        """Persist a parser-produced news DTO while retaining its raw asset reference."""
+
+        return self.add_news_evidence(
+            source=evidence.source,
+            url=evidence.url,
+            title=evidence.title,
+            published_at=evidence.published_at,
+            observed_at=evidence.observed_at,
+            raw_asset_id=evidence.raw_asset_id,
+        )
+
     def add_prematch_event(
         self,
         *,
@@ -205,17 +308,59 @@ class CanonicalFactStore:
         event_type: str,
         occurred_at: datetime | None,
         known_at: datetime,
-        confirmation_status: str,
-        evidence_refs: tuple[str, ...],
+        confirmation_status: str | None = None,
+        evidence_refs: tuple[str, ...] = (),
+        as_of: datetime | None = None,
     ) -> StoredFact:
-        if confirmation_status not in {"official", "corroborated", "unconfirmed"}:
-            raise ValueError("invalid confirmation_status")
         require_utc(known_at, "known_at")
+        if as_of is not None:
+            require_utc(as_of, "as_of")
+            if known_at > as_of:
+                raise ValueError("known_at cannot be later than as_of")
         if occurred_at is not None:
             require_utc(occurred_at, "occurred_at")
+            if occurred_at > known_at:
+                raise ValueError("occurred_at cannot be later than known_at")
         if not evidence_refs:
             raise ValueError("pre-match events require evidence")
-        can_modify = confirmation_status in {"official", "corroborated"}
+        unique_refs = tuple(dict.fromkeys(evidence_refs))
+        if any(not isinstance(ref, str) or not ref for ref in unique_refs):
+            raise ValueError("pre-match event evidence references must be non-empty text")
+        with self.canonical.connect() as connection:
+            placeholders = ",".join("?" for _ in unique_refs)
+            evidence_rows = connection.execute(
+                "SELECT n.record_id, n.source, n.published_at, n.observed_at, n.raw_asset_id "
+                "FROM news_evidence AS n JOIN raw_assets AS r "
+                "ON r.raw_asset_id = n.raw_asset_id "
+                f"WHERE n.record_id IN ({placeholders})",
+                unique_refs,
+            ).fetchall()
+            if len(evidence_rows) != len(unique_refs):
+                raise KeyError("pre-match event references unknown news evidence")
+            latest_evidence_time = max(
+                max(_parse_timestamp(row["published_at"]), _parse_timestamp(row["observed_at"]))
+                for row in evidence_rows
+            )
+            if known_at < latest_evidence_time:
+                raise ValueError("known_at cannot precede supporting evidence")
+            confirmation_status = classify_confirmation(
+                tuple(row["source"] for row in evidence_rows),
+                self.source_registry,
+                requested=confirmation_status,
+            )
+            match_row = _require_match(connection, match_id)
+            if team_id is not None:
+                _require_match_team(match_row, team_id)
+            if player_id is not None:
+                _require_registered_player(connection, player_id)
+                if team_id is not None:
+                    _require_player_assignment(
+                        connection,
+                        match_id=match_id,
+                        match_version=None,
+                        player_id=player_id,
+                        team_id=team_id,
+                    )
         payload = {
             "match_id": match_id.value,
             "team_id": team_id.value if team_id is not None else None,
@@ -224,27 +369,93 @@ class CanonicalFactStore:
             "occurred_at": _timestamp(occurred_at) if occurred_at is not None else None,
             "known_at": _timestamp(known_at),
             "confirmation_status": confirmation_status,
-            "evidence_refs_json": _json_text(sorted(set(evidence_refs))),
-            "can_modify_features": int(can_modify),
+            "evidence_refs_json": _json_text(sorted(unique_refs)),
+            "can_modify_features": int(confirmation_status in {"official", "corroborated"}),
         }
         record_id = _record_id("prematch-event", payload)
-        with self.canonical.connect() as connection:
-            found = connection.execute(
-                "SELECT COUNT(*) FROM news_evidence WHERE record_id IN "
-                f"({','.join('?' for _ in evidence_refs)})",
-                evidence_refs,
-            ).fetchone()[0]
-            if found != len(set(evidence_refs)):
-                raise KeyError("pre-match event references unknown news evidence")
         self._insert_unversioned("prematch_events", record_id, payload)
         return StoredFact(record_id, None)
+
+    def add_prematch_event_dto(self, event: PrematchEventDTO) -> StoredFact:
+        """Persist an event after recalculating confirmation from canonical evidence."""
+
+        return self.add_prematch_event(
+            match_id=event.match_id,
+            team_id=event.team_id,
+            player_id=event.player_id,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+            known_at=event.known_at,
+            confirmation_status=event.requested_confirmation_status or "unconfirmed",
+            evidence_refs=event.evidence_refs,
+            as_of=event.as_of,
+        )
+
+    def append_official_lineup(self, lineup: OfficialLineupDTO) -> tuple[StoredFact, ...]:
+        """Write an official starting XI only when its source is registry-verified."""
+
+        descriptor = self.source_registry.get(lineup.source)
+        if descriptor is None or not descriptor.official:
+            raise ValueError(f"lineup source {lineup.source!r} is not a verified official source")
+        if descriptor.kind is not SourceKind.OFFICIAL_LINEUP:
+            raise ValueError(f"source {lineup.source!r} is not an official-lineup adapter")
+        if lineup.url is not None:
+            self.source_registry.validate_url(lineup.source, lineup.url)
+        with self.canonical.connect() as connection:
+            raw = connection.execute(
+                "SELECT source, url, observed_at FROM raw_assets WHERE raw_asset_id = ?",
+                (lineup.raw_asset_id.value,),
+            ).fetchone()
+            if raw is None:
+                raise KeyError(f"raw asset {lineup.raw_asset_id} is not registered")
+            if raw["observed_at"] != _timestamp(lineup.observed_at):
+                raise ValueError("lineup observed_at must match the raw archive observation")
+            if raw["source"] != lineup.source:
+                raise ValueError("lineup source does not match the raw archive")
+            if lineup.url is not None and raw["url"] != lineup.url:
+                raise ValueError("lineup URL does not match the raw archive")
+            match_row = _require_match_version(
+                connection,
+                match_id=lineup.match_id,
+                match_version=lineup.match_version,
+            )
+            _require_match_team(match_row, lineup.team_id)
+            _require_temporal_order(lineup.published_at, lineup.observed_at)
+            for player_id in lineup.player_ids:
+                _require_registered_player(connection, player_id)
+                _require_player_assignment(
+                    connection,
+                    match_id=lineup.match_id,
+                    match_version=lineup.match_version,
+                    player_id=player_id,
+                    team_id=lineup.team_id,
+                )
+            payloads = [
+                {
+                    "match_id": lineup.match_id.value,
+                    "match_version": lineup.match_version,
+                    "team_id": lineup.team_id.value,
+                    "player_id": player_id.value,
+                    "lineup_role": "starter",
+                    "official": 1,
+                    "known_at": _timestamp(lineup.published_at),
+                    "observed_at": _timestamp(lineup.observed_at),
+                    "raw_asset_id": lineup.raw_asset_id.value,
+                }
+                for player_id in lineup.player_ids
+            ]
+            return tuple(_insert_lineup_payload(connection, payload) for payload in payloads)
 
     def availability(
         self,
         match_id: MatchId,
         *,
         snapshots: tuple[SnapshotAvailability, ...] = (),
+        as_of: datetime | None = None,
     ) -> MatchAvailability:
+        if as_of is not None:
+            require_utc(as_of, "as_of")
+        as_of_text = _timestamp(as_of) if as_of is not None else None
         with self.canonical.connect() as connection:
             match = connection.execute(
                 "SELECT home_team_id, away_team_id FROM matches WHERE match_id = ?",
@@ -252,46 +463,82 @@ class CanonicalFactStore:
             ).fetchone()
             if match is None:
                 raise KeyError(f"match {match_id} does not exist")
-            version = connection.execute(
-                "SELECT version, status FROM match_versions WHERE match_id = ? "
-                "ORDER BY version DESC LIMIT 1",
-                (match_id.value,),
-            ).fetchone()
+            version_query = "SELECT version, status FROM match_versions WHERE match_id = ?"
+            version_parameters: list[object] = [match_id.value]
+            if as_of_text is not None:
+                version_query += " AND observed_at <= ?"
+                version_parameters.append(as_of_text)
+            version_query += " ORDER BY version DESC LIMIT 1"
+            version = connection.execute(version_query, tuple(version_parameters)).fetchone()
             if version is None:
-                raise KeyError(f"match {match_id} has no versions")
-            result_present = (
-                connection.execute(
-                    "SELECT 1 FROM match_results_90 WHERE match_id = ? AND match_version = ? "
-                    "LIMIT 1",
-                    (match_id.value, version["version"]),
-                ).fetchone()
-                is not None
+                suffix = " by as_of" if as_of_text is not None else ""
+                raise KeyError(f"match {match_id} has no versions{suffix}")
+            result_query = (
+                "SELECT known_at FROM match_results_90 WHERE match_id = ? AND match_version = ?"
             )
-            team_stats_rows = connection.execute(
-                "SELECT team_id, stats_json FROM team_match_observations WHERE match_id = ? "
-                "AND match_version = ? ORDER BY observation_version DESC",
-                (match_id.value, version["version"]),
-            ).fetchall()
+            result_parameters: list[object] = [match_id.value, version["version"]]
+            if as_of_text is not None:
+                result_query += " AND known_at <= ?"
+                result_parameters.append(as_of_text)
+            result_query += " ORDER BY observation_version DESC LIMIT 1"
+            result_row = connection.execute(result_query, tuple(result_parameters)).fetchone()
+            result_present = result_row is not None
+            result_known_at = _parse_timestamp(result_row["known_at"]) if result_row else None
+            team_query = (
+                "SELECT team_id, stats_json, known_at FROM team_match_observations "
+                "WHERE match_id = ? AND match_version = ?"
+            )
+            team_parameters: list[object] = [match_id.value, version["version"]]
+            if as_of_text is not None:
+                team_query += " AND known_at <= ?"
+                team_parameters.append(as_of_text)
+            team_query += " ORDER BY observation_version DESC"
+            team_stats_rows = connection.execute(team_query, tuple(team_parameters)).fetchall()
             team_fields: dict[str, frozenset[str]] = {}
+            team_stats_known_at: dict[str, datetime] = {}
             for row in team_stats_rows:
                 if row["team_id"] not in team_fields:
                     values = json.loads(row["stats_json"])
                     team_fields[row["team_id"]] = frozenset(
                         key for key, value in values.items() if value is not None
                     )
-            lineup_rows = connection.execute(
+                    team_stats_known_at[row["team_id"]] = _parse_timestamp(row["known_at"])
+            lineup_query = (
                 "SELECT team_id, player_id FROM lineup_facts WHERE match_id = ? AND "
-                "match_version = ? AND lineup_role = 'starter' AND official = 1",
-                (match_id.value, version["version"]),
-            ).fetchall()
+                "match_version = ? AND lineup_role = 'starter' AND official = 1"
+            )
+            lineup_parameters: list[object] = [match_id.value, version["version"]]
+            if as_of_text is not None:
+                lineup_query += " AND known_at <= ?"
+                lineup_parameters.append(as_of_text)
+            lineup_rows = connection.execute(lineup_query, tuple(lineup_parameters)).fetchall()
             starters: dict[str, set[str]] = {}
             for row in lineup_rows:
                 starters.setdefault(row["team_id"], set()).add(row["player_id"])
-            player_rows = connection.execute(
-                "SELECT DISTINCT player_id FROM player_match_observations WHERE match_id = ? "
-                "AND match_version = ?",
-                (match_id.value, version["version"]),
-            ).fetchall()
+            player_query = (
+                "SELECT player_id, team_id, role, minutes, metrics_json, known_at "
+                "FROM player_match_observations WHERE match_id = ? AND match_version = ?"
+            )
+            player_parameters: list[object] = [match_id.value, version["version"]]
+            if as_of_text is not None:
+                player_query += " AND known_at <= ?"
+                player_parameters.append(as_of_text)
+            player_query += " ORDER BY observation_version DESC"
+            player_rows = connection.execute(player_query, tuple(player_parameters)).fetchall()
+            player_observations: dict[str, PlayerObservationAvailability] = {}
+            for row in player_rows:
+                if row["player_id"] in player_observations:
+                    continue
+                metrics = json.loads(row["metrics_json"])
+                player_observations[row["player_id"]] = PlayerObservationAvailability(
+                    team_id=row["team_id"],
+                    role=row["role"],
+                    minutes=float(row["minutes"]),
+                    metric_fields=frozenset(
+                        key for key, value in metrics.items() if value is not None
+                    ),
+                    known_at=_parse_timestamp(row["known_at"]),
+                )
         return MatchAvailability(
             match_status=MatchStatus(version["status"]),
             team_ids=(match["home_team_id"], match["away_team_id"]),
@@ -299,7 +546,13 @@ class CanonicalFactStore:
             result_90_present=result_present,
             team_stat_fields=team_fields,
             starters={team_id: frozenset(players) for team_id, players in starters.items()},
-            player_observation_ids=frozenset(row["player_id"] for row in player_rows),
+            player_observation_ids=frozenset(player_observations),
+            match_id=match_id.value,
+            match_version=int(version["version"]),
+            result_90_known_at=result_known_at,
+            team_stats_known_at=team_stats_known_at,
+            player_observations=player_observations,
+            as_of=as_of,
         )
 
     def _append_versioned(
@@ -385,6 +638,78 @@ def _validate_metrics(values: dict[str, float | int | None], name: str) -> None:
     _json_text(values)
 
 
+def _require_match(connection, match_id: MatchId):
+    row = connection.execute(
+        "SELECT match_id, home_team_id, away_team_id FROM matches WHERE match_id = ?",
+        (match_id.value,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"match {match_id} does not exist")
+    return row
+
+
+def _require_match_version(
+    connection,
+    *,
+    match_id: MatchId,
+    match_version: int,
+    require_finished: bool = False,
+):
+    if isinstance(match_version, bool) or not isinstance(match_version, int) or match_version < 1:
+        raise ValueError("match_version must be a positive integer")
+    row = connection.execute(
+        "SELECT m.match_id, m.home_team_id, m.away_team_id, v.status, v.kickoff_at "
+        "FROM matches AS m JOIN match_versions AS v ON v.match_id = m.match_id "
+        "WHERE m.match_id = ? AND v.version = ?",
+        (match_id.value, match_version),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"match version {match_id}:{match_version} does not exist")
+    if require_finished and row["status"] != MatchStatus.FINISHED.value:
+        raise ValueError("canonical fact requires a finished match version")
+    return row
+
+
+def _require_match_team(match_row, team_id: TeamId) -> None:
+    if team_id.value not in {match_row["home_team_id"], match_row["away_team_id"]}:
+        raise ValueError(f"team {team_id} does not belong to match {match_row['match_id']}")
+
+
+def _require_registered_player(connection, player_id: PlayerId) -> None:
+    row = connection.execute(
+        "SELECT entity_type FROM entities WHERE entity_id = ?", (player_id.value,)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"player {player_id} is not registered")
+    if row["entity_type"] != "player":
+        raise ValueError(f"entity {player_id} is not a player")
+
+
+def _require_player_assignment(
+    connection,
+    *,
+    match_id: MatchId,
+    match_version: int | None,
+    player_id: PlayerId,
+    team_id: TeamId,
+) -> None:
+    predicates = ["match_id = ?", "player_id = ?", "team_id <> ?"]
+    parameters: list[object] = [match_id.value, player_id.value, team_id.value]
+    if match_version is not None:
+        predicates.append("match_version = ?")
+        parameters.append(match_version)
+    where = " AND ".join(predicates)
+    tables = ("player_match_observations", "lineup_facts")
+    for table in tables:
+        row = connection.execute(
+            f"SELECT team_id FROM {table} WHERE {where} LIMIT 1", tuple(parameters)
+        ).fetchone()
+        if row is not None:
+            raise ValueError(
+                f"player {player_id} is already assigned to {row['team_id']} for match {match_id}"
+            )
+
+
 def _record_id(kind: str, payload: dict[str, Any]) -> str:
     digest = hashlib.sha256(_json_text(payload).encode("utf-8")).hexdigest()
     return f"fact:{kind}:{digest}"
@@ -408,6 +733,27 @@ def _link_evidence(
         "VALUES (?, ?, ?)",
         (record_id, raw_asset_id, observed_at),
     )
+
+
+def _insert_lineup_payload(connection, payload: dict[str, Any]) -> StoredFact:
+    record_id = _record_id("lineup", _semantic_payload(payload))
+    existing = connection.execute(
+        "SELECT record_id FROM lineup_facts WHERE record_id = ?", (record_id,)
+    ).fetchone()
+    if existing is None:
+        columns = ", ".join(("record_id", *payload.keys()))
+        placeholders = ", ".join("?" for _ in range(len(payload) + 1))
+        connection.execute(
+            f"INSERT INTO lineup_facts({columns}) VALUES ({placeholders})",
+            (record_id, *payload.values()),
+        )
+    _link_evidence(
+        connection,
+        record_id=record_id,
+        raw_asset_id=payload["raw_asset_id"],
+        observed_at=payload["observed_at"],
+    )
+    return StoredFact(record_id, None)
 
 
 def _json_text(value: Any) -> str:
@@ -434,3 +780,8 @@ def _require_temporal_order(known_at: datetime, observed_at: datetime) -> None:
     require_utc(observed_at, "observed_at")
     if known_at > observed_at:
         raise ValueError("known_at cannot be later than observed_at")
+
+
+def _require_text(value: str, name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be non-empty text")

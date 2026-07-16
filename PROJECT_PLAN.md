@@ -7,9 +7,9 @@ the contracts and orchestration needed to expand to the other top-five
 leagues and seasons from 2021-22 onward. It does not include in-play models,
 automated wagering, real-money execution, a public API, or a web application.
 
-The authoritative product design remains the 2026-07-16 design in the legacy
-`world-cup-predictor` repository until its documentation migration is handled
-as a separate, mechanical change.
+The authoritative product design is
+`docs/superpowers/specs/2026-07-16-football-data-platform-design.md` in this repository. The
+superseded 2026-05-28 design is retained only as historical context.
 
 ## Work Breakdown
 
@@ -78,19 +78,31 @@ source mappings. League-specific copies of the pipeline are a failed review.
 
 ## Current Acceptance Status
 
+This table reports the evidence boundary after the 2026-07-16 review. The remediation work,
+dependencies, and full phase-one roadmap are tracked in
+[docs/repair-and-optimization-plan.md](docs/repair-and-optimization-plan.md). "Not accepted" does
+not mean that no implementation exists; it means the current evidence does not prove the stated
+gate.
+
 | Gate | Status | Evidence |
 | --- | --- | --- |
-| Repository, registry, and three-layer storage | Accepted | Package install, CLI, immutable raw archive, SQLite canonical catalog |
-| Generic FBref parsing | Accepted offline | Schedule and match-report golden fixtures; no tournament-specific branches |
+| Repository and raw evidence foundation | Verified at current unit scope | Package install, CLI, and content-addressed raw replay are covered; full run/derived lineage remains open |
+| Canonical catalog and cross-source identities | Contract gates implemented; production evidence open | Stable mappings, participant constraints, migrations, and cross-source replay are covered; a full-season reconciliation is not recorded |
+| Generic FBref parsing | Contract gates implemented; golden-sample only | Offline fixtures parse and forged identity/score reports are rejected; live schema coverage remains unproven |
 | FBref live access | Blocked and observable | HTTP 403 becomes persisted `blocked_by_access_control`, exit code 3 |
-| Premier League 2025-26 fixture/result catalog | Accepted | Real fallback feed produced 20 teams, 380 matches, and 380 result facts |
+| Premier League 2025-26 fixture/result catalog | Gate implemented; coverage evidence open | The fallback sample reuses platform identities and the validator checks 20/380 structure and persisted attempts; the bundled feed is not a full-season capture |
 | Full FBref per-match statistics collection | Open | The full collection gate remains false until source IDs/reports are collected |
-| Temporal snapshots and readiness | Accepted | Reconstructed T-24h and lineup-preview artifacts; independent qualification reasons |
-| Team/player/lineup/context features | Accepted for contract slice | Versioned baseline/profile/delta builders preserve missingness and reject future facts |
-| Dixon-Coles score distribution | Accepted | Formal four-cell regression tests and one normalized grid for every market view |
-| Prediction/evaluation schema | Accepted | One prediction document per artifact; unknown/tampered schemas fail; market is separate |
-| End-to-end replay and report | Accepted | Fixed-time golden run replays with stable run, snapshot, and prediction IDs |
+| Temporal snapshots and three readiness qualifications | Contract gates implemented; captured production open | Snapshot provenance, UTC cutoffs, lifecycle completeness, and independent qualifications reject the previous bypasses; prospective captured runs are not recorded |
+| Prematch news, injuries, suspensions, and official lineups | Contract adapters/tests implemented; live collection open | Evidence independence, publication cutoffs, official-source checks, and atomic XI writes are covered; production source runs are not proven |
+| Player profiles and lineup deltas | Versioned contract implemented; full coverage open | Windowed role metrics, availability/load fields, missing/N/A states, and preview deltas are validated; full player history is not recorded |
+| Team baseline and context composition | Versioned contract implemented; calibration evidence open | Away-neutral coordinates, contribution keys, lineage, and final lambda composition are tested; prospective calibration is not established |
+| Dixon-Coles score distribution | Verified at mathematical unit scope | Formal four-cell tau and normalized-grid tests pass; this does not accept upstream feature construction or season coverage |
+| Prediction, real-market evaluation, and governance | Contract gates implemented; prospective policy/sample open | Future/incomplete/synthetic markets, unknown results, and invalid promotion metrics are rejected; no reviewed prospective promotion cohort is proven |
+| Run manifests and static reports | Golden/derived manifests implemented; all-command lineage open | Derived artifacts and successful/failed golden runs are content-addressed; broader CLI/report registry coverage remains open |
+| Versioned training datasets and model-run artifacts | Contract/storage/tests implemented; production evidence open | Per-sample qualification, leakage, captured raw evidence, model cohorts, and tamper checks are covered; no production model run is recorded |
+| Paper betting ledger | Contract/storage/tests implemented; prospective operation open | Real/open market gates, exposure recomputation, append-only revisions, and deterministic settlement are covered; no real prospective ledger cohort is recorded |
+| End-to-end vertical slice | Replay only; not accepted | The fixed-time two-match golden run is deterministic but is not 20 teams/380 matches with one persisted attempt per fixture |
+| Five leagues from 2021-22 and context competitions | Open | Required by the authoritative design; no completion evidence is currently recorded |
 
-The implementation milestone is accepted as a vertical contract slice. It does not claim that the
-FBref 380-match statistics archive, prospective captured snapshots, or five-league 2021-22 onward
-backfill is complete.
+No production vertical slice or phase-one milestone is accepted at this baseline. Individual unit
+contracts may remain verified while the broader gate stays open.

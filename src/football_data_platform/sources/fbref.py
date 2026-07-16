@@ -297,14 +297,6 @@ def _parse_row(
         raise ValueError("fixture has an empty team name")
 
     round_name = _optional_text(row, "round")
-    source_fixture_id = ":".join(
-        (
-            season.source("fbref").season_id,
-            round_name or "unassigned",
-            home_source_id,
-            away_source_id,
-        )
-    )
     match_report = row.get("match_report")
     report_url = (
         urljoin(page_url, match_report.href)
@@ -315,6 +307,9 @@ def _parse_row(
         _match_id_from_href(match_report.href)
         if match_report is not None and match_report.href
         else None
+    )
+    source_fixture_id = source_match_id or ":".join(
+        (season.source("fbref").season_id, home_source_id, away_source_id)
     )
     kickoff_at = _parse_kickoff(row, competition.timezone)
     score_text = _optional_text(row, "score")

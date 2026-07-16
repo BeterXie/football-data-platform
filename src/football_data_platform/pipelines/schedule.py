@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -22,6 +23,9 @@ class SeasonCoverage:
     expected_teams: int
     actual_teams: int
     duplicate_fixture_ids: tuple[str, ...]
+    unregistered_team_ids: tuple[str, ...]
+    missing_registered_teams: tuple[str, ...]
+    structural_violations: tuple[str, ...]
     missing_collection_attempts: tuple[str, ...]
     blocking_diagnostics: tuple[str, ...]
 
@@ -31,6 +35,9 @@ class SeasonCoverage:
             self.actual_matches == self.expected_matches
             and self.actual_teams == self.expected_teams
             and not self.duplicate_fixture_ids
+            and not self.unregistered_team_ids
+            and not self.missing_registered_teams
+            and not self.structural_violations
             and not self.blocking_diagnostics
         )
 
@@ -77,37 +84,50 @@ def ingest_fbref_schedule(
         page_url=page_url,
     )
     match_ids: list[str] = []
+    _require_round_robin_contract(season)
     for fixture in parsed.matches:
-        home = canonical.resolve_or_create_team(
+        home_definition = season.team("fbref", fixture.home_source_id)
+        away_definition = season.team("fbref", fixture.away_source_id)
+        home = canonical.resolve_registered_team(
             source="fbref",
             source_id=fixture.home_source_id,
-            canonical_name=fixture.home_name,
+            team_id=home_definition.id,
+            canonical_name=home_definition.name,
+            observed_name=fixture.home_name,
             competition_id=competition.id,
             observed_at=observed_at,
             raw_asset_id=raw_asset.id,
         )
-        away = canonical.resolve_or_create_team(
+        away = canonical.resolve_registered_team(
             source="fbref",
             source_id=fixture.away_source_id,
-            canonical_name=fixture.away_name,
+            team_id=away_definition.id,
+            canonical_name=away_definition.name,
+            observed_name=fixture.away_name,
             competition_id=competition.id,
             observed_at=observed_at,
             raw_asset_id=raw_asset.id,
         )
-        match, _ = canonical.resolve_or_create_match(
+        match, _ = canonical.resolve_or_create_round_robin_match(
             source="fbref-schedule",
             source_id=fixture.source_fixture_id,
             competition_id=competition.id,
             season_id=season.id,
             home_team_id=home.id,
             away_team_id=away.id,
+            round_name=fixture.round_name,
             kickoff_at=fixture.kickoff_at,
             status=fixture.status,
             observed_at=observed_at,
             raw_asset_id=raw_asset.id,
         )
         match_ids.append(match.id.value)
-    coverage = assess_season_coverage(parsed, season)
+    coverage = assess_season_coverage(
+        parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+    )
     return ScheduleIngestResult(parsed, coverage, raw_asset.id.value, tuple(match_ids))
 
 
@@ -116,6 +136,10 @@ def assess_season_coverage(
     season: SeasonDefinition,
     *,
     attempted_fixture_ids: set[str] | None = None,
+    source: str | None = None,
+    attempt_source: str = "fbref-match-report",
+    match_mapping_source: str | None = None,
+    canonical: CanonicalStore | None = None,
 ) -> SeasonCoverage:
     fixture_ids = [match.source_fixture_id for match in parsed.matches]
     duplicate_diagnostics = {
@@ -133,13 +157,111 @@ def assess_season_coverage(
         for match in parsed.matches
         for source_id in (match.home_source_id, match.away_source_id)
     }
-    attempted = set() if attempted_fixture_ids is None else attempted_fixture_ids
+    registered_team_ids, resolved_source = _registered_team_ids(season, team_ids, source)
+    # Kept for CLI compatibility only. Unpersisted identifiers never establish an attempt.
+    _ = attempted_fixture_ids
+    attempted_match_ids = (
+        {
+            attempt.match_id
+            for attempt in canonical.collection_attempts(season.id)
+            if attempt.source == attempt_source
+        }
+        if canonical is not None
+        else set()
+    )
+    match_mapping_source = match_mapping_source or (
+        f"{resolved_source}-schedule" if resolved_source is not None else None
+    )
+    mapped_match_ids = (
+        canonical.mapped_match_ids(source=match_mapping_source, source_ids=fixture_ids)
+        if canonical is not None and match_mapping_source is not None
+        else {}
+    )
+    missing_attempts = tuple(
+        sorted(
+            fixture_id
+            for fixture_id in fixture_ids
+            if mapped_match_ids.get(fixture_id) not in attempted_match_ids
+        )
+    )
     return SeasonCoverage(
         expected_matches=season.expected_matches,
         actual_matches=len(parsed.matches),
         expected_teams=season.expected_teams,
         actual_teams=len(team_ids),
         duplicate_fixture_ids=duplicates,
-        missing_collection_attempts=tuple(sorted(set(fixture_ids) - attempted)),
+        unregistered_team_ids=tuple(sorted(team_ids - registered_team_ids)),
+        missing_registered_teams=tuple(sorted(registered_team_ids - team_ids)),
+        structural_violations=_round_robin_violations(parsed, season),
+        missing_collection_attempts=missing_attempts,
         blocking_diagnostics=tuple(sorted({item.code for item in parsed.diagnostics})),
     )
+
+
+def _registered_team_ids(
+    season: SeasonDefinition,
+    observed_team_ids: set[str],
+    source: str | None,
+) -> tuple[set[str], str | None]:
+    if not season.teams:
+        return set(observed_team_ids), source
+    registered_by_source: dict[str, set[str]] = {}
+    for team in season.teams:
+        for reference in team.sources:
+            registered_by_source.setdefault(reference.source, set()).add(reference.source_id)
+    if source is None:
+        if not registered_by_source:
+            return set(), None
+        source = max(
+            sorted(registered_by_source),
+            key=lambda candidate: (
+                len(observed_team_ids & registered_by_source[candidate]),
+                candidate,
+            ),
+        )
+    return registered_by_source.get(source, set()), source
+
+
+def _require_round_robin_contract(season: SeasonDefinition) -> None:
+    teams = season.expected_teams
+    if season.expected_matches not in {teams * (teams - 1), teams * (teams - 1) // 2}:
+        raise ValueError(f"season {season.id} is not configured as a single/double round-robin")
+
+
+def _round_robin_violations(
+    parsed: ScheduleParseResult,
+    season: SeasonDefinition,
+) -> tuple[str, ...]:
+    team_ids = {
+        source_id
+        for match in parsed.matches
+        for source_id in (match.home_source_id, match.away_source_id)
+    }
+    violations: set[str] = set()
+    if any(match.home_source_id == match.away_source_id for match in parsed.matches):
+        violations.add("self_fixture")
+
+    directed = Counter((match.home_source_id, match.away_source_id) for match in parsed.matches)
+    double_round_robin_matches = season.expected_teams * (season.expected_teams - 1)
+    single_round_robin_matches = double_round_robin_matches // 2
+    if season.expected_matches == double_round_robin_matches:
+        if any(count > 1 for count in directed.values()):
+            violations.add("duplicate_directed_matchups")
+        expected = {(home, away) for home in team_ids for away in team_ids if home != away}
+        if set(directed) != expected:
+            violations.add("missing_directed_matchups")
+    elif season.expected_matches == single_round_robin_matches:
+        unordered = Counter(frozenset(pair) for pair in directed)
+        if any(count > 1 for count in unordered.values()):
+            violations.add("duplicate_unordered_matchups")
+        expected_unordered = {
+            frozenset((first, second))
+            for first in team_ids
+            for second in team_ids
+            if first < second
+        }
+        if set(unordered) != expected_unordered:
+            violations.add("missing_unordered_matchups")
+    else:
+        violations.add("unsupported_round_robin_shape")
+    return tuple(sorted(violations))

@@ -21,12 +21,16 @@ from football_data_platform.domain.predictions import (
     prediction_payload,
 )
 from football_data_platform.domain.snapshots import (
-    CaptureMode,
     SnapshotFeature,
     SnapshotType,
     build_snapshot,
 )
 from football_data_platform.evaluation.metrics import evaluate_prediction
+from football_data_platform.features.contributions import (
+    compose_expected_goals,
+    context_contribution,
+    lineup_delta_contributions,
+)
 from football_data_platform.features.lineup import build_lineup_delta
 from football_data_platform.features.player_profiles import (
     PlayerMatchObservation,
@@ -36,6 +40,7 @@ from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
     build_team_baseline,
     expected_goals_from_baseline,
+    team_baseline_payload,
 )
 from football_data_platform.pipelines.match_report import ingest_fbref_match_report
 from football_data_platform.pipelines.schedule import (
@@ -48,10 +53,14 @@ from football_data_platform.reporting.vertical_slice import (
 )
 from football_data_platform.sources.fbref import schedule_url
 from football_data_platform.storage.canonical import CanonicalStore
-from football_data_platform.storage.derived import DerivedArchive
+from football_data_platform.storage.derived import (
+    DERIVED_CODE_VERSION,
+    DerivedArchive,
+    RunManifest,
+)
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
-from football_data_platform.storage.raw import RawArchive
+from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +86,53 @@ def run_offline_vertical_slice(
     second_result_known_at: datetime,
     profile_minimum_minutes: float,
 ) -> VerticalSliceResult:
+    """Replay the golden slice and retain a failed run manifest on errors."""
+
+    try:
+        return _run_offline_vertical_slice(
+            data_root=data_root,
+            registry_path=registry_path,
+            schedule_file=schedule_file,
+            first_match_report_file=first_match_report_file,
+            lineups_file=lineups_file,
+            observed_at=observed_at,
+            first_report_known_at=first_report_known_at,
+            second_result_known_at=second_result_known_at,
+            profile_minimum_minutes=profile_minimum_minutes,
+        )
+    except Exception as error:
+        _write_failed_run_manifest(
+            data_root=data_root,
+            input_files=(
+                registry_path,
+                schedule_file,
+                first_match_report_file,
+                lineups_file,
+            ),
+            observed_at=observed_at,
+            profile_minimum_minutes=profile_minimum_minutes,
+            error=error,
+        )
+        raise
+
+
+def _run_offline_vertical_slice(
+    *,
+    data_root: Path,
+    registry_path: Path,
+    schedule_file: Path,
+    first_match_report_file: Path,
+    lineups_file: Path,
+    observed_at: datetime,
+    first_report_known_at: datetime,
+    second_result_known_at: datetime,
+    profile_minimum_minutes: float,
+) -> VerticalSliceResult:
     """Replay a two-match golden slice through every architecture boundary."""
 
     layout = DataLayout(data_root).ensure()
     archive = RawArchive(layout)
+    derived = DerivedArchive(layout)
     canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
     canonical.initialize()
     registry = load_competition_registry(registry_path)
@@ -109,6 +161,16 @@ def run_offline_vertical_slice(
     if first_fixture.home_goals is None or first_fixture.away_goals is None:
         raise ValueError("first golden fixture requires a real 90-minute result")
 
+    facts = CanonicalFactStore(canonical)
+    facts.append_result_90(
+        match_id=first_match_id,
+        match_version=1,
+        home_goals=first_fixture.home_goals,
+        away_goals=first_fixture.away_goals,
+        known_at=first_report_known_at,
+        observed_at=observed_at,
+        raw_asset_id=RawAssetId(schedule_ingest.raw_asset_id),
+    )
     report_ingest = ingest_fbref_match_report(
         first_match_report_file.read_bytes(),
         page_url=first_fixture.report_url or "https://fbref.invalid/missing-report-url",
@@ -122,7 +184,6 @@ def run_offline_vertical_slice(
         archive=archive,
         canonical=canonical,
     )
-    facts = CanonicalFactStore(canonical)
     result_fact = facts.append_result_90(
         match_id=second_match_id,
         match_version=1,
@@ -150,7 +211,6 @@ def run_offline_vertical_slice(
     )
     canonical.register_raw_asset(lineup_asset)
     lineup_features: list[SnapshotFeature] = []
-    lineup_player_ids: set[str] = set()
     lineup_player_ids_by_team: dict[str, tuple[str, ...]] = {}
     for team_payload in lineup_payload["teams"]:
         team = canonical.mapped_team(source="fbref", source_id=str(team_payload["source_team_id"]))
@@ -164,7 +224,6 @@ def run_offline_vertical_slice(
                 raw_asset_id=lineup_asset.id,
             )
             player_ids.append(player.id.value)
-            lineup_player_ids.add(player.id.value)
             facts.append_lineup_fact(
                 match_id=second_match_id,
                 match_version=1,
@@ -179,12 +238,18 @@ def run_offline_vertical_slice(
         if len(player_ids) != 11:
             raise ValueError(f"official lineup for {team.id} must contain 11 starters")
         lineup_player_ids_by_team[team.id.value] = tuple(player_ids)
+        lineup_source_ref = derived.write_snapshot_source(
+            value=player_ids,
+            input_refs=(lineup_asset.id,),
+            transform_version="official-lineup-input/1",
+            generated_at=observed_at,
+        )
         lineup_features.append(
             SnapshotFeature(
                 name="official_lineup_confirmed",
                 value=player_ids,
                 known_at=lineup_known_at,
-                source_ref=lineup_asset.id.value,
+                source_ref=lineup_source_ref,
                 contribution_key=f"official-lineup:{team.id.value}",
                 entity_id=team.id.value,
             )
@@ -247,43 +312,57 @@ def run_offline_vertical_slice(
         away_team_id=second_away.id.value,
     )
     t24_as_of = second_fixture.kickoff_at - timedelta(hours=24)
+    derived.write_team_baseline(baseline, generated_at=observed_at)
+    profile_manifest_path = derived.write_player_profiles(profiles, generated_at=observed_at)
+    baseline_value = {
+        "artifact_id": baseline.artifact_id,
+        "artifact": team_baseline_payload(baseline),
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+    }
     baseline_feature = SnapshotFeature(
         name="team_baseline",
-        value={
-            "artifact_id": baseline.artifact_id,
-            "lambda_home": lambda_home,
-            "lambda_away": lambda_away,
-        },
+        value=baseline_value,
         known_at=first_report_known_at,
-        source_ref=baseline.artifact_id,
+        source_ref=derived.write_snapshot_source(
+            value=baseline_value,
+            input_refs=(RawAssetId(report_ingest.raw_asset_id),),
+            transform_version="team-baseline-input/2",
+            generated_at=observed_at,
+        ),
         contribution_key="team-baseline",
+    )
+    context_value = {
+        "days_since_previous_match": (
+            second_fixture.kickoff_at - first_fixture.kickoff_at
+        ).total_seconds()
+        / 86_400
+    }
+    context_source_ref = derived.write_snapshot_source(
+        value=context_value,
+        input_refs=(RawAssetId(schedule_ingest.raw_asset_id),),
+        transform_version="match-context-input/1",
+        generated_at=observed_at,
     )
     context_feature = SnapshotFeature(
         name="match_context",
-        value={
-            "days_since_previous_match": (
-                second_fixture.kickoff_at - first_fixture.kickoff_at
-            ).total_seconds()
-            / 86_400
-        },
+        value=context_value,
         known_at=max(schedule_known_at, first_report_known_at),
-        source_ref=schedule_ingest.raw_asset_id,
+        source_ref=context_source_ref,
         contribution_key="context:rest-days",
     )
     t24_snapshot = build_snapshot(
         match_id=second_match_id,
         match_version=1,
         snapshot_type=SnapshotType.T24H,
-        capture_mode=CaptureMode.RECONSTRUCTED,
         as_of=t24_as_of,
-        observed_at=observed_at,
         scheduled_kickoff_used=second_fixture.kickoff_at,
         feature_spec_version="prematch-features/1",
         features=(baseline_feature, context_feature),
         home_team_id=second_home.id,
         away_team_id=second_away.id,
+        source_validator=derived,
     )
-    available_profile_ids = {profile.player_id for profile in profiles.profiles}
     lineup_deltas = {
         team_id: build_lineup_delta(
             starter_ids=player_ids,
@@ -292,27 +371,32 @@ def run_offline_vertical_slice(
         )
         for team_id, player_ids in lineup_player_ids_by_team.items()
     }
-    missing_profile_ids = tuple(sorted(lineup_player_ids - available_profile_ids))
+    lineup_delta_value = {
+        team_id: {
+            "quality_status": delta.quality_status,
+            "dimension_deltas": delta.dimension_deltas,
+            "missing_fields": list(delta.missing_fields),
+        }
+        for team_id, delta in lineup_deltas.items()
+    }
+    lineup_delta_source_ref = derived.write_snapshot_source(
+        value=lineup_delta_value,
+        input_refs=(lineup_asset.id, RawAssetId(report_ingest.raw_asset_id)),
+        transform_version="lineup-delta-input/1",
+        generated_at=observed_at,
+    )
     lineup_delta_feature = SnapshotFeature(
         name="lineup_delta",
-        value={
-            team_id: {
-                "quality_status": delta.quality_status,
-                "dimension_deltas": delta.dimension_deltas,
-            }
-            for team_id, delta in lineup_deltas.items()
-        },
+        value=lineup_delta_value,
         known_at=lineup_known_at,
-        source_ref=lineup_asset.id.value,
+        source_ref=lineup_delta_source_ref,
         contribution_key="lineup-delta",
     )
     lineups_snapshot = build_snapshot(
         match_id=second_match_id,
         match_version=1,
         snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
-        capture_mode=CaptureMode.RECONSTRUCTED,
         as_of=lineup_known_at,
-        observed_at=observed_at,
         scheduled_kickoff_used=second_fixture.kickoff_at,
         feature_spec_version="prematch-features/1",
         features=(
@@ -323,36 +407,48 @@ def run_offline_vertical_slice(
         ),
         home_team_id=second_home.id,
         away_team_id=second_away.id,
-        missing_fields=tuple(
-            sorted(
-                {
-                    *(f"player_profile:{item}" for item in missing_profile_ids),
-                    *(
-                        f"{team_id}:{field}"
-                        for team_id, delta in lineup_deltas.items()
-                        for field in delta.missing_fields
-                    ),
-                }
-            )
-        ),
+        source_validator=derived,
     )
-    derived = DerivedArchive(layout)
     derived.write_snapshot(t24_snapshot)
     derived.write_snapshot(lineups_snapshot)
 
+    context_effect = context_contribution(context_value, source_ref=context_source_ref)
+    t24_composition = compose_expected_goals(
+        lambda_home,
+        lambda_away,
+        (context_effect,),
+    )
+    lineup_effects = lineup_delta_contributions(
+        lineup_delta_value,
+        home_team_id=second_home.id.value,
+        away_team_id=second_away.id.value,
+        source_ref=lineup_delta_source_ref,
+    )
+    lineups_composition = compose_expected_goals(
+        lambda_home,
+        lambda_away,
+        (context_effect, *lineup_effects),
+    )
+    prediction_snapshot = (
+        lineups_snapshot if lineups_snapshot.quality_status == "ready" else t24_snapshot
+    )
+    composition = (
+        lineups_composition if prediction_snapshot is lineups_snapshot else t24_composition
+    )
     prediction = build_score_prediction(
-        match_id=second_match_id,
-        snapshot_id=t24_snapshot.id,
-        capture_mode=t24_snapshot.capture_mode,
-        snapshot_quality_status=t24_snapshot.quality_status,
+        snapshot=prediction_snapshot,
+        snapshot_validator=derived,
         model_run_id=ModelRunId("model-run:dixon-coles-baseline-v1"),
-        model_version="dixon-coles-baseline/1",
+        model_version="dixon-coles-composed/1",
         generated_at=observed_at,
-        lambda_home=lambda_home,
-        lambda_away=lambda_away,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
         rho=-0.1,
         max_goals=11,
-        input_refs=(t24_snapshot.id.value, baseline.artifact_id),
+        input_refs=(
+            baseline.artifact_id,
+            *composition.input_refs,
+        ),
     )
     derived.write_prediction(prediction)
     evaluation = evaluate_prediction(
@@ -365,32 +461,34 @@ def run_offline_vertical_slice(
             result_fact.record_id,
         ),
         evaluated_at=observed_at,
+        result_validator=facts,
     )
+    evaluation_manifest_path = derived.write_evaluation(evaluation, generated_at=observed_at)
+    baseline_manifest_id = _manifest_id_for_output_ref(derived, baseline.artifact_id)
+    profile_manifest_id = _manifest_id_from_path(profile_manifest_path)
+    evaluation_manifest_id = _manifest_id_from_path(evaluation_manifest_path)
 
-    attempted = {first_fixture.source_fixture_id}
     coverage = assess_season_coverage(
         schedule_ingest.parsed,
         season,
-        attempted_fixture_ids=attempted,
+        canonical=canonical,
+        source="fbref",
     )
-    first_lifecycle = assess_lifecycle(facts.availability(first_match_id), evaluated_at=observed_at)
+    first_lifecycle = assess_lifecycle(
+        facts.availability(first_match_id, as_of=observed_at),
+        evaluated_at=observed_at,
+    )
     second_lifecycle = assess_lifecycle(
         facts.availability(
             second_match_id,
+            as_of=observed_at,
             snapshots=(
-                SnapshotAvailability(
-                    t24_snapshot.snapshot_type,
-                    t24_snapshot.capture_mode,
-                    t24_snapshot.quality_status,
-                ),
-                SnapshotAvailability(
-                    lineups_snapshot.snapshot_type,
-                    lineups_snapshot.capture_mode,
-                    lineups_snapshot.quality_status,
-                ),
+                SnapshotAvailability.from_snapshot(t24_snapshot),
+                SnapshotAvailability.from_snapshot(lineups_snapshot),
             ),
         ),
         evaluated_at=observed_at,
+        snapshot_validator=derived,
     )
     run_identity = {
         "schema_version": 1,
@@ -400,7 +498,38 @@ def run_offline_vertical_slice(
         "prediction_id": prediction.id.value,
         "result_fact_id": result_fact.record_id,
     }
-    run_id = f"run:{hashlib.sha256(_canonical_json(run_identity)).hexdigest()}"
+    run_manifest = RunManifest.create(
+        run_type="offline-golden-replay",
+        started_at=observed_at,
+        ended_at=observed_at,
+        generated_at=observed_at,
+        transform_version="vertical-slice/2",
+        code_version=DERIVED_CODE_VERSION,
+        input_refs=(
+            schedule_ingest.raw_asset_id,
+            report_ingest.raw_asset_id,
+            lineup_asset.id.value,
+        ),
+        output_refs=(
+            baseline_manifest_id,
+            profile_manifest_id,
+            evaluation_manifest_id,
+            t24_snapshot.id.value,
+            lineups_snapshot.id.value,
+            prediction.id.value,
+        ),
+        status="succeeded",
+        error=None,
+        quality="partial" if lineups_snapshot.quality_status != "ready" else "ready",
+        parameters={
+            "mode": "offline-golden-replay",
+            "observed_at": _timestamp(observed_at),
+            "profile_minimum_minutes": profile_minimum_minutes,
+        },
+        checkpoint="static-report-written",
+        payload=run_identity,
+    )
+    run_id = run_manifest.run_id
     summary = {
         **run_identity,
         "run_id": run_id,
@@ -417,10 +546,27 @@ def run_offline_vertical_slice(
         "team_baseline": {
             "artifact_id": baseline.artifact_id,
             "input_refs": list(baseline.input_refs),
+            "lambda_home": lambda_home,
+            "lambda_away": lambda_away,
+        },
+        "lambda_composition": {
+            "version": composition.composition_version,
+            "baseline_lambda_home": composition.baseline_lambda_home,
+            "baseline_lambda_away": composition.baseline_lambda_away,
+            "lambda_home": composition.lambda_home,
+            "lambda_away": composition.lambda_away,
+            "contribution_keys": list(composition.contribution_keys),
+            "input_refs": list(composition.input_refs),
+            "prediction_snapshot": prediction_snapshot.snapshot_type.value,
         },
         "player_profiles": {
             "count": len(profiles.profiles),
             "ready": sum(profile.quality_status == "ready" for profile in profiles.profiles),
+        },
+        "derived_artifacts": {
+            "team_baseline": baseline_manifest_id,
+            "player_profiles": profile_manifest_id,
+            "evaluation": evaluation_manifest_id,
         },
         "prediction": prediction_payload(prediction),
         "evaluation": _evaluation_summary(evaluation),
@@ -438,7 +584,11 @@ def run_offline_vertical_slice(
     summary_path = layout.derived / "runs" / f"{digest}.json"
     _write_json_exact(summary_path, summary)
     report_path = layout.derived / "reports" / f"{digest}.md"
-    write_static_report(report_path, render_vertical_slice_report(summary))
+    report_content = render_vertical_slice_report(summary)
+    if report_path.exists() and report_path.read_text(encoding="utf-8") != report_content:
+        raise ArchiveConflictError(f"derived report conflicts at {report_path}")
+    write_static_report(report_path, report_content)
+    derived.write_run_manifest(run_manifest)
     return VerticalSliceResult(
         run_id,
         summary_path,
@@ -458,6 +608,67 @@ def _snapshot_summary(snapshot) -> dict[str, Any]:
         "quality_status": snapshot.quality_status,
         "missing_fields": list(snapshot.missing_fields),
     }
+
+
+def _write_failed_run_manifest(
+    *,
+    data_root: Path,
+    input_files: tuple[Path, ...],
+    observed_at: datetime,
+    profile_minimum_minutes: float,
+    error: Exception,
+) -> None:
+    """Best-effort failure evidence that never masks the original exception."""
+
+    try:
+        input_refs = tuple(_file_content_ref(path) for path in input_files)
+        manifest = RunManifest.create(
+            run_type="offline-golden-replay",
+            started_at=observed_at,
+            ended_at=observed_at,
+            generated_at=observed_at,
+            transform_version="vertical-slice/2",
+            code_version=DERIVED_CODE_VERSION,
+            input_refs=input_refs,
+            output_refs=(),
+            status="failed",
+            error=f"{type(error).__name__}: {error}",
+            quality="failed",
+            parameters={
+                "mode": "offline-golden-replay",
+                "observed_at": _timestamp(observed_at),
+                "profile_minimum_minutes": profile_minimum_minutes,
+            },
+            checkpoint="before-completion",
+        )
+        DerivedArchive(DataLayout(data_root)).write_run_manifest(manifest)
+    except Exception:
+        return
+
+
+def _file_content_ref(path: Path) -> str:
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return f"missing-file:{path.name}"
+    return f"file-sha256:{digest}"
+
+
+def _manifest_id_from_path(path: Path) -> str:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    manifest_id = payload.get("id")
+    if not isinstance(manifest_id, str) or not manifest_id:
+        raise ValueError(f"derived manifest at {path} has no immutable ID")
+    return manifest_id
+
+
+def _manifest_id_for_output_ref(derived: DerivedArchive, output_ref: str) -> str:
+    root = derived.layout.derived / "manifests" / "artifacts"
+    for path in root.rglob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if output_ref in payload.get("output_refs", ()):
+            return _manifest_id_from_path(path)
+    raise ValueError(f"no derived manifest cites output reference {output_ref!r}")
 
 
 def _lifecycle_summary(assessment) -> dict[str, Any]:
@@ -532,6 +743,13 @@ def _write_json_exact(path: Path, value: dict[str, Any]) -> None:
         + b"\n"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_bytes() == payload:
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise ArchiveConflictError(f"derived run summary conflicts at {path}")
         return
-    path.write_bytes(payload)
+    try:
+        with path.open("xb") as destination:
+            destination.write(payload)
+    except FileExistsError:
+        if path.read_bytes() != payload:
+            raise ArchiveConflictError(f"derived run summary conflicts at {path}") from None

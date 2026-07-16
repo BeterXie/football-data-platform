@@ -33,6 +33,7 @@
 ## 实施与验收
 
 - [当前交付计划与自动化验收门禁](../PROJECT_PLAN.md)
+- [修复、优化与第一阶段完整路线图](repair-and-optimization-plan.md)
 
 ## 历史设计
 

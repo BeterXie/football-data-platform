@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
 from football_data_platform.domain.models import MatchStatus, require_utc
-from football_data_platform.domain.snapshots import CaptureMode, SnapshotType
+from football_data_platform.domain.snapshots import (
+    CaptureMode,
+    PreMatchSnapshot,
+    SnapshotSourceValidator,
+    SnapshotType,
+    verify_snapshot,
+)
 
 
 class LifecycleState(StrEnum):
@@ -30,6 +37,37 @@ class SnapshotAvailability:
     snapshot_type: SnapshotType
     capture_mode: CaptureMode
     quality_status: str
+    evidence: PreMatchSnapshot | None = None
+
+    @classmethod
+    def from_snapshot(cls, snapshot: PreMatchSnapshot) -> SnapshotAvailability:
+        """Create a summary that can be trusted only after store verification."""
+
+        return cls(
+            snapshot_type=snapshot.snapshot_type,
+            capture_mode=snapshot.capture_mode,
+            quality_status=snapshot.quality_status,
+            evidence=snapshot,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerObservationAvailability:
+    team_id: str
+    role: str
+    minutes: float
+    metric_fields: frozenset[str]
+    known_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.team_id, str) or not self.team_id:
+            raise ValueError("player observation team_id must be non-empty text")
+        if not isinstance(self.role, str):
+            raise TypeError("player observation role must be text")
+        if not math.isfinite(float(self.minutes)) or self.minutes < 0:
+            raise ValueError("player observation minutes must be finite and non-negative")
+        if self.known_at is not None:
+            require_utc(self.known_at, "player observation known_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +79,12 @@ class MatchAvailability:
     team_stat_fields: dict[str, frozenset[str]]
     starters: dict[str, frozenset[str]]
     player_observation_ids: frozenset[str]
+    match_id: str | None = None
+    match_version: int | None = None
+    result_90_known_at: datetime | None = None
+    team_stats_known_at: dict[str, datetime] = field(default_factory=dict)
+    player_observations: dict[str, PlayerObservationAvailability] | None = None
+    as_of: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,26 +104,39 @@ class LifecycleAssessment:
     evaluated_at: datetime
 
 
+_REQUIRED_TEAM_STAT_FIELDS = frozenset({"goals", "xg", "shots", "shots_on_target"})
+_SUPPORTED_RULESET_VERSIONS = frozenset({"readiness/1"})
+
+
 def assess_lifecycle(
     availability: MatchAvailability,
     *,
     evaluated_at: datetime,
     ruleset_version: str = "readiness/1",
+    snapshot_validator: SnapshotSourceValidator | None = None,
 ) -> LifecycleAssessment:
     """Compute lifecycle and three independent training qualifications."""
 
     require_utc(evaluated_at, "evaluated_at")
+    if ruleset_version not in _SUPPORTED_RULESET_VERSIONS:
+        raise ValueError(f"unsupported readiness ruleset {ruleset_version!r}")
+    ready_snapshots, has_unverified_ready_snapshot = _verified_ready_snapshot_types(
+        availability,
+        evaluated_at=evaluated_at,
+        snapshot_validator=snapshot_validator,
+    )
     qualifications = (
-        _score_model_qualification(availability, evaluated_at, ruleset_version),
+        _score_model_qualification(
+            availability,
+            evaluated_at,
+            ruleset_version,
+            ready_snapshots=ready_snapshots,
+            has_unverified_ready_snapshot=has_unverified_ready_snapshot,
+        ),
         _team_baseline_qualification(availability, evaluated_at, ruleset_version),
         _player_profile_qualification(availability, evaluated_at, ruleset_version),
     )
-    ready_snapshots = {
-        snapshot.snapshot_type
-        for snapshot in availability.snapshots
-        if snapshot.quality_status == "ready"
-    }
-    archive_complete = _archive_complete(availability)
+    archive_complete = _archive_complete(availability, evaluated_at=evaluated_at)
     reasons: list[str] = []
     if availability.match_status is MatchStatus.FINISHED:
         if not archive_complete:
@@ -108,12 +165,23 @@ def _score_model_qualification(
     availability: MatchAvailability,
     evaluated_at: datetime,
     ruleset_version: str,
+    *,
+    ready_snapshots: set[SnapshotType],
+    has_unverified_ready_snapshot: bool,
 ) -> QualificationResult:
     reasons: list[str] = []
+    if availability.match_status is not MatchStatus.FINISHED:
+        reasons.append("match_not_finished")
+    if _known_after(availability.as_of, evaluated_at):
+        reasons.append("availability_as_of_after_evaluation")
     if not availability.result_90_present:
         reasons.append("missing_result_90")
-    if not any(snapshot.quality_status == "ready" for snapshot in availability.snapshots):
+    if not ready_snapshots:
         reasons.append("missing_ready_prematch_snapshot")
+        if has_unverified_ready_snapshot:
+            reasons.append("unverified_snapshot_evidence")
+    if _known_after(availability.result_90_known_at, evaluated_at):
+        reasons.append("result_known_after_evaluation")
     return _qualification(Qualification.SCORE_MODEL, reasons, evaluated_at, ruleset_version)
 
 
@@ -123,12 +191,21 @@ def _team_baseline_qualification(
     ruleset_version: str,
 ) -> QualificationResult:
     reasons: list[str] = []
+    if availability.match_status is not MatchStatus.FINISHED:
+        reasons.append("match_not_finished")
+    if _known_after(availability.as_of, evaluated_at):
+        reasons.append("availability_as_of_after_evaluation")
     if not availability.result_90_present:
         reasons.append("missing_result_90")
-    required = frozenset({"goals", "xg", "shots", "shots_on_target"})
+    if _known_after(availability.result_90_known_at, evaluated_at):
+        reasons.append("result_known_after_evaluation")
     for team_id in availability.team_ids:
-        missing = sorted(required - availability.team_stat_fields.get(team_id, frozenset()))
+        missing = sorted(
+            _REQUIRED_TEAM_STAT_FIELDS - availability.team_stat_fields.get(team_id, frozenset())
+        )
         reasons.extend(f"missing_team_stat:{team_id}:{field}" for field in missing)
+        if _known_after(availability.team_stats_known_at.get(team_id), evaluated_at):
+            reasons.append(f"team_stats_known_after_evaluation:{team_id}")
     return _qualification(Qualification.TEAM_BASELINE, reasons, evaluated_at, ruleset_version)
 
 
@@ -138,6 +215,10 @@ def _player_profile_qualification(
     ruleset_version: str,
 ) -> QualificationResult:
     reasons: list[str] = []
+    if availability.match_status is not MatchStatus.FINISHED:
+        reasons.append("match_not_finished")
+    if _known_after(availability.as_of, evaluated_at):
+        reasons.append("availability_as_of_after_evaluation")
     for team_id in availability.team_ids:
         starters = availability.starters.get(team_id, frozenset())
         if len(starters) != 11:
@@ -146,6 +227,20 @@ def _player_profile_qualification(
         reasons.extend(
             f"missing_player_observation:{player_id}" for player_id in missing_observations
         )
+        if availability.player_observations is not None:
+            for player_id in sorted(starters & availability.player_observation_ids):
+                observation = availability.player_observations.get(player_id)
+                if observation is None:
+                    reasons.append(f"missing_player_observation_detail:{player_id}")
+                    continue
+                if observation.team_id != team_id:
+                    reasons.append(f"player_observation_team_mismatch:{player_id}")
+                if not observation.role.strip() and observation.minutes <= 0:
+                    reasons.append(f"missing_player_role_or_minutes:{player_id}")
+                if not observation.metric_fields:
+                    reasons.append(f"missing_player_metrics:{player_id}")
+                if _known_after(observation.known_at, evaluated_at):
+                    reasons.append(f"player_observation_known_after_evaluation:{player_id}")
     return _qualification(Qualification.PLAYER_PROFILE, reasons, evaluated_at, ruleset_version)
 
 
@@ -164,9 +259,94 @@ def _qualification(
     )
 
 
-def _archive_complete(availability: MatchAvailability) -> bool:
-    if not availability.result_90_present:
+def _archive_complete(availability: MatchAvailability, *, evaluated_at: datetime) -> bool:
+    if availability.match_status is not MatchStatus.FINISHED or not availability.result_90_present:
         return False
-    if any(team_id not in availability.team_stat_fields for team_id in availability.team_ids):
+    if _known_after(availability.as_of, evaluated_at):
         return False
-    return all(team_id in availability.starters for team_id in availability.team_ids)
+    if _known_after(availability.result_90_known_at, evaluated_at):
+        return False
+    if set(availability.team_stat_fields) - set(availability.team_ids):
+        return False
+    if set(availability.starters) - set(availability.team_ids):
+        return False
+    for team_id in availability.team_ids:
+        fields = availability.team_stat_fields.get(team_id, frozenset())
+        if not _REQUIRED_TEAM_STAT_FIELDS <= fields:
+            return False
+        if _known_after(availability.team_stats_known_at.get(team_id), evaluated_at):
+            return False
+        starters = availability.starters.get(team_id, frozenset())
+        if len(starters) != 11:
+            return False
+        if not starters <= availability.player_observation_ids:
+            return False
+    return True
+
+
+def _verified_ready_snapshot_types(
+    availability: MatchAvailability,
+    *,
+    evaluated_at: datetime,
+    snapshot_validator: SnapshotSourceValidator | None,
+) -> tuple[set[SnapshotType], bool]:
+    ready_types: set[SnapshotType] = set()
+    has_unverified = False
+    for summary in availability.snapshots:
+        if summary.quality_status != "ready":
+            continue
+        if not _snapshot_is_verified(
+            summary,
+            availability=availability,
+            evaluated_at=evaluated_at,
+            snapshot_validator=snapshot_validator,
+        ):
+            has_unverified = True
+            continue
+        ready_types.add(summary.snapshot_type)
+    return ready_types, has_unverified
+
+
+def _snapshot_is_verified(
+    summary: SnapshotAvailability,
+    *,
+    availability: MatchAvailability,
+    evaluated_at: datetime,
+    snapshot_validator: SnapshotSourceValidator | None,
+) -> bool:
+    evidence = summary.evidence
+    if evidence is None or snapshot_validator is None:
+        return False
+    if (
+        summary.snapshot_type is not evidence.snapshot_type
+        or summary.capture_mode is not evidence.capture_mode
+        or summary.quality_status != evidence.quality_status
+    ):
+        return False
+    if availability.match_id is not None and evidence.match_id.value != availability.match_id:
+        return False
+    if (
+        availability.match_version is not None
+        and evidence.match_version != availability.match_version
+    ):
+        return False
+    if evidence.observed_at > evaluated_at:
+        return False
+    try:
+        verify_snapshot(evidence, source_validator=snapshot_validator)
+        loader = getattr(snapshot_validator, "load_snapshot_payload", None)
+        if loader is None:
+            return False
+        payload = loader(evidence)
+        if payload.get("id") != evidence.id.value:
+            return False
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return evidence.quality_status == "ready"
+
+
+def _known_after(known_at: datetime | None, evaluated_at: datetime) -> bool:
+    if known_at is None:
+        return False
+    require_utc(known_at, "known_at")
+    return known_at > evaluated_at

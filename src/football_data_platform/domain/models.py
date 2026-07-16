@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 
 from football_data_platform.domain.ids import (
+    CollectionAttemptId,
     CompetitionId,
     EntityId,
     MatchId,
@@ -34,6 +35,12 @@ class MappingRule(StrEnum):
     MANUAL_OVERRIDE = "manual_override"
 
 
+class CollectionAttemptOutcome(StrEnum):
+    SUCCEEDED = "succeeded"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class Match:
     id: MatchId
@@ -56,6 +63,7 @@ class MatchVersion:
     kickoff_at: datetime | None
     status: MatchStatus
     observed_at: datetime
+    round_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.version < 1:
@@ -63,6 +71,39 @@ class MatchVersion:
         if self.kickoff_at is not None:
             require_utc(self.kickoff_at, "kickoff_at")
         require_utc(self.observed_at, "observed_at")
+        if self.round_name is not None:
+            _require_text(self.round_name, "round_name")
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionAttempt:
+    """An auditable source request targeting one canonical match."""
+
+    id: CollectionAttemptId
+    match_id: MatchId
+    source: str
+    target_url: str
+    outcome: CollectionAttemptOutcome
+    observed_at: datetime
+    collector_version: str
+    diagnostic_code: str | None
+    diagnostic_message: str | None
+    raw_asset_id: RawAssetId | None
+
+    def __post_init__(self) -> None:
+        _require_text(self.source, "source")
+        _require_text(self.target_url, "target_url")
+        _require_text(self.collector_version, "collector_version")
+        require_utc(self.observed_at, "observed_at")
+        if self.diagnostic_code is not None:
+            _require_text(self.diagnostic_code, "diagnostic_code")
+        if self.diagnostic_message is not None:
+            _require_text(self.diagnostic_message, "diagnostic_message")
+        if self.outcome is CollectionAttemptOutcome.SUCCEEDED:
+            if self.raw_asset_id is None:
+                raise ValueError("successful collection attempts require raw_asset_id")
+        elif self.diagnostic_code is None:
+            raise ValueError("unsuccessful collection attempts require diagnostic_code")
 
 
 @dataclass(frozen=True, slots=True)

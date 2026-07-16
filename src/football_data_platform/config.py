@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 from types import MappingProxyType
 
-from football_data_platform.domain.ids import CompetitionId, SeasonId
+from football_data_platform.domain.ids import CompetitionId, SeasonId, TeamId
 
 DEFAULT_REGISTRY_PATH = Path(__file__).resolve().parent / "resources" / "competitions.toml"
 
@@ -29,6 +29,41 @@ class SourceSeasonReference:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceTeamReference:
+    """One provider identifier and display alias for a registered team."""
+
+    source: str
+    source_id: str
+    alias: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.source, "source")
+        _require_text(self.source_id, "source_id")
+        _require_text(self.alias, "alias")
+
+
+@dataclass(frozen=True, slots=True)
+class TeamDefinition:
+    """A platform-owned team identity with explicit provider mappings."""
+
+    id: TeamId
+    name: str
+    sources: tuple[SourceTeamReference, ...]
+
+    def __post_init__(self) -> None:
+        _require_text(self.name, "name")
+        source_names = [reference.source for reference in self.sources]
+        if len(source_names) != len(set(source_names)):
+            raise ValueError(f"duplicate source in team {self.id}")
+
+    def source(self, name: str) -> SourceTeamReference:
+        for reference in self.sources:
+            if reference.source == name:
+                return reference
+        raise KeyError(f"source {name!r} is not registered for team {self.id}")
+
+
+@dataclass(frozen=True, slots=True)
 class SeasonDefinition:
     id: SeasonId
     label: str
@@ -37,6 +72,7 @@ class SeasonDefinition:
     expected_teams: int
     expected_matches: int
     sources: tuple[SourceSeasonReference, ...] = ()
+    teams: tuple[TeamDefinition, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.label, "label")
@@ -49,6 +85,21 @@ class SeasonDefinition:
         source_names = [reference.source for reference in self.sources]
         if len(source_names) != len(set(source_names)):
             raise ValueError(f"duplicate source in season {self.id}")
+        team_ids = [team.id for team in self.teams]
+        if len(team_ids) != len(set(team_ids)):
+            raise ValueError(f"duplicate team in season {self.id}")
+        if self.teams and len(self.teams) != self.expected_teams:
+            raise ValueError(
+                f"season {self.id} registers {len(self.teams)} teams, "
+                f"expected {self.expected_teams}"
+            )
+        source_keys = [
+            (reference.source, reference.source_id)
+            for team in self.teams
+            for reference in team.sources
+        ]
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError(f"duplicate team source mapping in season {self.id}")
 
     def source(self, name: str) -> SourceSeasonReference:
         """Return this season's reference for a provider."""
@@ -57,6 +108,15 @@ class SeasonDefinition:
             if reference.source == name:
                 return reference
         raise KeyError(f"source {name!r} is not registered for season {self.id}")
+
+    def team(self, source: str, source_id: str) -> TeamDefinition:
+        """Resolve a provider team ID through the operator-owned mapping registry."""
+
+        for team in self.teams:
+            for reference in team.sources:
+                if reference.source == source and reference.source_id == source_id:
+                    return team
+        raise KeyError(f"team mapping {source}:{source_id} is not registered for season {self.id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +216,9 @@ def _parse_season(payload: Mapping[str, object]) -> SeasonDefinition:
     sources_payload = payload.get("sources", [])
     if not isinstance(sources_payload, list):
         raise ValueError("season sources must be a list")
+    teams_payload = payload.get("teams", [])
+    if not isinstance(teams_payload, list):
+        raise ValueError("season teams must be a list")
     starts_on = payload["starts_on"]
     ends_on = payload["ends_on"]
     if type(starts_on) is not date or type(ends_on) is not date:
@@ -168,6 +231,7 @@ def _parse_season(payload: Mapping[str, object]) -> SeasonDefinition:
         expected_teams=int(payload["expected_teams"]),
         expected_matches=int(payload["expected_matches"]),
         sources=tuple(_parse_source(_require_table(item)) for item in sources_payload),
+        teams=tuple(_parse_team(_require_table(item)) for item in teams_payload),
     )
 
 
@@ -176,6 +240,25 @@ def _parse_source(payload: Mapping[str, object]) -> SourceSeasonReference:
         source=str(payload["source"]),
         competition_id=str(payload["competition_id"]),
         season_id=str(payload["season_id"]),
+    )
+
+
+def _parse_team(payload: Mapping[str, object]) -> TeamDefinition:
+    sources_payload = payload.get("sources", [])
+    if not isinstance(sources_payload, list):
+        raise ValueError("team sources must be a list")
+    return TeamDefinition(
+        id=TeamId(str(payload["id"])),
+        name=str(payload["name"]),
+        sources=tuple(_parse_team_source(_require_table(item)) for item in sources_payload),
+    )
+
+
+def _parse_team_source(payload: Mapping[str, object]) -> SourceTeamReference:
+    return SourceTeamReference(
+        source=str(payload["source"]),
+        source_id=str(payload["source_id"]),
+        alias=str(payload["alias"]),
     )
 
 

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import CompetitionId, SeasonId
-from football_data_platform.domain.models import MatchStatus
+from football_data_platform.domain.ids import CompetitionId, RawAssetId, SeasonId
+from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus
 from football_data_platform.storage.canonical import (
     CanonicalConflictError,
     CanonicalStore,
@@ -174,7 +175,6 @@ def test_canonical_facts_require_registered_raw_lineage(
     prepared_store: tuple[CanonicalStore, object],
 ) -> None:
     store, _ = prepared_store
-    from football_data_platform.domain.ids import RawAssetId
 
     with pytest.raises(KeyError, match="raw asset"):
         store.resolve_or_create_team(
@@ -185,3 +185,116 @@ def test_canonical_facts_require_registered_raw_lineage(
             observed_at=NOW,
             raw_asset_id=RawAssetId("raw-asset:" + "a" * 64),
         )
+
+
+def test_existing_player_resolution_still_requires_registered_raw_lineage(
+    prepared_store: tuple[CanonicalStore, object],
+) -> None:
+    store, asset = prepared_store
+    store.resolve_or_create_player(
+        source="fbref",
+        source_id="player-1",
+        canonical_name="Player One",
+        observed_at=NOW,
+        raw_asset_id=asset.id,  # type: ignore[attr-defined]
+    )
+
+    with pytest.raises(KeyError, match="raw asset"):
+        store.resolve_or_create_player(
+            source="fbref",
+            source_id="player-1",
+            canonical_name="Player One",
+            observed_at=NOW,
+            raw_asset_id=RawAssetId("raw-asset:" + "b" * 64),
+        )
+
+
+def test_collection_attempts_are_persisted_and_blocked_attempts_need_no_raw(
+    prepared_store: tuple[CanonicalStore, object],
+) -> None:
+    store, asset = prepared_store
+    teams = [
+        store.resolve_or_create_team(
+            source="fbref",
+            source_id=f"attempt-team-{index}",
+            canonical_name=f"Attempt Team {index}",
+            competition_id=COMPETITION_ID,
+            observed_at=NOW,
+            raw_asset_id=asset.id,  # type: ignore[attr-defined]
+        )
+        for index in range(2)
+    ]
+    match, _ = store.resolve_or_create_match(
+        source="fbref",
+        source_id="attempt-match",
+        competition_id=COMPETITION_ID,
+        season_id=SEASON_ID,
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        kickoff_at=NOW + timedelta(days=1),
+        status=MatchStatus.SCHEDULED,
+        observed_at=NOW,
+        raw_asset_id=asset.id,  # type: ignore[attr-defined]
+    )
+
+    blocked = store.record_collection_attempt(
+        match_id=match.id,
+        source="fbref-match-report",
+        target_url="https://fbref.example/matches/attempt-match",
+        outcome=CollectionAttemptOutcome.BLOCKED,
+        observed_at=NOW + timedelta(minutes=1),
+        collector_version="fbref-match-report/test",
+        diagnostic_code="blocked_by_access_control",
+        diagnostic_message="HTTP 403",
+    )
+
+    assert blocked.raw_asset_id is None
+    assert store.collection_attempts(SEASON_ID) == (blocked,)
+    with pytest.raises(ValueError, match="successful collection attempts require raw_asset_id"):
+        store.record_collection_attempt(
+            match_id=match.id,
+            source="fbref-match-report",
+            target_url="https://fbref.example/matches/attempt-match",
+            outcome=CollectionAttemptOutcome.SUCCEEDED,
+            observed_at=NOW + timedelta(minutes=2),
+            collector_version="fbref-match-report/test",
+        )
+
+
+def test_initialize_migrates_v1_match_versions_and_collection_attempts(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "canonical.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            );
+            INSERT INTO schema_meta(singleton, version) VALUES (1, 1);
+            CREATE TABLE match_versions (
+                match_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                kickoff_at TEXT,
+                status TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                raw_asset_id TEXT NOT NULL,
+                PRIMARY KEY (match_id, version)
+            );
+            """
+        )
+
+    store = CanonicalStore(path)
+    store.initialize()
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
+            == 2
+        )
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(match_versions)")}
+        assert "round_name" in columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'collection_attempts'"
+        ).fetchone()

@@ -21,12 +21,18 @@ class CompetitionRegistryTests(unittest.TestCase):
         competition = registry.competition(CompetitionId("competition:eng.1"))
         season = registry.season(SeasonId("season:eng.1.2025-26"))
 
+        self.assertEqual(registry.schema_version, 2)
         self.assertEqual(competition.name, "Premier League")
         self.assertEqual(season.label, "2025-26")
         self.assertEqual(season.expected_teams, 20)
         self.assertEqual(season.expected_matches, 380)
         self.assertEqual(season.source("fbref").competition_id, "9")
         self.assertEqual(season.source("fbref").season_id, "2025-2026")
+        self.assertEqual(len(season.teams), 20)
+        self.assertEqual(
+            season.team("fbref", "18bb7c10").id,
+            season.team("football-data", "Arsenal").id,
+        )
 
     def test_unknown_source_is_explicit(self) -> None:
         season = load_competition_registry().season(SeasonId("season:eng.1.2025-26"))

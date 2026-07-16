@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 
 [[competitions]]
 id = "competition:eng.1"
@@ -24,3 +24,243 @@ season_id = "2025-2026"
 source = "football-data"
 competition_id = "E0"
 season_id = "2526"
+
+[[competitions.seasons.teams]]
+id = "team:49735ef0-eac6-5e87-b98a-6038f0546134"
+name = "Arsenal"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "18bb7c10"
+alias = "Arsenal"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Arsenal"
+alias = "Arsenal"
+
+[[competitions.seasons.teams]]
+id = "team:2f24ecde-5fc0-5c72-bcf2-b6ece3ef54e0"
+name = "Aston Villa"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "8602292d"
+alias = "Aston Villa"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Aston Villa"
+alias = "Aston Villa"
+
+[[competitions.seasons.teams]]
+id = "team:5ee8c586-9645-59f7-83ed-b5acd25c4c77"
+name = "Bournemouth"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "4ba7cbea"
+alias = "Bournemouth"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Bournemouth"
+alias = "Bournemouth"
+
+[[competitions.seasons.teams]]
+id = "team:80c08df2-1669-5076-9cc8-9c0c9cbd48bf"
+name = "Brentford"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "cd051869"
+alias = "Brentford"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Brentford"
+alias = "Brentford"
+
+[[competitions.seasons.teams]]
+id = "team:e379cb98-b9e9-5c91-9636-73b206436262"
+name = "Brighton and Hove Albion"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "d07537b9"
+alias = "Brighton"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Brighton"
+alias = "Brighton"
+
+[[competitions.seasons.teams]]
+id = "team:ebb34015-6d39-5cb7-b320-1450aadaaa49"
+name = "Burnley"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "943e8050"
+alias = "Burnley"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Burnley"
+alias = "Burnley"
+
+[[competitions.seasons.teams]]
+id = "team:df03bf01-8776-56e0-ac01-9af932c33f0f"
+name = "Chelsea"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "cff3d9bb"
+alias = "Chelsea"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Chelsea"
+alias = "Chelsea"
+
+[[competitions.seasons.teams]]
+id = "team:d6f7daf3-d5a0-53a2-ac8c-e4ca98961fdf"
+name = "Crystal Palace"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "47c64c55"
+alias = "Crystal Palace"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Crystal Palace"
+alias = "Crystal Palace"
+
+[[competitions.seasons.teams]]
+id = "team:e3bf14d6-85e5-57d3-a4fa-b2d5ea8fbd94"
+name = "Everton"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "d3fd31cc"
+alias = "Everton"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Everton"
+alias = "Everton"
+
+[[competitions.seasons.teams]]
+id = "team:e14c8f9c-82dc-5f7b-9e81-aa38b25f6b7b"
+name = "Fulham"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "fd962109"
+alias = "Fulham"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Fulham"
+alias = "Fulham"
+
+[[competitions.seasons.teams]]
+id = "team:bbcd402e-0811-5264-961c-1f8fbe6afb63"
+name = "Leeds United"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "5bfb9659"
+alias = "Leeds United"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Leeds"
+alias = "Leeds"
+
+[[competitions.seasons.teams]]
+id = "team:3f3120c7-2c0c-5b24-b82a-23939e2c756b"
+name = "Liverpool"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "822bd0ba"
+alias = "Liverpool"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Liverpool"
+alias = "Liverpool"
+
+[[competitions.seasons.teams]]
+id = "team:dad2fd9a-7936-5b6f-ae40-866a2d7a6ab8"
+name = "Manchester City"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "b8fd03ef"
+alias = "Manchester City"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Man City"
+alias = "Man City"
+
+[[competitions.seasons.teams]]
+id = "team:ae4107de-6b0c-5615-9b48-1c3e7d4c4c65"
+name = "Manchester United"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "19538871"
+alias = "Manchester Utd"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Man United"
+alias = "Man United"
+
+[[competitions.seasons.teams]]
+id = "team:d9f08555-4b9d-51f2-ae8e-7e8de8d1d30c"
+name = "Newcastle United"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "b2b47a98"
+alias = "Newcastle Utd"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Newcastle"
+alias = "Newcastle"
+
+[[competitions.seasons.teams]]
+id = "team:14523c12-69d7-5319-ba2f-2ba200105ee1"
+name = "Nottingham Forest"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "e4a775cb"
+alias = "Nott'ham Forest"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Nott'm Forest"
+alias = "Nott'm Forest"
+
+[[competitions.seasons.teams]]
+id = "team:dfd606f7-cf12-5b4e-ae93-243b8cf7b78d"
+name = "Sunderland"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "8ef52968"
+alias = "Sunderland"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Sunderland"
+alias = "Sunderland"
+
+[[competitions.seasons.teams]]
+id = "team:2cf37361-4a2d-5ded-9fc0-500500ac7046"
+name = "Tottenham Hotspur"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "361ca564"
+alias = "Tottenham"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Tottenham"
+alias = "Tottenham"
+
+[[competitions.seasons.teams]]
+id = "team:1601ed29-778e-583c-a59a-fd8238770b4d"
+name = "West Ham United"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "7c21e445"
+alias = "West Ham"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "West Ham"
+alias = "West Ham"
+
+[[competitions.seasons.teams]]
+id = "team:ed1a50df-d5f9-56e4-802d-c5b2f5008538"
+name = "Wolverhampton Wanderers"
+[[competitions.seasons.teams.sources]]
+source = "fbref"
+source_id = "8cec06e1"
+alias = "Wolves"
+[[competitions.seasons.teams.sources]]
+source = "football-data"
+source_id = "Wolves"
+alias = "Wolves"

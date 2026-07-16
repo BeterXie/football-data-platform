@@ -166,6 +166,7 @@ def _validate_schedule(arguments: argparse.Namespace) -> int:
         parsed,
         season,
         attempted_fixture_ids=attempted,
+        source="fbref",
     )
     result = {
         "schedule_complete": coverage.schedule_complete,
@@ -175,6 +176,9 @@ def _validate_schedule(arguments: argparse.Namespace) -> int:
         "expected_teams": coverage.expected_teams,
         "actual_teams": coverage.actual_teams,
         "duplicate_fixture_ids": coverage.duplicate_fixture_ids,
+        "unregistered_team_ids": coverage.unregistered_team_ids,
+        "missing_registered_teams": coverage.missing_registered_teams,
+        "structural_violations": coverage.structural_violations,
         "missing_collection_attempts": coverage.missing_collection_attempts,
         "blocking_diagnostics": coverage.blocking_diagnostics,
     }
