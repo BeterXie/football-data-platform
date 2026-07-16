@@ -32,7 +32,11 @@ from football_data_platform.domain.training import (
 )
 from football_data_platform.models.score_grid import DixonColesGrid
 
-PREDICTION_SCHEMA_VERSION = 2
+PREDICTION_SCHEMA_VERSION = 3
+SCORE_GRID_COMPOSITION_SCHEMA_VERSION = 1
+SCORE_GRID_COMPOSITION_ARTIFACT_TYPE = "score-grid-composition"
+SCORE_GRID_COMPOSITION_CODE_VERSION = "football-data-platform/0.1.0"
+LEGACY_COMPOSITION_VERSION = "legacy-inline/1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +65,33 @@ class ScoreCell:
 
 
 @dataclass(frozen=True, slots=True)
+class PredictionContribution:
+    """The immutable contribution detail retained by a score prediction.
+
+    ``ExpectedGoalsContribution`` lives in the feature layer.  Predictions
+    intentionally carry this small domain copy so the persisted prediction
+    does not depend on importing or reconstructing feature objects later.
+    """
+
+    contribution_key: str
+    lambda_home_multiplier: float
+    lambda_away_multiplier: float
+    source_ref: str
+    version: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.contribution_key, "contribution_key")
+        _require_text(self.source_ref, "source_ref")
+        _require_text(self.version, "version")
+        for name, value in (
+            ("lambda_home_multiplier", self.lambda_home_multiplier),
+            ("lambda_away_multiplier", self.lambda_away_multiplier),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
 class ScorePrediction:
     id: PredictionId
     schema_version: int
@@ -80,6 +111,31 @@ class ScorePrediction:
     markets: tuple[MarketView, ...]
     normalization_residual: float
     input_refs: tuple[str, ...]
+    baseline_lambda_home: float | None = None
+    baseline_lambda_away: float | None = None
+    contribution_keys: tuple[str, ...] = ()
+    contribution_multipliers: tuple[PredictionContribution, ...] = ()
+    composition_version: str = LEGACY_COMPOSITION_VERSION
+    calibration_versions: tuple[str, ...] = ()
+    composition_artifact_ref: str | None = None
+
+    @property
+    def contributions(self) -> tuple[PredictionContribution, ...]:
+        """Compatibility alias for callers that use the feature terminology."""
+
+        return self.contribution_multipliers
+
+    @property
+    def composition_ref(self) -> str | None:
+        """Short alias used by report and registry consumers."""
+
+        return self.composition_artifact_ref
+
+    @property
+    def grid_artifact_ref(self) -> str | None:
+        """The composition artifact contains the canonical Dixon-Coles grid."""
+
+        return self.composition_artifact_ref
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,8 +299,19 @@ def build_score_prediction(
     max_goals: int,
     input_refs: tuple[str, ...],
     model_run_validator: ModelRunValidator | None = None,
+    expected_goals: Any | None = None,
+    composition: Any | None = None,
+    composition_artifact_ref: str | None = None,
+    calibration_versions: tuple[str, ...] | None = None,
 ) -> ScorePrediction:
-    """Build the one score distribution consumed by every football market view."""
+    """Build the one score distribution consumed by every football market view.
+
+    ``expected_goals`` (or its ``composition`` alias) is the preferred input
+    because it carries the baseline and auditable feature contributions.  A
+    legacy low-level caller may omit it; that path is explicitly represented
+    as ``legacy-inline/1`` and still receives a content-addressed composition
+    reference so persistence cannot silently lose provenance.
+    """
 
     verify_snapshot(snapshot, source_validator=snapshot_validator)
     require_utc(generated_at, "generated_at")
@@ -253,6 +320,26 @@ def build_score_prediction(
         raise ValueError("formal score predictions require a ready snapshot")
     if generated_at < snapshot.as_of:
         raise ValueError("prediction generated_at cannot precede snapshot as_of")
+    if expected_goals is not None and composition is not None:
+        raise ValueError("pass only one of expected_goals or composition")
+    expected_goals = expected_goals if expected_goals is not None else composition
+    (
+        baseline_lambda_home,
+        baseline_lambda_away,
+        contribution_keys,
+        contribution_multipliers,
+        composition_version,
+        resolved_calibration_versions,
+        composition_input_refs,
+    ) = _prediction_composition_metadata(
+        expected_goals,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
+        calibration_versions=calibration_versions,
+    )
+    normalized_input_refs = tuple(
+        sorted({*input_refs, snapshot.id.value, model_run_id.value, *composition_input_refs})
+    )
     grid = DixonColesGrid(lambda_home, lambda_away, rho=rho, max_goals=max_goals)
     result = grid.result_probabilities()
     handicap = grid.handicap_probabilities(-1)
@@ -263,6 +350,34 @@ def build_score_prediction(
         _market_view("total_goals", "0-6,7+", totals),
     )
     cells = tuple(ScoreCell(**cell) for cell in grid.score_cells())
+    composition_payload = _score_grid_composition_payload_from_values(
+        match_id=snapshot.match_id,
+        snapshot_id=snapshot.id,
+        model_run_id=model_run_id,
+        model_version=model_version,
+        generated_at=generated_at,
+        snapshot_as_of=snapshot.as_of,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contribution_keys=contribution_keys,
+        contribution_multipliers=contribution_multipliers,
+        composition_version=composition_version,
+        calibration_versions=resolved_calibration_versions,
+        lambda_home=grid.lambda_home,
+        lambda_away=grid.lambda_away,
+        rho=grid.rho,
+        max_goals=grid.max_goals,
+        normalization_residual=grid.normalization_residual,
+        score_cells=cells,
+        input_refs=normalized_input_refs,
+    )
+    expected_composition_ref = score_grid_composition_artifact_id(composition_payload)
+    if (
+        composition_artifact_ref is not None
+        and composition_artifact_ref != expected_composition_ref
+    ):
+        raise ValueError("composition_artifact_ref does not match its content")
+    composition_artifact_ref = expected_composition_ref
     payload = {
         "schema_version": PREDICTION_SCHEMA_VERSION,
         "match_id": snapshot.match_id.value,
@@ -280,7 +395,16 @@ def build_score_prediction(
         "score_cells": [_score_cell_payload(cell) for cell in cells],
         "markets": [_market_payload(market) for market in markets],
         "normalization_residual": grid.normalization_residual,
-        "input_refs": sorted({*input_refs, snapshot.id.value}),
+        "input_refs": list(normalized_input_refs),
+        "baseline_lambda_home": baseline_lambda_home,
+        "baseline_lambda_away": baseline_lambda_away,
+        "contribution_keys": list(contribution_keys),
+        "contribution_multipliers": [
+            _prediction_contribution_payload(item) for item in contribution_multipliers
+        ],
+        "composition_version": composition_version,
+        "calibration_versions": list(resolved_calibration_versions),
+        "composition_artifact_ref": composition_artifact_ref,
     }
     digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
     prediction = ScorePrediction(
@@ -301,7 +425,14 @@ def build_score_prediction(
         score_cells=cells,
         markets=markets,
         normalization_residual=grid.normalization_residual,
-        input_refs=tuple(sorted({*input_refs, snapshot.id.value})),
+        input_refs=normalized_input_refs,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contribution_keys=contribution_keys,
+        contribution_multipliers=contribution_multipliers,
+        composition_version=composition_version,
+        calibration_versions=resolved_calibration_versions,
+        composition_artifact_ref=composition_artifact_ref,
     )
     verify_score_prediction(prediction, model_run_validator=model_run_validator)
     return prediction
@@ -341,6 +472,7 @@ def verify_score_prediction(
         or any(not isinstance(item, str) or not item for item in prediction.input_refs)
     ):
         raise ValueError("prediction input_refs must be unique, sorted, and cite the snapshot")
+    _verify_prediction_composition_metadata(prediction)
 
     grid = DixonColesGrid(
         prediction.lambda_home,
@@ -366,6 +498,10 @@ def verify_score_prediction(
     digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
     if prediction.id != PredictionId(f"prediction:{digest}"):
         raise ValueError("prediction identity does not match its canonical content")
+    composition_payload = score_grid_composition_payload(prediction)
+    expected_composition_ref = score_grid_composition_artifact_id(composition_payload)
+    if prediction.composition_artifact_ref != expected_composition_ref:
+        raise ValueError("prediction composition artifact reference does not match its content")
     if model_run_validator is not None:
         _verify_prediction_model_run(prediction, model_run_validator)
 
@@ -390,6 +526,15 @@ def prediction_payload(prediction: ScorePrediction) -> dict[str, Any]:
         "markets": [_market_payload(market) for market in prediction.markets],
         "normalization_residual": prediction.normalization_residual,
         "input_refs": list(prediction.input_refs),
+        "baseline_lambda_home": prediction.baseline_lambda_home,
+        "baseline_lambda_away": prediction.baseline_lambda_away,
+        "contribution_keys": list(prediction.contribution_keys),
+        "contribution_multipliers": [
+            _prediction_contribution_payload(item) for item in prediction.contribution_multipliers
+        ],
+        "composition_version": prediction.composition_version,
+        "calibration_versions": list(prediction.calibration_versions),
+        "composition_artifact_ref": prediction.composition_artifact_ref,
     }
 
 
@@ -405,6 +550,36 @@ def parse_prediction_payload(
     if payload.get("schema_version") != PREDICTION_SCHEMA_VERSION:
         raise ValueError(f"unsupported prediction schema_version {payload.get('schema_version')!r}")
     try:
+        contribution_payloads = payload.get("contribution_multipliers", ())
+        if not isinstance(contribution_payloads, (list, tuple)):
+            raise ValueError("contribution_multipliers must be a sequence")
+        from football_data_platform.features.contributions import (
+            ExpectedGoals,
+            ExpectedGoalsContribution,
+        )
+
+        contributions = tuple(
+            ExpectedGoalsContribution(
+                contribution_key=str(item["contribution_key"]),
+                lambda_home_multiplier=float(item["lambda_home_multiplier"]),
+                lambda_away_multiplier=float(item["lambda_away_multiplier"]),
+                source_ref=str(item["source_ref"]),
+                version=str(item["version"]),
+            )
+            for item in contribution_payloads
+        )
+        expected_goals = ExpectedGoals(
+            lambda_home=float(payload["lambda_home"]),
+            lambda_away=float(payload["lambda_away"]),
+            contribution_keys=tuple(str(item) for item in payload["contribution_keys"]),
+            input_refs=tuple(
+                str(item) for contribution in contributions for item in (contribution.source_ref,)
+            ),
+            baseline_lambda_home=float(payload["baseline_lambda_home"]),
+            baseline_lambda_away=float(payload["baseline_lambda_away"]),
+            composition_version=str(payload["composition_version"]),
+            contributions=contributions,
+        )
         prediction = build_score_prediction(
             snapshot=snapshot,
             snapshot_validator=snapshot_validator,
@@ -419,12 +594,262 @@ def parse_prediction_payload(
             max_goals=int(payload["max_goals"]),
             input_refs=tuple(str(item) for item in payload["input_refs"]),
             model_run_validator=model_run_validator,
+            expected_goals=expected_goals,
+            composition_artifact_ref=str(payload["composition_artifact_ref"]),
+            calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid prediction schema: {error}") from error
     if prediction_payload(prediction) != payload:
         raise ValueError("prediction payload does not match its canonical score grid")
     return prediction
+
+
+def _prediction_composition_metadata(
+    expected_goals: Any | None,
+    *,
+    lambda_home: float,
+    lambda_away: float,
+    calibration_versions: tuple[str, ...] | None,
+) -> tuple[
+    float,
+    float,
+    tuple[str, ...],
+    tuple[PredictionContribution, ...],
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    if expected_goals is None:
+        if (
+            not math.isfinite(lambda_home)
+            or not math.isfinite(lambda_away)
+            or lambda_home <= 0
+            or lambda_away <= 0
+        ):
+            raise ValueError("prediction lambdas must be finite and positive")
+        return (
+            float(lambda_home),
+            float(lambda_away),
+            (),
+            (),
+            LEGACY_COMPOSITION_VERSION,
+            tuple(sorted(set(calibration_versions or ()))),
+            (),
+        )
+
+    try:
+        baseline_home = float(expected_goals.baseline_lambda_home)
+        baseline_away = float(expected_goals.baseline_lambda_away)
+        raw_keys = tuple(str(item) for item in expected_goals.contribution_keys)
+        raw_contributions = tuple(expected_goals.contributions)
+        composition_version = str(expected_goals.composition_version)
+        raw_input_refs = tuple(str(item) for item in expected_goals.input_refs)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("expected_goals does not satisfy the composition contract") from error
+    if (
+        not math.isfinite(baseline_home)
+        or not math.isfinite(baseline_away)
+        or baseline_home <= 0
+        or baseline_away <= 0
+    ):
+        raise ValueError("expected-goals baseline lambdas must be finite and positive")
+    _require_text(composition_version, "composition_version")
+    contributions = tuple(_prediction_contribution(item) for item in raw_contributions)
+    keys = tuple(item.contribution_key for item in contributions)
+    if raw_keys != keys:
+        raise ValueError("expected-goals contribution keys do not match contribution details")
+    if keys != tuple(sorted(set(keys))):
+        raise ValueError("expected-goals contribution keys must be unique and sorted")
+    source_refs = tuple(item.source_ref for item in contributions)
+    input_refs = tuple(sorted(set((*raw_input_refs, *source_refs))))
+    if any(not item for item in input_refs):
+        raise ValueError("expected-goals input refs must be non-empty")
+    composed_home = baseline_home * math.prod(item.lambda_home_multiplier for item in contributions)
+    composed_away = baseline_away * math.prod(item.lambda_away_multiplier for item in contributions)
+    if not math.isclose(composed_home, lambda_home, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("expected-goals home lambda does not match prediction")
+    if not math.isclose(composed_away, lambda_away, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("expected-goals away lambda does not match prediction")
+    explicit_calibrations = (
+        calibration_versions
+        if calibration_versions is not None
+        else tuple(getattr(expected_goals, "calibration_versions", ()))
+    )
+    resolved_calibration_versions = tuple(sorted(set(explicit_calibrations)))
+    return (
+        baseline_home,
+        baseline_away,
+        keys,
+        contributions,
+        composition_version,
+        resolved_calibration_versions,
+        input_refs,
+    )
+
+
+def _prediction_contribution(value: Any) -> PredictionContribution:
+    try:
+        return PredictionContribution(
+            contribution_key=str(value.contribution_key),
+            lambda_home_multiplier=float(value.lambda_home_multiplier),
+            lambda_away_multiplier=float(value.lambda_away_multiplier),
+            source_ref=str(value.source_ref),
+            version=str(value.version),
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("invalid expected-goals contribution") from error
+
+
+def _verify_prediction_composition_metadata(prediction: ScorePrediction) -> None:
+    for name, value in (
+        ("baseline_lambda_home", prediction.baseline_lambda_home),
+        ("baseline_lambda_away", prediction.baseline_lambda_away),
+    ):
+        if value is None or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"prediction {name} must be finite and positive")
+    _require_text(prediction.composition_version, "composition_version")
+    if prediction.contribution_keys != tuple(sorted(set(prediction.contribution_keys))):
+        raise ValueError("prediction contribution keys must be unique and sorted")
+    if any(not isinstance(item, str) or not item for item in prediction.contribution_keys):
+        raise ValueError("prediction contribution keys must be non-empty text")
+    if any(
+        not isinstance(item, PredictionContribution) for item in prediction.contribution_multipliers
+    ):
+        raise TypeError("prediction contribution multipliers must be PredictionContribution values")
+    contribution_keys = tuple(item.contribution_key for item in prediction.contribution_multipliers)
+    if contribution_keys != prediction.contribution_keys:
+        raise ValueError("prediction contribution keys do not match multiplier details")
+    if prediction.calibration_versions != tuple(sorted(set(prediction.calibration_versions))):
+        raise ValueError("prediction calibration_versions must be unique and sorted")
+    if any(not isinstance(item, str) or not item for item in prediction.calibration_versions):
+        raise ValueError("prediction calibration_versions must be non-empty text")
+    for item in prediction.contribution_multipliers:
+        if item.source_ref not in prediction.input_refs:
+            raise ValueError("prediction contribution source is missing from input_refs")
+    calculated_home = prediction.baseline_lambda_home * math.prod(
+        item.lambda_home_multiplier for item in prediction.contribution_multipliers
+    )
+    calculated_away = prediction.baseline_lambda_away * math.prod(
+        item.lambda_away_multiplier for item in prediction.contribution_multipliers
+    )
+    if not math.isclose(calculated_home, prediction.lambda_home, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("prediction home lambda is not reproducible from its composition")
+    if not math.isclose(calculated_away, prediction.lambda_away, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("prediction away lambda is not reproducible from its composition")
+    if prediction.composition_artifact_ref is None:
+        raise ValueError("prediction requires a composition artifact reference")
+    _require_content_ref(prediction.composition_artifact_ref, "composition_artifact_ref")
+
+
+def score_grid_composition_payload(prediction: ScorePrediction) -> dict[str, Any]:
+    """Return the canonical derived payload referenced by a prediction."""
+
+    return _score_grid_composition_payload_from_values(
+        match_id=prediction.match_id,
+        snapshot_id=prediction.snapshot_id,
+        model_run_id=prediction.model_run_id,
+        model_version=prediction.model_version,
+        generated_at=prediction.generated_at,
+        snapshot_as_of=prediction.snapshot_as_of,
+        baseline_lambda_home=prediction.baseline_lambda_home,
+        baseline_lambda_away=prediction.baseline_lambda_away,
+        contribution_keys=prediction.contribution_keys,
+        contribution_multipliers=prediction.contribution_multipliers,
+        composition_version=prediction.composition_version,
+        calibration_versions=prediction.calibration_versions,
+        lambda_home=prediction.lambda_home,
+        lambda_away=prediction.lambda_away,
+        rho=prediction.rho,
+        max_goals=prediction.max_goals,
+        normalization_residual=prediction.normalization_residual,
+        score_cells=prediction.score_cells,
+        input_refs=prediction.input_refs,
+    )
+
+
+def _score_grid_composition_payload_from_values(
+    *,
+    match_id: MatchId,
+    snapshot_id: SnapshotId,
+    model_run_id: ModelRunId,
+    model_version: str,
+    generated_at: datetime,
+    snapshot_as_of: datetime,
+    baseline_lambda_home: float | None,
+    baseline_lambda_away: float | None,
+    contribution_keys: tuple[str, ...],
+    contribution_multipliers: tuple[PredictionContribution, ...],
+    composition_version: str,
+    calibration_versions: tuple[str, ...],
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    max_goals: int,
+    normalization_residual: float,
+    score_cells: tuple[ScoreCell, ...],
+    input_refs: tuple[str, ...],
+) -> dict[str, Any]:
+    contributions = [_prediction_contribution_payload(item) for item in contribution_multipliers]
+    grid = {
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+        "rho": rho,
+        "max_goals": max_goals,
+        "normalization_residual": normalization_residual,
+        "score_cells": [_score_cell_payload(item) for item in score_cells],
+    }
+    return {
+        "schema_version": SCORE_GRID_COMPOSITION_SCHEMA_VERSION,
+        "artifact_type": SCORE_GRID_COMPOSITION_ARTIFACT_TYPE,
+        "match_id": match_id.value,
+        "snapshot_id": snapshot_id.value,
+        "model_run_id": model_run_id.value,
+        "model_version": model_version,
+        "generated_at": _timestamp(generated_at),
+        "snapshot_as_of": _timestamp(snapshot_as_of),
+        "baseline_lambda_home": baseline_lambda_home,
+        "baseline_lambda_away": baseline_lambda_away,
+        "contribution_keys": list(contribution_keys),
+        "contribution_multipliers": contributions,
+        "composition_version": composition_version,
+        "calibration_versions": list(calibration_versions),
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+        "rho": rho,
+        "max_goals": max_goals,
+        "normalization_residual": normalization_residual,
+        "score_cells": grid["score_cells"],
+        "input_refs": list(input_refs),
+        "grid": grid,
+    }
+
+
+def score_grid_composition_output_ref(payload: dict[str, Any]) -> str:
+    digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+    return f"score-grid-composition:{digest}"
+
+
+def score_grid_composition_artifact_id(payload: dict[str, Any]) -> str:
+    """Return the immutable content reference for a composition payload.
+
+    The reference is deliberately derived from the payload only.  Runtime
+    metadata belongs to the derived manifest and must not change the logical
+    composition identity or force the prediction builder to duplicate storage
+    envelope hashing rules.
+    """
+
+    return score_grid_composition_output_ref(payload)
+
+
+def _prediction_contribution_payload(item: PredictionContribution) -> dict[str, Any]:
+    return {
+        "contribution_key": item.contribution_key,
+        "lambda_home_multiplier": item.lambda_home_multiplier,
+        "lambda_away_multiplier": item.lambda_away_multiplier,
+        "source_ref": item.source_ref,
+        "version": item.version,
+    }
 
 
 def _verify_prediction_model_run(
@@ -550,3 +975,11 @@ def _timestamp(value: datetime) -> str:
 def _require_text(value: str, field_name: str) -> None:
     if not value or value.strip() != value:
         raise ValueError(f"{field_name} must be non-empty text without surrounding whitespace")
+
+
+def _require_content_ref(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value.startswith("score-grid-composition:"):
+        raise ValueError(f"{field_name} must be a score-grid-composition reference")
+    digest = value.removeprefix("score-grid-composition:")
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(f"{field_name} must contain a 64-character content digest")

@@ -36,7 +36,14 @@ from football_data_platform.domain.models import (
     RawAsset,
     SourceMapping,
 )
-from football_data_platform.domain.predictions import ModelRunValidator, verify_match_result_source
+from football_data_platform.domain.predictions import (
+    ModelRunValidator,
+    PredictionContribution,
+    ScorePrediction,
+    score_grid_composition_artifact_id,
+    score_grid_composition_payload,
+    verify_match_result_source,
+)
 from football_data_platform.domain.training import (
     DatasetStatus,
     FeatureLabelSample,
@@ -61,6 +68,8 @@ __all__ = [
     "CandidateDecision",
     "MatchResultValidator",
     "ModelRunValidator",
+    "PredictionContribution",
+    "ScorePrediction",
     "MappingRule",
     "Match",
     "MatchId",
@@ -101,6 +110,8 @@ __all__ = [
     "settle_paper_bet",
     "verify_paper_bet_entry",
     "verify_match_result_source",
+    "score_grid_composition_artifact_id",
+    "score_grid_composition_payload",
     "verify_model_run_artifact",
     "verify_training_dataset",
 ]

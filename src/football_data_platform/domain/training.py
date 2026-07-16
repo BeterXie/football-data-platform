@@ -24,10 +24,14 @@ TRAINING_DATASET_SCHEMA_VERSION = 1
 MODEL_RUN_ARTIFACT_SCHEMA_VERSION = 1
 _DATASET_PREFIX = "training-dataset:"
 _MODEL_RUN_PREFIX = "model-run:"
+MODEL_ARTIFACT_REF_PREFIX = "model-artifact:"
+MODEL_OUTPUT_REF_PREFIX = "model-output:"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _KNOWN_DATASET_STATUSES = frozenset({"succeeded", "partial", "failed"})
 _KNOWN_MODEL_STATUSES = frozenset({"succeeded", "partial", "failed"})
 _KNOWN_SPLITS = frozenset({"train", "validation", "test", "holdout"})
+_OUT_OF_TIME_SPLITS = frozenset({"validation", "test", "holdout"})
+_TEMPORAL_SPLIT_MARKERS = ("forward", "rolling", "temporal")
 
 
 class TrainingArtifactConflict(ValueError):
@@ -488,6 +492,22 @@ def verify_model_run_artifact(
             raise ValueError("model evaluation cohort label version mismatch")
         if any(sample.capture_mode is not artifact.evaluation_capture_mode for sample in cohort):
             raise ValueError("model evaluation cohort capture mode does not match manifest")
+        if any(sample.split not in _OUT_OF_TIME_SPLITS for sample in cohort):
+            raise ValueError("model evaluation cohort must use an out-of-time split, not train")
+        if artifact.status in {ModelRunStatus.SUCCEEDED, ModelRunStatus.PARTIAL}:
+            strategy = dataset.split_strategy.lower()
+            if not any(marker in strategy for marker in _TEMPORAL_SPLIT_MARKERS):
+                raise ValueError("model evaluation requires a forward or temporal split strategy")
+            training = [
+                sample for sample in dataset.samples if sample.eligible and sample.split == "train"
+            ]
+            if not training:
+                raise ValueError("model run requires at least one eligible training sample")
+            latest_training_as_of = max(sample.as_of for sample in training)
+            if any(sample.as_of <= latest_training_as_of for sample in cohort):
+                raise ValueError(
+                    "model evaluation cohort must be strictly later than the training window"
+                )
 
 
 def training_sample_payload(sample: TrainingSample) -> dict[str, Any]:
@@ -676,11 +696,17 @@ def _model_run_fields(**kwargs: Any) -> dict[str, Any]:
     if not isinstance(kwargs["evaluation_capture_mode"], CaptureMode):
         raise TypeError("evaluation_capture_mode must be a CaptureMode")
     model_refs = _normalize_refs(kwargs["model_artifact_refs"], "model_artifact_refs")
-    cohort = _normalize_refs(kwargs["evaluation_cohort"], "evaluation_cohort")
+    cohort = _normalize_unique_refs(kwargs["evaluation_cohort"], "evaluation_cohort")
     output_refs = _normalize_refs(kwargs["output_refs"], "output_refs")
     hashes = tuple(kwargs["output_hashes"])
     if len(output_refs) != len(hashes) or any(not _DIGEST.fullmatch(str(item)) for item in hashes):
         raise ValueError("output_refs and output_hashes must have matching SHA-256 entries")
+    for reference in model_refs:
+        _validate_digest_id(reference, MODEL_ARTIFACT_REF_PREFIX, "model_artifact_refs")
+    for reference, digest in zip(output_refs, hashes, strict=True):
+        _validate_digest_id(reference, MODEL_OUTPUT_REF_PREFIX, "output_refs")
+        if reference.removeprefix(MODEL_OUTPUT_REF_PREFIX) != str(digest):
+            raise ValueError("output reference digest must match its output_hash")
     status = ModelRunStatus(kwargs["status"])
     if kwargs["run_role"] in {"formal", "champion"} and (
         kwargs["evaluation_capture_mode"] is not CaptureMode.CAPTURED
@@ -755,6 +781,19 @@ def _normalize_refs(refs: Sequence[str], field_name: str) -> tuple[str, ...]:
 
 def _normalize_reasons(reasons: Sequence[str]) -> tuple[str, ...]:
     normalized = _normalize_refs(reasons, "exclusion_reasons")
+    return normalized
+
+
+def _normalize_unique_refs(refs: Sequence[str], field_name: str) -> tuple[str, ...]:
+    if isinstance(refs, (str, bytes)):
+        raise ValueError(f"{field_name} must be a sequence of references")
+    try:
+        values = tuple(refs)
+    except TypeError as error:
+        raise ValueError(f"{field_name} must be a sequence of references") from error
+    normalized = _normalize_refs(values, field_name)
+    if len(normalized) != len(values):
+        raise ValueError(f"{field_name} must not contain duplicate references")
     return normalized
 
 

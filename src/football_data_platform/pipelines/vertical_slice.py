@@ -21,9 +21,15 @@ from football_data_platform.domain.predictions import (
     prediction_payload,
 )
 from football_data_platform.domain.snapshots import (
+    CaptureMode,
     SnapshotFeature,
     SnapshotType,
     build_snapshot,
+)
+from football_data_platform.domain.training import (
+    ModelRunArtifact,
+    TrainingDatasetManifest,
+    TrainingSample,
 )
 from football_data_platform.evaluation.metrics import evaluate_prediction
 from football_data_platform.features.contributions import (
@@ -56,11 +62,13 @@ from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
     DerivedArchive,
+    DerivedArtifactManifest,
     RunManifest,
 )
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
+from football_data_platform.storage.training import TrainingArtifactStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +170,7 @@ def _run_offline_vertical_slice(
         raise ValueError("first golden fixture requires a real 90-minute result")
 
     facts = CanonicalFactStore(canonical)
-    facts.append_result_90(
+    first_result_fact = facts.append_result_90(
         match_id=first_match_id,
         match_version=1,
         home_goals=first_fixture.home_goals,
@@ -435,10 +443,126 @@ def _run_offline_vertical_slice(
     composition = (
         lineups_composition if prediction_snapshot is lineups_snapshot else t24_composition
     )
+    composition_calibration_versions = tuple(
+        sorted({item.version for item in composition.contributions})
+    )
+    model_store = TrainingArtifactStore(layout)
+    train_as_of = first_report_known_at - timedelta(hours=1)
+    holdout_as_of = prediction_snapshot.as_of
+    training_sample = TrainingSample(
+        sample_id=f"sample:{first_match_id.value}:score-model",
+        as_of=train_as_of,
+        feature_known_at=first_report_known_at - timedelta(hours=2),
+        label_known_at=first_report_known_at + timedelta(hours=1),
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/vertical-slice-1",
+        label_version="result-90/1",
+        feature_refs=tuple(sorted((baseline.artifact_id, report_ingest.raw_asset_id))),
+        label_ref=first_result_fact.record_id,
+        features={
+            "lambda_home": lambda_home,
+            "lambda_away": lambda_away,
+            "rho": -0.1,
+        },
+        label={
+            "home_goals": first_fixture.home_goals,
+            "away_goals": first_fixture.away_goals,
+        },
+        split="train",
+    )
+    holdout_sample = TrainingSample(
+        sample_id=f"sample:{second_match_id.value}:score-model",
+        as_of=holdout_as_of,
+        feature_known_at=holdout_as_of - timedelta(hours=1),
+        label_known_at=second_result_known_at,
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/vertical-slice-1",
+        label_version="result-90/1",
+        feature_refs=tuple(
+            sorted({baseline.artifact_id, prediction_snapshot.id.value, *composition.input_refs})
+        ),
+        label_ref=result_fact.record_id,
+        features={
+            "lambda_home": composition.lambda_home,
+            "lambda_away": composition.lambda_away,
+            "rho": -0.1,
+        },
+        label={
+            "home_goals": second_fixture.home_goals,
+            "away_goals": second_fixture.away_goals,
+        },
+        split="holdout",
+    )
+    training_dataset = TrainingDatasetManifest.create(
+        dataset_version="score-dataset/vertical-slice-1",
+        task="score-model",
+        qualification="score-model-ready",
+        qualification_ruleset_version="readiness/1",
+        feature_version="score-features/vertical-slice-1",
+        label_version="result-90/1",
+        as_of=holdout_as_of,
+        split_strategy="forward-chaining/1",
+        samples=(training_sample, holdout_sample),
+        generated_at=observed_at,
+        transform_version="training-dataset/vertical-slice-1",
+        code_version=DERIVED_CODE_VERSION,
+    )
+    model_store.write_dataset(training_dataset)
+    model_ref = model_store.write_model_artifact(
+        json.dumps(
+            {
+                "algorithm": "dixon-coles",
+                "model_version": "dixon-coles-composed/1",
+                "rho": -0.1,
+                "max_goals": 11,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    output_ref = model_store.write_model_output(
+        json.dumps(
+            {
+                "evaluation_cohort": [holdout_sample.sample_id],
+                "capture_mode": CaptureMode.RECONSTRUCTED.value,
+                "status": "shadow-replay",
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    model_run = ModelRunArtifact.create(
+        model_version="dixon-coles-composed/1",
+        run_role="shadow",
+        task="score-model",
+        dataset_id=training_dataset.dataset_id,
+        feature_version=training_dataset.feature_version,
+        label_version=training_dataset.label_version,
+        algorithm="dixon-coles",
+        parameters={"rho": -0.1, "max_goals": 11},
+        code_version=DERIVED_CODE_VERSION,
+        environment_version="python-runtime:locked",
+        started_at=observed_at - timedelta(seconds=2),
+        ended_at=observed_at - timedelta(seconds=1),
+        random_seed=0,
+        model_artifact_refs=(model_ref,),
+        evaluation_cohort=(holdout_sample.sample_id,),
+        evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
+        output_refs=(output_ref,),
+        output_hashes=(output_ref.removeprefix("model-output:"),),
+    )
+    model_store.write_model_run(model_run)
+    derived.model_run_validator = model_store
     prediction = build_score_prediction(
         snapshot=prediction_snapshot,
         snapshot_validator=derived,
-        model_run_id=ModelRunId("model-run:dixon-coles-baseline-v1"),
+        model_run_id=ModelRunId(model_run.model_run_id),
         model_version="dixon-coles-composed/1",
         generated_at=observed_at,
         lambda_home=composition.lambda_home,
@@ -449,6 +573,8 @@ def _run_offline_vertical_slice(
             baseline.artifact_id,
             *composition.input_refs,
         ),
+        expected_goals=composition,
+        calibration_versions=composition_calibration_versions,
     )
     derived.write_prediction(prediction)
     evaluation = evaluate_prediction(
@@ -496,19 +622,27 @@ def _run_offline_vertical_slice(
         "observed_at": _timestamp(observed_at),
         "snapshot_ids": [t24_snapshot.id.value, lineups_snapshot.id.value],
         "prediction_id": prediction.id.value,
+        "training_dataset_id": training_dataset.dataset_id,
+        "model_run_id": model_run.model_run_id,
         "result_fact_id": result_fact.record_id,
     }
+    semantic_digest = hashlib.sha256(_canonical_json(run_identity)).hexdigest()
+    summary_logical_ref = f"vertical-slice-summary:{semantic_digest}"
+    report_logical_ref = f"vertical-slice-report:{semantic_digest}"
     run_manifest = RunManifest.create(
         run_type="offline-golden-replay",
         started_at=observed_at,
         ended_at=observed_at,
         generated_at=observed_at,
-        transform_version="vertical-slice/2",
+        transform_version="vertical-slice/3",
         code_version=DERIVED_CODE_VERSION,
         input_refs=(
             schedule_ingest.raw_asset_id,
             report_ingest.raw_asset_id,
             lineup_asset.id.value,
+            training_dataset.dataset_id,
+            model_ref,
+            output_ref,
         ),
         output_refs=(
             baseline_manifest_id,
@@ -517,6 +651,13 @@ def _run_offline_vertical_slice(
             t24_snapshot.id.value,
             lineups_snapshot.id.value,
             prediction.id.value,
+            prediction.composition_artifact_ref,
+            training_dataset.dataset_id,
+            model_run.model_run_id,
+            model_ref,
+            output_ref,
+            summary_logical_ref,
+            report_logical_ref,
         ),
         status="succeeded",
         error=None,
@@ -557,6 +698,18 @@ def _run_offline_vertical_slice(
             "lambda_away": composition.lambda_away,
             "contribution_keys": list(composition.contribution_keys),
             "input_refs": list(composition.input_refs),
+            "calibration_versions": list(prediction.calibration_versions),
+            "contribution_multipliers": [
+                {
+                    "contribution_key": item.contribution_key,
+                    "lambda_home_multiplier": item.lambda_home_multiplier,
+                    "lambda_away_multiplier": item.lambda_away_multiplier,
+                    "source_ref": item.source_ref,
+                    "version": item.version,
+                }
+                for item in prediction.contribution_multipliers
+            ],
+            "composition_artifact_ref": prediction.composition_artifact_ref,
             "prediction_snapshot": prediction_snapshot.snapshot_type.value,
         },
         "player_profiles": {
@@ -567,6 +720,10 @@ def _run_offline_vertical_slice(
             "team_baseline": baseline_manifest_id,
             "player_profiles": profile_manifest_id,
             "evaluation": evaluation_manifest_id,
+            "training_dataset": training_dataset.dataset_id,
+            "model_run": model_run.model_run_id,
+            "model_artifact": model_ref,
+            "model_output": output_ref,
         },
         "prediction": prediction_payload(prediction),
         "evaluation": _evaluation_summary(evaluation),
@@ -589,6 +746,17 @@ def _run_offline_vertical_slice(
         raise ArchiveConflictError(f"derived report conflicts at {report_path}")
     write_static_report(report_path, report_content)
     derived.write_run_manifest(run_manifest)
+    _register_static_outputs(
+        derived=derived,
+        run_manifest=run_manifest,
+        summary=summary,
+        summary_path=summary_path,
+        report_content=report_content,
+        report_path=report_path,
+        summary_logical_ref=summary_logical_ref,
+        report_logical_ref=report_logical_ref,
+        generated_at=observed_at,
+    )
     return VerticalSliceResult(
         run_id,
         summary_path,
@@ -598,6 +766,76 @@ def _run_offline_vertical_slice(
         prediction.id.value,
         canonical.counts(),
     )
+
+
+def _register_static_outputs(
+    *,
+    derived: DerivedArchive,
+    run_manifest: RunManifest,
+    summary: dict[str, Any],
+    summary_path: Path,
+    report_content: str,
+    report_path: Path,
+    summary_logical_ref: str,
+    report_logical_ref: str,
+    generated_at: datetime,
+) -> tuple[str, str, str]:
+    """Register immutable report payloads without making the parent run ID self-referential."""
+
+    summary_ref = _file_content_ref(summary_path)
+    report_ref = _file_content_ref(report_path)
+    summary_artifact = DerivedArtifactManifest.create(
+        artifact_type="vertical-slice-summary",
+        payload=summary,
+        generated_at=generated_at,
+        started_at=generated_at,
+        ended_at=generated_at,
+        transform_version="vertical-slice-report/1",
+        code_version=DERIVED_CODE_VERSION,
+        input_refs=(run_manifest.run_id, *run_manifest.input_refs),
+        output_refs=(summary_logical_ref, summary_ref),
+        quality=run_manifest.quality,
+    )
+    report_artifact = DerivedArtifactManifest.create(
+        artifact_type="vertical-slice-report",
+        payload={
+            "run_id": run_manifest.run_id,
+            "content_sha256": report_ref.removeprefix("file-sha256:"),
+            "content": report_content,
+        },
+        generated_at=generated_at,
+        started_at=generated_at,
+        ended_at=generated_at,
+        transform_version="vertical-slice-report/1",
+        code_version=DERIVED_CODE_VERSION,
+        input_refs=(run_manifest.run_id, summary_artifact.artifact_id),
+        output_refs=(report_logical_ref, report_ref),
+        quality=run_manifest.quality,
+    )
+    derived.write_artifact_manifest(summary_artifact)
+    derived.write_artifact_manifest(report_artifact)
+    registration = RunManifest.create(
+        run_type="offline-golden-output-registration",
+        started_at=generated_at,
+        ended_at=generated_at,
+        generated_at=generated_at,
+        transform_version="vertical-slice-report/1",
+        code_version=DERIVED_CODE_VERSION,
+        input_refs=(run_manifest.run_id, summary_logical_ref, report_logical_ref),
+        output_refs=(summary_artifact.artifact_id, report_artifact.artifact_id),
+        status="succeeded",
+        error=None,
+        quality=run_manifest.quality,
+        parameters={"parent_run_id": run_manifest.run_id},
+        checkpoint="static-artifacts-registered",
+        payload={
+            "parent_run_id": run_manifest.run_id,
+            "summary_artifact_id": summary_artifact.artifact_id,
+            "report_artifact_id": report_artifact.artifact_id,
+        },
+    )
+    derived.write_run_manifest(registration)
+    return summary_artifact.artifact_id, report_artifact.artifact_id, registration.run_id
 
 
 def _snapshot_summary(snapshot) -> dict[str, Any]:
@@ -627,7 +865,7 @@ def _write_failed_run_manifest(
             started_at=observed_at,
             ended_at=observed_at,
             generated_at=observed_at,
-            transform_version="vertical-slice/2",
+            transform_version="vertical-slice/3",
             code_version=DERIVED_CODE_VERSION,
             input_refs=input_refs,
             output_refs=(),

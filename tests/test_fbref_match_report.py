@@ -80,6 +80,122 @@ def test_match_report_parses_normal_and_comment_wrapped_summary_tables() -> None
     assert parsed.teams[1].players[0].starter is True
 
 
+def test_match_report_identity_and_auxiliary_tables_are_retained() -> None:
+    parsed = parse_match_report(_report_content())
+
+    assert parsed.identity.source_match_id == "aaaaaaaa"
+    assert parsed.identity.competition_source_id == "9"
+    assert parsed.identity.played_on.isoformat() == "2025-08-15"
+    assert parsed.identity.home_source_id == "18bb7c10"
+    assert parsed.identity.away_source_id == "cff3d9bb"
+    assert (parsed.identity.home_goals, parsed.identity.away_goals) == (2, 1)
+    assert parsed.parser_version == "fbref-match-report/2"
+    assert set(parsed.tables_present) == {
+        "summary",
+        "passing",
+        "passing_types",
+        "defense",
+        "possession",
+        "misc",
+        "keeper",
+    }
+
+    home = parsed.teams[0]
+    assert home.table_stats["passing"]["passes_completed"] == 31
+    player = next(item for item in home.players if item.source_player_id == "playera1")
+    assert player.metrics["passes_completed"] == 24
+    assert player.metrics["passes_into_final_third"] == 2
+    assert player.metrics["tackles_won"] == 1
+    assert player.metrics["touches"] == 37
+    assert player.metrics["fouls"] == 1
+    away = parsed.teams[1]
+    assert away.players[0].metrics["saves"] == 4
+
+
+def test_match_report_required_auxiliary_table_missing_is_diagnostic() -> None:
+    parsed = parse_match_report(_report_content(), required_tables=("summary", "keeper"))
+
+    missing = [item for item in parsed.diagnostics if item.code == "required_report_table_missing"]
+    assert {item.subject_id for item in missing} == {"18bb7c10"}
+
+
+def test_match_report_identity_conflicts_are_visible() -> None:
+    content = _report_content().replace(
+        b'data-venue-date="2025-08-15"',
+        b'data-venue-date="2025-08-15"><span data-venue-date="2025-08-16"></span>',
+    )
+    content = content.replace(
+        b"</body>",
+        b'<link rel="canonical" href="https://fbref.com/en/matches/bbbbbbbb/other"></body>',
+    )
+    parsed = parse_match_report(content)
+
+    assert parsed.identity.played_on is None
+    assert parsed.identity.source_match_id is None
+    assert {item.code for item in parsed.diagnostics} >= {
+        "match_date_conflict",
+        "match_source_id_conflict",
+    }
+
+
+def test_match_report_unsupported_table_has_table_diagnostic() -> None:
+    content = _report_content().replace(
+        b"</body>",
+        b'<table id="stats_18bb7c10_unknown"><tr><th data-stat="player">x</th></tr></table></body>',
+    )
+    parsed = parse_match_report(content)
+
+    diagnostic = next(
+        item for item in parsed.diagnostics if item.code == "unsupported_report_table"
+    )
+    assert diagnostic.table_id == "stats_18bb7c10_unknown"
+
+
+@pytest.mark.parametrize(
+    "extra_table",
+    (
+        b'<table id="stats_18bb7c10_passing"><tr><th data-stat="player">'
+        b'<a href="/en/players/playera1/A-One">A One</a></th>'
+        b'<td data-stat="passes_completed">999</td></tr></table>',
+        b'<table id="stats_18bb7c10_unknown"><tr><th data-stat="player">x</th></tr></table>',
+    ),
+)
+def test_match_report_table_conflicts_are_blocked_before_fact_write(
+    tmp_path: Path,
+    extra_table: bytes,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            _report_content().replace(b"</body>", extra_table + b"</body>"),
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "match_report_parse_diagnostics"
+    attempt = next(
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    )
+    assert attempt.diagnostic_code == "match_report_parse_diagnostics"
+    with canonical.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM team_match_observations").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM player_match_observations").fetchone()[0] == 0
+        )
+
+
 def test_match_report_ingest_creates_canonical_team_and_player_facts(tmp_path: Path) -> None:
     archive, canonical, season, schedule = _prepare_schedule(tmp_path)
     match_id = MatchId(schedule.canonical_match_ids[0])
@@ -239,6 +355,170 @@ def test_report_source_mapping_rejects_caller_supplied_wrong_match(tmp_path: Pat
     assert attempt.outcome is CollectionAttemptOutcome.FAILED
     with canonical.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM match_results_90").fetchone()[0] == 0
+
+
+def test_report_raw_source_identity_is_cross_checked_before_fact_write(tmp_path: Path) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    content = _report_content().replace(
+        b"/en/matches/aaaaaaaa/arsenal-chelsea-August-15-2025-Premier-League",
+        b"/en/matches/bbbbbbbb/arsenal-chelsea-August-15-2025-Premier-League",
+    )
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            content,
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "report_source_match_identity_mismatch"
+    attempts = [
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0].outcome is CollectionAttemptOutcome.FAILED
+
+
+def test_report_page_url_mismatch_keeps_raw_and_records_safe_failed_attempt(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            _report_content(),
+            page_url="https://fbref.example/en/matches/bbbbbbbb/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "report_page_url_identity_mismatch"
+    archive.verify(RawAssetId(caught.value.raw_asset_id))
+    assert caught.value.attempt_raw_asset_id is not None
+    archive.verify(RawAssetId(caught.value.attempt_raw_asset_id))
+    attempt = next(
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    )
+    assert attempt.outcome is CollectionAttemptOutcome.FAILED
+    assert attempt.diagnostic_code == "report_page_url_identity_mismatch"
+    assert attempt.target_url == "https://fbref.com/en/matches/aaaaaaaa/"
+    assert attempt.raw_asset_id == RawAssetId(caught.value.attempt_raw_asset_id)
+
+
+def test_report_raw_score_is_cross_checked_against_canonical_result(tmp_path: Path) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    content = _report_content().replace(
+        b'<div class="score">2</div>', b'<div class="score">9</div>'
+    )
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            content,
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT + timedelta(seconds=1),
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "report_score_identity_mismatch"
+    attempts = [
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    ]
+    assert attempts
+    assert attempts[-1].outcome is CollectionAttemptOutcome.FAILED
+
+
+def test_report_season_identity_is_cross_checked(tmp_path: Path) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    content = _report_content().replace(b"/comps/9/2025-2026/", b"/comps/9/2024-2025/")
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            content,
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "report_season_identity_mismatch"
+    with canonical.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM team_match_observations").fetchone()[0] == 0
+
+
+def test_report_missing_season_identity_blocks_fact_write(tmp_path: Path) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    content = _report_content().replace(
+        b'<a href="/en/comps/9/2025-2026/Premier-League-Stats">Premier League</a>',
+        b"",
+    )
+
+    parsed = parse_match_report(content)
+    assert "match_season_id_missing" in {item.code for item in parsed.diagnostics}
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            content,
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "match_report_parse_diagnostics"
+    attempts = [
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    ]
+    assert attempts[-1].diagnostic_code == "match_report_parse_diagnostics"
+    with canonical.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM team_match_observations").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM player_match_observations").fetchone()[0] == 0
+        )
 
 
 def test_non_finished_match_version_cannot_ingest_report_facts(tmp_path: Path) -> None:

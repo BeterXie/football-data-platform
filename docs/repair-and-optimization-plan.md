@@ -15,9 +15,27 @@ The current checkout implements and tests the contract-level repairs for R01-R12
 raw/canonical/derived lineage, stable cross-source identities, lifecycle/readiness gates, the
 versioned feature composition, real-market evaluation gates, prematch evidence adapters, derived
 and run manifests, versioned training/model artifacts, and the append-only paper ledger. The
-166-test suite and the deterministic two-match golden replay are evidence for those contracts
+206-test suite and the deterministic two-match golden replay are evidence for those contracts
 only. Full-season 20-team/380-match collection, live-source coverage, prospective `captured`
 cohorts, reviewed promotion policy, and multi-league expansion remain open by design.
+
+## Review Checkpoint (2026-07-16, orchestration follow-up)
+
+The local orchestration boundary is now covered by immutable command artifacts and run manifests.
+`init`, `validate-schedule`, `diagnose-fbref`, `backfill-results`, and the new offline
+`ingest-match-report` command persist structured success, partial-gate, and failure outcomes with
+checkpoints, content-addressed JSON/Markdown outputs, resume references, and latest pointer files.
+`--resume-run-id` is an explicit idempotent replay (`resume_mode: replay`), not an implicit
+checkpoint jump; the run manifest records that mode and the parent run reference.
+`validate-schedule` ignores caller-supplied attempt IDs and queries canonical collection attempts;
+the FBref report pipeline now cross-checks raw-page match/competition/season identity, URL, teams,
+date, and score before writing facts. Golden summary/report files also have immutable derived artifact
+manifests and a separate output-registration run. Paper-ledger append/retry also registers an
+immutable summary artifact and recompute run, including repair after an entry was persisted before
+registry writing failed. Current evidence is 206 passing tests plus the two-match offline replay.
+This does not prove 20-team/380-match real coverage, live FBref access,
+one report attempt for every fixture, prospective captured samples, or a reviewed promotion policy;
+those production gates remain Open.
 
 ## 执行原则与依赖
 

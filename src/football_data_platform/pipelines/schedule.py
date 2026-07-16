@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from football_data_platform.config import CompetitionDefinition, SeasonDefinition
+from football_data_platform.domain.ids import MatchId
 from football_data_platform.sources.fbref import (
     COLLECTOR_VERSION,
     ScheduleParseResult,
@@ -184,6 +185,17 @@ def assess_season_coverage(
             if mapped_match_ids.get(fixture_id) not in attempted_match_ids
         )
     )
+    structural_violations = set(_round_robin_violations(parsed, season))
+    if canonical is not None and resolved_source is not None:
+        structural_violations.update(
+            _canonical_identity_violations(
+                parsed,
+                season,
+                canonical=canonical,
+                team_source=resolved_source,
+                mapped_match_ids=mapped_match_ids,
+            )
+        )
     return SeasonCoverage(
         expected_matches=season.expected_matches,
         actual_matches=len(parsed.matches),
@@ -192,7 +204,7 @@ def assess_season_coverage(
         duplicate_fixture_ids=duplicates,
         unregistered_team_ids=tuple(sorted(team_ids - registered_team_ids)),
         missing_registered_teams=tuple(sorted(registered_team_ids - team_ids)),
-        structural_violations=_round_robin_violations(parsed, season),
+        structural_violations=tuple(sorted(structural_violations)),
         missing_collection_attempts=missing_attempts,
         blocking_diagnostics=tuple(sorted({item.code for item in parsed.diagnostics})),
     )
@@ -220,6 +232,57 @@ def _registered_team_ids(
             ),
         )
     return registered_by_source.get(source, set()), source
+
+
+def _canonical_identity_violations(
+    parsed: ScheduleParseResult,
+    season: SeasonDefinition,
+    *,
+    canonical: CanonicalStore,
+    team_source: str,
+    mapped_match_ids: dict[str, MatchId],
+) -> set[str]:
+    """Cross-check each parsed fixture against persisted canonical identity facts.
+
+    Provider fixture IDs and persisted collection attempts are not sufficient evidence on their
+    own: a stale or mis-mapped source ID can otherwise make coverage appear complete.  Keep the
+    diagnostics fixture-scoped so an operator can identify the exact record requiring repair.
+    """
+
+    violations: set[str] = set()
+    for fixture in parsed.matches:
+        fixture_id = fixture.source_fixture_id
+        match_id = mapped_match_ids.get(fixture_id)
+        if match_id is None:
+            violations.add(f"canonical_match_mapping_missing:{fixture_id}")
+            continue
+        try:
+            match = canonical.match(match_id)
+        except KeyError:
+            violations.add(f"canonical_match_missing:{fixture_id}")
+            continue
+
+        if match.season_id != season.id:
+            violations.add(f"canonical_match_season_mismatch:{fixture_id}")
+
+        for side, source_id, canonical_team_id in (
+            ("home", fixture.home_source_id, match.home_team_id),
+            ("away", fixture.away_source_id, match.away_team_id),
+        ):
+            try:
+                resolved_team = canonical.mapped_team(source=team_source, source_id=source_id)
+            except KeyError:
+                violations.add(f"canonical_{side}_team_mapping_missing:{fixture_id}")
+            else:
+                if resolved_team.id != canonical_team_id:
+                    violations.add(f"canonical_match_{side}_team_mismatch:{fixture_id}")
+
+        versions = canonical.match_versions(match_id)
+        if not versions:
+            violations.add(f"canonical_match_version_missing:{fixture_id}")
+        elif versions[-1].kickoff_at != fixture.kickoff_at:
+            violations.add(f"canonical_match_kickoff_mismatch:{fixture_id}")
+    return violations
 
 
 def _require_round_robin_contract(season: SeasonDefinition) -> None:

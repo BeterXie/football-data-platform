@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import urllib.error
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,8 +17,10 @@ from football_data_platform.pipelines.schedule import (
 )
 from football_data_platform.sources.fbref import (
     FBrefAccessBlockedError,
+    FBrefFetchError,
     ScheduleMatch,
     ScheduleParseResult,
+    fetch_schedule,
     parse_schedule,
     schedule_url,
 )
@@ -64,6 +68,69 @@ def test_comment_wrapped_schedule_parses_all_valid_league_rows() -> None:
     assert result.matches[0].kickoff_at == datetime(2025, 8, 15, 19, 0, tzinfo=UTC)
     assert result.matches[1].source_match_id is None
     assert [diagnostic.code for diagnostic in result.diagnostics] == ["invalid_schedule_row"]
+
+
+@pytest.mark.parametrize(
+    ("replacement", "diagnostic_code", "original"),
+    [
+        (
+            b"",
+            "kickoff_missing",
+            b'<td data-stat="start_time">20:00</td>',
+        ),
+        (
+            b'<td data-stat="start_time">not-a-time</td>',
+            "kickoff_invalid",
+            b'<td data-stat="start_time">15:00</td>',
+        ),
+    ],
+)
+def test_missing_or_invalid_start_time_keeps_fixture_unknown(
+    replacement: bytes,
+    diagnostic_code: str,
+    original: bytes,
+) -> None:
+    _, competition, season = _registration()
+    content = (ROOT / "tests" / "fixtures" / "fbref_premier_league_schedule.html").read_bytes()
+    content = content.replace(original, replacement, 1)
+
+    result = parse_schedule(
+        content,
+        competition=competition,
+        season=season,
+        page_url=schedule_url(competition, season),
+    )
+
+    assert len(result.matches) == 2
+    assert result.matches[0 if diagnostic_code == "kickoff_missing" else 1].kickoff_at is None
+    assert diagnostic_code in {item.code for item in result.diagnostics}
+    assert all(
+        match.kickoff_at != datetime(2025, 8, 15, 0, 0, tzinfo=UTC) for match in result.matches
+    )
+
+
+def test_fetch_schedule_preserves_http_error_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"<html><title>Cloudflare</title><div id='cf-chl-widget'></div></html>"
+    url = "https://fbref.example/schedule"
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            url,
+            403,
+            "forbidden",
+            hdrs=None,
+            fp=io.BytesIO(body),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+
+    with pytest.raises(FBrefFetchError) as caught:
+        fetch_schedule(url, observed_at=OBSERVED_AT)
+
+    assert caught.value.diagnostic.body == body
+    assert caught.value.diagnostic.response_body == body
+    assert caught.value.diagnostic.as_dict()["body_present"] is True
+    assert caught.value.diagnostic.as_dict()["body_size_bytes"] == len(body)
 
 
 def test_access_control_page_is_not_interpreted_as_an_empty_schedule() -> None:
@@ -146,6 +213,55 @@ def test_schedule_pipeline_archives_before_normalizing_and_replays_idempotently(
         canonical=canonical,
     )
     assert persisted_attempts.missing_collection_attempts == ()
+
+
+def test_schedule_coverage_cross_checks_canonical_fixture_identity(tmp_path: Path) -> None:
+    registry, competition, season = _registration()
+    content = (ROOT / "tests/fixtures/fbref_premier_league_schedule.html").read_bytes()
+    layout = DataLayout(tmp_path / "data")
+    archive = RawArchive(layout)
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    canonical.initialize()
+    canonical.register_registry(registry, registered_at=OBSERVED_AT)
+    ingested = ingest_fbref_schedule(
+        content,
+        page_url=schedule_url(competition, season),
+        competition=competition,
+        season=season,
+        observed_at=OBSERVED_AT,
+        archive=archive,
+        canonical=canonical,
+    )
+
+    first = ingested.parsed.matches[0]
+    alternate_team = first.away_source_id
+    tampered = replace(
+        first,
+        home_source_id=alternate_team,
+        kickoff_at=first.kickoff_at.replace(minute=1) if first.kickoff_at else None,
+    )
+    tampered_parsed = ScheduleParseResult(
+        (tampered, *ingested.parsed.matches[1:]),
+        ingested.parsed.diagnostics,
+        ingested.parsed.rows_seen,
+    )
+
+    coverage = assess_season_coverage(
+        tampered_parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+    )
+
+    assert not coverage.schedule_complete
+    assert any(
+        item.startswith("canonical_match_home_team_mismatch:")
+        for item in coverage.structural_violations
+    )
+    assert any(
+        item.startswith("canonical_match_kickoff_mismatch:")
+        for item in coverage.structural_violations
+    )
 
 
 def test_round_change_keeps_match_identity_and_adds_version(tmp_path: Path) -> None:

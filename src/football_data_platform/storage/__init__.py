@@ -7,6 +7,13 @@ from football_data_platform.storage.derived import (
     DerivedArtifactManifest,
     RunManifest,
 )
+from football_data_platform.storage.governance import (
+    GovernanceArtifactConflict,
+    GovernanceArtifactStore,
+    parse_challenger_evidence_payload,
+    parse_promotion_decision_payload,
+    parse_promotion_policy_payload,
+)
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.ledger import (
     LedgerConflictError,
@@ -33,6 +40,8 @@ __all__ = [
     "ArchiveConflictError",
     "ChecksumMismatchError",
     "DataLayout",
+    "GovernanceArtifactConflict",
+    "GovernanceArtifactStore",
     "DERIVED_CODE_VERSION",
     "DERIVED_MANIFEST_VERSION",
     "DerivedArchive",
@@ -50,4 +59,7 @@ __all__ = [
     "parse_model_run_payload",
     "parse_training_dataset_payload",
     "parse_paper_bet_entry_payload",
+    "parse_challenger_evidence_payload",
+    "parse_promotion_decision_payload",
+    "parse_promotion_policy_payload",
 ]

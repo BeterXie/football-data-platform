@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -32,17 +34,24 @@ from football_data_platform.domain.snapshots import (
     build_snapshot,
 )
 from football_data_platform.domain.training import (
+    MODEL_ARTIFACT_REF_PREFIX,
+    MODEL_OUTPUT_REF_PREFIX,
     ModelRunArtifact,
     ModelRunStatus,
 )
 from football_data_platform.evaluation.governance import (
     ChallengerEvidence,
     PromotionPolicy,
+    SubgroupDiagnostic,
     assess_promotion,
 )
 from football_data_platform.evaluation.metrics import (
     evaluate_prediction,
     multiclass_brier,
+)
+from football_data_platform.features.contributions import (
+    ExpectedGoalsContribution,
+    compose_expected_goals,
 )
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
@@ -52,7 +61,7 @@ from football_data_platform.features.team_baseline import (
 )
 from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.layout import DataLayout
-from football_data_platform.storage.raw import RawArchive
+from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
 MATCH = MatchId("match:prediction-test")
 HOME = TeamId("team:prediction-home")
@@ -60,6 +69,8 @@ AWAY = TeamId("team:prediction-away")
 GENERATED_AT = datetime(2025, 8, 16, 12, 0, tzinfo=UTC)
 KICKOFF = GENERATED_AT + timedelta(hours=24)
 DEFAULT_MODEL_RUN_ID = ModelRunId("model-run:dc-v1")
+MODEL_DIGEST = hashlib.sha256(b"prediction-evaluation-model").hexdigest()
+OUTPUT_DIGEST = hashlib.sha256(b"prediction-evaluation-output").hexdigest()
 
 
 def _snapshot(tmp_path: Path, *, ready: bool = True):
@@ -183,7 +194,9 @@ def _model_run(
     ended_at: datetime = GENERATED_AT - timedelta(seconds=1),
     status: ModelRunStatus = ModelRunStatus.SUCCEEDED,
 ) -> ModelRunArtifact:
-    output_refs = () if status is ModelRunStatus.FAILED else ("model-file:dc-v1",)
+    output_refs = (
+        () if status is ModelRunStatus.FAILED else (MODEL_OUTPUT_REF_PREFIX + OUTPUT_DIGEST,)
+    )
     return ModelRunArtifact.create(
         model_version=model_version,
         run_role="challenger",
@@ -198,11 +211,13 @@ def _model_run(
         started_at=ended_at - timedelta(seconds=1),
         ended_at=ended_at,
         random_seed=17,
-        model_artifact_refs=() if status is ModelRunStatus.FAILED else ("model-file:dc-v1",),
+        model_artifact_refs=(
+            () if status is ModelRunStatus.FAILED else (MODEL_ARTIFACT_REF_PREFIX + MODEL_DIGEST,)
+        ),
         evaluation_cohort=() if status is ModelRunStatus.FAILED else ("sample:test",),
         evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
         output_refs=output_refs,
-        output_hashes=() if not output_refs else ("b" * 64,),
+        output_hashes=() if not output_refs else (OUTPUT_DIGEST,),
         status=status,
         error="training failed" if status is ModelRunStatus.FAILED else None,
     )
@@ -225,6 +240,15 @@ class _ResultRegistry:
     def verify_match_result(self, result: MatchResult90) -> None:
         if result != self.expected:
             raise ValueError("unknown canonical result")
+
+
+class _GovernanceReferenceRegistry:
+    def __init__(self, *references: str) -> None:
+        self.references = set(references)
+
+    def verify_reference(self, reference: str) -> None:
+        if reference not in self.references:
+            raise ValueError(f"unknown governance reference: {reference}")
 
 
 def _market(
@@ -268,11 +292,78 @@ def test_prediction_schema_has_one_coordinate_explicit_normalized_grid(tmp_path:
     prediction = _prediction(_snapshot(tmp_path))
     payload = prediction_payload(prediction)
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert len(payload["score_cells"]) == 144
     assert len({(cell["home_goals"], cell["away_goals"]) for cell in payload["score_cells"]}) == 144
     assert sum(cell["probability"] for cell in payload["score_cells"]) == pytest.approx(1.0)
     assert sum(result_probabilities(prediction).values()) == pytest.approx(1.0)
+
+
+def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_path: Path) -> None:
+    snapshot, validator = _snapshot(tmp_path)
+    composition = compose_expected_goals(
+        1.7,
+        0.8,
+        (
+            ExpectedGoalsContribution(
+                contribution_key="context:rest-days:calibration/1",
+                lambda_home_multiplier=1.02,
+                lambda_away_multiplier=0.98,
+                source_ref="derived-source:context",
+                version="calibration/1",
+            ),
+        ),
+    )
+    prediction = build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=validator,
+        model_run_id=DEFAULT_MODEL_RUN_ID,
+        model_version="dixon-coles/1",
+        generated_at=GENERATED_AT,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
+        rho=-0.12,
+        max_goals=11,
+        input_refs=("derived-source:baseline",),
+        expected_goals=composition,
+        calibration_versions=("calibration/1",),
+    )
+
+    payload = prediction_payload(prediction)
+    assert payload["baseline_lambda_home"] == pytest.approx(1.7)
+    assert payload["baseline_lambda_away"] == pytest.approx(0.8)
+    assert payload["contribution_keys"] == ["context:rest-days:calibration/1"]
+    assert payload["contribution_multipliers"][0]["lambda_home_multiplier"] == pytest.approx(1.02)
+    assert payload["composition_version"] == composition.composition_version
+    assert payload["calibration_versions"] == ["calibration/1"]
+    assert prediction.composition_artifact_ref.startswith("score-grid-composition:")
+    assert DEFAULT_MODEL_RUN_ID.value in prediction.input_refs
+
+    archive = DerivedArchive(DataLayout(tmp_path / "prediction-data"))
+    composition_path = archive.write_score_grid_composition(prediction)
+    assert composition_path == archive.score_grid_composition_path(
+        prediction.composition_artifact_ref
+    )
+    archive.write_prediction(prediction)
+    assert archive.verify_score_grid_composition(prediction).artifact_type == (
+        "score-grid-composition"
+    )
+    assert archive.load_score_grid_composition_payload(prediction.composition_artifact_ref)[
+        "rho"
+    ] == pytest.approx(-0.12)
+
+
+def test_prediction_composition_bytes_are_tamper_evident(tmp_path: Path) -> None:
+    prediction = _prediction(_snapshot(tmp_path))
+    archive = DerivedArchive(DataLayout(tmp_path / "prediction-data"))
+    archive.write_prediction(prediction)
+    path = archive.score_grid_composition_path(prediction.composition_artifact_ref)
+    tampered = json.loads(path.read_text(encoding="utf-8"))
+    tampered["lambda_home"] = 9.0
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    with pytest.raises(ArchiveConflictError, match="composition"):
+        archive.load_prediction_payload(prediction)
 
 
 def test_prediction_and_market_are_separate_evaluation_inputs(tmp_path: Path) -> None:
@@ -572,15 +663,32 @@ def test_evaluation_and_archive_reject_tampered_prediction_content(tmp_path: Pat
 
 
 def test_challenger_promotion_requires_an_explicit_policy() -> None:
+    challenger_ref = "model-run:" + "a" * 64
+    champion_ref = "model-run:" + "b" * 64
+    evaluation_ref = "evaluation:" + "c" * 64
+    cohort_ref = "training-dataset:" + "d" * 64
+    sample_ref = "sample:captured-001"
+    rollback_ref = "model-run:" + "e" * 64
     evidence = ChallengerEvidence(
         capture_mode=CaptureMode.CAPTURED,
-        captured_samples=500,
+        captured_samples=1,
         observation_days=120,
         brier_delta_vs_champion=-0.01,
         log_loss_delta_vs_champion=-0.02,
         confidence_interval_passed=True,
         reliability_passed=True,
         subgroup_diagnostics_passed=True,
+        model_run_ref=challenger_ref,
+        champion_model_ref=champion_ref,
+        evaluation_ref=evaluation_ref,
+        cohort_ref=cohort_ref,
+        sample_refs=(sample_ref,),
+        confidence_level=0.95,
+        confidence_interval=(-0.02, -0.005),
+        confidence_method="paired-bootstrap/1",
+        subgroup_diagnostics=(SubgroupDiagnostic("all", 1, -0.01, -0.02, True),),
+        prospective=True,
+        evaluated_at=GENERATED_AT,
     )
 
     with pytest.raises(ValueError, match="explicit reviewed"):
@@ -593,12 +701,22 @@ def test_challenger_promotion_requires_an_explicit_policy() -> None:
             reviewed_by="model-risk-reviewer",
             reviewed_at=GENERATED_AT,
             confidence_method="paired-bootstrap/1",
-            rollback_target="model-run:champion-v1",
-            minimum_captured_samples=400,
+            rollback_target=rollback_ref,
+            minimum_captured_samples=1,
             minimum_observation_days=90,
             maximum_brier_delta=-0.005,
             maximum_log_loss_delta=-0.01,
+            confidence_level=0.95,
         ),
+        reference_validator=_GovernanceReferenceRegistry(
+            challenger_ref,
+            champion_ref,
+            evaluation_ref,
+            cohort_ref,
+            sample_ref,
+            rollback_ref,
+        ),
+        decided_at=GENERATED_AT + timedelta(days=1),
     )
     assert decision.promoted
 
@@ -609,7 +727,7 @@ def test_challenger_promotion_rejects_invalid_or_non_captured_evidence() -> None
         reviewed_by="model-risk-reviewer",
         reviewed_at=GENERATED_AT,
         confidence_method="paired-bootstrap/1",
-        rollback_target="model-run:champion-v1",
+        rollback_target="model-run:" + "e" * 64,
         minimum_captured_samples=400,
         minimum_observation_days=90,
         maximum_brier_delta=-0.005,

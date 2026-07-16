@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -36,9 +37,17 @@ from football_data_platform.domain.predictions import (
     MarketStatus,
     MatchResult90,
     ScorePrediction,
+    prediction_payload,
+)
+from football_data_platform.storage.derived import (
+    DERIVED_CODE_VERSION,
+    DerivedArchive,
+    DerivedArtifactManifest,
+    RunManifest,
 )
 from football_data_platform.storage.layout import DataLayout
-from football_data_platform.storage.raw import ArchiveConflictError
+from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
+from football_data_platform.storage.training import TrainingArtifactStore
 
 
 class LedgerConflictError(ArchiveConflictError):
@@ -79,17 +88,21 @@ class PaperBetLedger:
         market_source_validator: MarketSourceValidator | None = None,
         result_validator: MatchResultValidator | None = None,
         model_run_validator: ModelRunValidator | None = None,
+        derived_archive: DerivedArchive | None = None,
     ) -> None:
         self.layout = layout.ensure()
-        self.market_source_validator = market_source_validator
+        self.market_source_validator = market_source_validator or RawArchive(self.layout)
         self.result_validator = result_validator
-        self.model_run_validator = model_run_validator
+        self.persisted_model_runs = TrainingArtifactStore(self.layout)
+        self.model_run_validator = model_run_validator or self.persisted_model_runs
+        self.derived = derived_archive or DerivedArchive(self.layout)
         self.root = self.layout.paper_ledger / "entries"
         self.root.mkdir(parents=True, exist_ok=True)
 
     def append(self, entry: PaperBetEntry) -> Path:
         """Persist one entry; an identical retry returns the same path."""
 
+        self._verify_persisted_prediction_entry(entry)
         verify_paper_bet_entry(
             entry,
             market_source_validator=self.market_source_validator,
@@ -101,6 +114,9 @@ class PaperBetLedger:
         if path.exists():
             if path.read_bytes() != encoded:
                 raise LedgerConflictError(f"paper ledger entry conflicts at {path}")
+            # A previous process may have persisted the entry but failed before registering the
+            # derived summary.  Re-running the exact append repairs that checkpoint idempotently.
+            self._write_derived_summary()
             return path
         if entry.revision > 1:
             self._validate_revision_parent(entry)
@@ -114,6 +130,7 @@ class PaperBetLedger:
         except FileExistsError:
             if path.read_bytes() != encoded:
                 raise LedgerConflictError(f"paper ledger entry conflicts at {path}") from None
+        self._write_derived_summary()
         return path
 
     def append_candidate(
@@ -138,6 +155,7 @@ class PaperBetLedger:
         """
 
         try:
+            self._verify_persisted_prediction(prediction)
             if market_snapshot is None or settlement_rules is None or selection is None:
                 raise ValueError("market snapshot, selection, and settlement rules are required")
             entry = PaperBetEntry.accepted(
@@ -173,6 +191,7 @@ class PaperBetLedger:
         path = self.entry_path(entry_id)
         payload = _read_object(path)
         entry = parse_paper_bet_entry_payload(payload)
+        self._verify_persisted_prediction_entry(entry)
         verify_paper_bet_entry(
             entry,
             market_source_validator=self.market_source_validator,
@@ -185,6 +204,7 @@ class PaperBetLedger:
         parsed: list[PaperBetEntry] = []
         for path in sorted(self.root.glob("*/*.json")):
             entry = parse_paper_bet_entry_payload(_read_object(path))
+            self._verify_persisted_prediction_entry(entry)
             verify_paper_bet_entry(
                 entry,
                 market_source_validator=self.market_source_validator,
@@ -286,6 +306,71 @@ class PaperBetLedger:
             "day": summary.daily_exposure_map(),
         }
 
+    def _write_derived_summary(self) -> tuple[str, str, str]:
+        """Register the current ledger state as immutable derived evidence."""
+
+        entries = self.entries(latest_only=True)
+        if not entries:
+            raise LedgerConflictError("cannot register an empty paper ledger")
+        summary = asdict(self.recompute())
+        summary["match_exposure"] = dict(summary["match_exposure"])
+        summary["daily_exposure"] = dict(summary["daily_exposure"])
+        entry_refs = tuple(sorted(entry.entry_id for entry in entries))
+        semantic_digest = hashlib.sha256(_canonical_json(summary)).hexdigest()
+        logical_ref = f"paper-ledger-summary:{semantic_digest}"
+        summary_path = self.layout.paper_ledger / "summaries" / f"{semantic_digest}.json"
+        encoded = _encode(summary)
+        _write_immutable(summary_path, encoded)
+        file_ref = f"file-sha256:{hashlib.sha256(encoded).hexdigest()}"
+        generated_at = max(
+            (item.settled_at or item.placed_at for item in entries),
+            default=entries[-1].placed_at,
+        )
+        artifact = DerivedArtifactManifest.create(
+            artifact_type="paper-ledger-summary",
+            payload=summary,
+            generated_at=generated_at,
+            started_at=generated_at,
+            ended_at=generated_at,
+            transform_version="paper-ledger/1",
+            code_version=DERIVED_CODE_VERSION,
+            input_refs=entry_refs,
+            output_refs=(logical_ref, file_ref),
+            quality="ready",
+        )
+        self.derived.write_artifact_manifest(artifact)
+        run = RunManifest.create(
+            run_type="paper-ledger-recompute",
+            started_at=generated_at,
+            ended_at=generated_at,
+            generated_at=generated_at,
+            transform_version="paper-ledger/1",
+            code_version=DERIVED_CODE_VERSION,
+            input_refs=(*entry_refs, logical_ref),
+            output_refs=(artifact.artifact_id, logical_ref, file_ref),
+            status="succeeded",
+            error=None,
+            quality="ready",
+            parameters={"entry_count": len(entries)},
+            checkpoint="summary-registered",
+            payload={
+                "artifact_id": artifact.artifact_id,
+                "summary_path": str(summary_path.resolve()),
+                "entry_ids": list(entry_refs),
+            },
+        )
+        run_path = self.derived.write_run_manifest(run)
+        _write_json(
+            self.layout.paper_ledger / "latest.json",
+            {
+                "artifact_id": artifact.artifact_id,
+                "run_id": run.run_id,
+                "summary": str(summary_path.resolve()),
+                "manifest": str(run_path.resolve()),
+            },
+        )
+        return artifact.artifact_id, run.run_id, str(summary_path)
+
     def entry_path(self, entry_id: str) -> Path:
         if not isinstance(entry_id, str) or not entry_id.startswith("paper-bet-entry:"):
             raise ValueError("invalid paper betting entry ID")
@@ -295,9 +380,80 @@ class PaperBetLedger:
         return self.root / digest[:2] / f"{digest}.json"
 
     def _require_market_validator(self) -> MarketSourceValidator:
-        if self.market_source_validator is None:
-            raise ValueError("paper betting requires a market raw evidence validator")
         return self.market_source_validator
+
+    def _verify_persisted_prediction(self, prediction: ScorePrediction) -> None:
+        path = self._prediction_path(prediction.id.value)
+        try:
+            stored = _read_object(path)
+        except LedgerConflictError as error:
+            raise ValueError(
+                "paper ledger prediction artifact is unavailable or invalid"
+            ) from error
+        if stored != prediction_payload(prediction):
+            raise ValueError("paper ledger prediction does not match its persisted artifact")
+
+    def _verify_persisted_prediction_entry(self, entry: PaperBetEntry) -> None:
+        path = self._prediction_path(entry.prediction_id.value)
+        try:
+            payload = _read_object(path)
+            stored_id = str(payload["id"])
+            identity = dict(payload)
+            identity.pop("id")
+            calculated = "prediction:" + hashlib.sha256(_canonical_json(identity)).hexdigest()
+            generated_at = _parse_datetime(payload["generated_at"], "prediction generated_at")
+            snapshot_as_of = _parse_datetime(payload["snapshot_as_of"], "prediction snapshot_as_of")
+        except (KeyError, TypeError, ValueError, LedgerConflictError) as error:
+            raise ValueError(
+                "paper ledger prediction artifact is unavailable or invalid"
+            ) from error
+        if stored_id != entry.prediction_id.value or calculated != entry.prediction_id.value:
+            raise ValueError("paper ledger prediction artifact identity is invalid")
+        composition_ref = payload.get("composition_artifact_ref")
+        if not isinstance(composition_ref, str):
+            raise ValueError("paper ledger prediction lacks a composition artifact reference")
+        try:
+            composition = self.derived.load_score_grid_composition_payload(composition_ref)
+            composition_manifest = self.derived._load_artifact_manifest_for_output_ref(
+                composition_ref
+            )
+            prediction_manifest = self.derived._load_artifact_manifest_for_output_ref(
+                entry.prediction_id.value
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
+            raise ValueError(
+                "paper ledger prediction provenance is unavailable or invalid"
+            ) from error
+        if (
+            composition_manifest.artifact_type != "score-grid-composition"
+            or composition_manifest.status != "succeeded"
+            or composition_manifest.payload != composition
+            or prediction_manifest.artifact_type != "prediction"
+            or prediction_manifest.status != "succeeded"
+            or prediction_manifest.payload != payload
+        ):
+            raise ValueError("paper ledger prediction provenance does not match its artifacts")
+        if (
+            payload.get("match_id") != entry.match_id.value
+            or payload.get("model_run_id") != entry.model_run_id.value
+            or generated_at != entry.prediction_generated_at
+            or snapshot_as_of != entry.prediction_snapshot_as_of
+        ):
+            raise ValueError("paper ledger entry does not match its prediction artifact")
+        try:
+            artifact = self.persisted_model_runs.load_model_run(entry.model_run_id.value)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError("paper ledger model artifact is unavailable or invalid") from error
+        if artifact.model_run_id != entry.model_run_id.value:
+            raise ValueError("paper ledger model artifact identity is invalid")
+
+    def _prediction_path(self, prediction_id: str) -> Path:
+        if not isinstance(prediction_id, str) or not prediction_id.startswith("prediction:"):
+            raise ValueError("invalid prediction ID")
+        digest = prediction_id.removeprefix("prediction:")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("invalid prediction ID")
+        return self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
 
     def _validate_revision_parent(self, entry: PaperBetEntry) -> None:
         assert entry.prior_entry_id is not None
@@ -493,6 +649,38 @@ def _encode(payload: dict[str, Any]) -> bytes:
             "utf-8"
         )
         + b"\n"
+    )
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _write_immutable(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise LedgerConflictError(f"paper ledger summary conflicts at {path}")
+        return
+    try:
+        with path.open("xb") as destination:
+            destination.write(payload)
+    except FileExistsError:
+        if path.read_bytes() != payload:
+            raise LedgerConflictError(f"paper ledger summary conflicts at {path}") from None
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 

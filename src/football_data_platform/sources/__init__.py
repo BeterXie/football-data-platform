@@ -1,5 +1,6 @@
 """External source adapters."""
 
+from football_data_platform.sources.fbref_match_report import MatchReportIdentity
 from football_data_platform.sources.prematch import (
     AdapterDiagnostic,
     NewsEvidenceDTO,
@@ -30,4 +31,5 @@ __all__ = [
     "adapt_suspension_event",
     "classify_confirmation",
     "validate_official_lineups",
+    "MatchReportIdentity",
 ]

@@ -53,6 +53,7 @@ class ExpectedGoals:
     baseline_lambda_away: float = field(default=0.0, compare=True)
     composition_version: str = EXPECTED_GOALS_COMPOSITION_VERSION
     contributions: tuple[ExpectedGoalsContribution, ...] = ()
+    calibration_versions: tuple[str, ...] = ()
 
 
 def apply_expected_goals_contributions(
@@ -102,6 +103,8 @@ def compose_expected_goals(
     baseline_lambda_home: float,
     baseline_lambda_away: float,
     contributions: tuple[ExpectedGoalsContribution, ...] = (),
+    *,
+    calibration_versions: tuple[str, ...] = (),
 ) -> ExpectedGoals:
     """Return the single model coordinate after versioned contributions.
 
@@ -121,6 +124,7 @@ def compose_expected_goals(
         baseline_lambda_away=baseline_lambda_away,
         composition_version=EXPECTED_GOALS_COMPOSITION_VERSION,
         contributions=result.contributions,
+        calibration_versions=tuple(sorted(set(calibration_versions))),
     )
 
 

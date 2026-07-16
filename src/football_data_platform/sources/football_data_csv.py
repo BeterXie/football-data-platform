@@ -48,6 +48,12 @@ def fetch_results_csv(
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             return response.read(), observed_at
     except urllib.error.HTTPError as error:
+        try:
+            body = error.read()
+        except (OSError, ValueError):
+            body = None
+        if not isinstance(body, bytes):
+            body = None
         raise FootballDataFetchError(
             FetchDiagnostic(
                 code="http_error",
@@ -55,6 +61,7 @@ def fetch_results_csv(
                 http_status=error.code,
                 message=f"Football-Data request failed with HTTP {error.code}",
                 observed_at=observed_at,
+                body=body,
             )
         ) from error
     except (OSError, TimeoutError) as error:

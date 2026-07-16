@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,8 @@ from football_data_platform.domain.ids import RawAssetId
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.snapshots import CaptureMode
 from football_data_platform.domain.training import (
+    MODEL_ARTIFACT_REF_PREFIX,
+    MODEL_OUTPUT_REF_PREFIX,
     DatasetStatus,
     ModelRunArtifact,
     ModelRunStatus,
@@ -41,6 +45,7 @@ class TrainingArtifactStore:
 
     def write_dataset(self, dataset: TrainingDatasetManifest) -> Path:
         verify_training_dataset(dataset)
+        self._validate_sample_references(dataset)
         self._validate_capture_evidence(dataset)
         path = self._write_json(self.dataset_path(dataset.dataset_id), dataset.to_payload())
         self.derived.write_artifact_manifest(
@@ -80,6 +85,7 @@ class TrainingArtifactStore:
         dataset = parse_training_dataset_payload(payload)
         if dataset.dataset_id != dataset_id:
             raise TrainingArtifactConflict("training dataset path and ID disagree")
+        self._validate_sample_references(dataset)
         self._validate_capture_evidence(dataset)
         return dataset
 
@@ -89,6 +95,7 @@ class TrainingArtifactStore:
     def write_model_run(self, artifact: ModelRunArtifact) -> Path:
         dataset = self._load_dataset_for_run(artifact)
         verify_model_run_artifact(artifact, dataset=dataset)
+        self._validate_model_bytes(artifact)
         path = self._write_json(self.model_run_path(artifact.model_run_id), artifact.to_payload())
         input_refs = tuple(
             sorted(
@@ -136,6 +143,7 @@ class TrainingArtifactStore:
             raise TrainingArtifactConflict("model run path and ID disagree")
         dataset = self._load_dataset_for_run(artifact)
         verify_model_run_artifact(artifact, dataset=dataset)
+        self._validate_model_bytes(artifact)
         return artifact
 
     def load_model_run_artifact(self, model_run_id: str) -> ModelRunArtifact:
@@ -144,6 +152,31 @@ class TrainingArtifactStore:
     def verify_model_run(self, artifact: ModelRunArtifact) -> None:
         dataset = self._load_dataset_for_run(artifact)
         verify_model_run_artifact(artifact, dataset=dataset)
+        self._validate_model_bytes(artifact)
+
+    def write_model_artifact(self, payload: bytes) -> str:
+        """Persist immutable model bytes and return their content reference."""
+
+        return self._write_content_bytes(payload, prefix=MODEL_ARTIFACT_REF_PREFIX)
+
+    def write_model_output(self, payload: bytes) -> str:
+        """Persist immutable evaluation/output bytes and return their content reference."""
+
+        return self._write_content_bytes(payload, prefix=MODEL_OUTPUT_REF_PREFIX)
+
+    def verify_model_artifact(self, reference: str) -> None:
+        self._verify_content_bytes(reference, prefix=MODEL_ARTIFACT_REF_PREFIX)
+
+    def verify_model_output(self, reference: str) -> None:
+        self._verify_content_bytes(reference, prefix=MODEL_OUTPUT_REF_PREFIX)
+
+    def model_artifact_path(self, reference: str) -> Path:
+        digest = _digest_id(reference, MODEL_ARTIFACT_REF_PREFIX)
+        return self.layout.derived / "model-artifacts" / "sha256" / digest[:2] / digest
+
+    def model_output_path(self, reference: str) -> Path:
+        digest = _digest_id(reference, MODEL_OUTPUT_REF_PREFIX)
+        return self.layout.derived / "model-outputs" / "sha256" / digest[:2] / digest
 
     def dataset_path(self, dataset_id: str) -> Path:
         digest = _digest_id(dataset_id, "training-dataset:")
@@ -187,6 +220,184 @@ class TrainingArtifactStore:
                 raise TrainingArtifactConflict(
                     f"captured sample {sample.sample_id} capture timestamp precedes raw evidence"
                 )
+
+    def _validate_sample_references(self, dataset: TrainingDatasetManifest) -> None:
+        """Resolve every feature/label reference through an immutable store."""
+
+        references = {
+            reference
+            for sample in dataset.samples
+            for reference in (*sample.feature_refs, sample.label_ref)
+        }
+        for reference in sorted(references):
+            try:
+                self._verify_training_reference(reference)
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+                raise TrainingArtifactConflict(
+                    f"training sample reference is unavailable or invalid: {reference}"
+                ) from error
+
+    def _verify_training_reference(self, reference: str) -> None:
+        if not isinstance(reference, str) or not reference or reference.strip() != reference:
+            raise ValueError("reference must be non-empty text")
+        if reference.startswith("raw-asset:"):
+            RawArchive(self.layout).verify(RawAssetId(reference))
+            return
+        if reference.startswith("derived-source:"):
+            _require_digest_reference(reference, "derived-source:")
+            self.derived.validate_snapshot_source(reference)
+            return
+        if reference.startswith("team-baseline:"):
+            self.derived.load_team_baseline(reference)
+            self._verify_manifest_output(reference, "team-baseline")
+            return
+        if reference.startswith("snapshot:"):
+            self._verify_json_artifact(reference, "snapshot:", "snapshots", "prematch-snapshot")
+            return
+        if reference.startswith("prediction:"):
+            self._verify_prediction_reference(reference)
+            return
+        if reference.startswith("score-grid-composition:"):
+            self.derived.load_score_grid_composition_payload(reference)
+            self._verify_manifest_output(reference, "score-grid-composition")
+            return
+        if reference.startswith("derived-artifact:"):
+            self.derived.load_artifact_manifest(reference)
+            return
+        if reference.startswith("training-dataset:"):
+            self.load_dataset(reference)
+            return
+        if reference.startswith("model-run:"):
+            self.load_model_run(reference)
+            return
+        if reference.startswith("model-artifact:"):
+            self.verify_model_artifact(reference)
+            return
+        if reference.startswith("model-output:"):
+            self.verify_model_output(reference)
+            return
+        if reference.startswith("fact:") or reference.startswith("canonical:"):
+            self._verify_canonical_reference(reference)
+            return
+        raise ValueError(f"unsupported training reference type: {reference}")
+
+    def _verify_manifest_output(self, reference: str, artifact_type: str) -> None:
+        manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
+        if manifest.artifact_type != artifact_type or manifest.status != "succeeded":
+            raise TrainingArtifactConflict(
+                f"reference {reference} does not resolve to a succeeded {artifact_type} artifact"
+            )
+
+    def _verify_json_artifact(
+        self,
+        reference: str,
+        prefix: str,
+        directory: str,
+        artifact_type: str,
+    ) -> dict[str, Any]:
+        digest = _digest_id(reference, prefix)
+        path = self.layout.derived / directory / digest[:2] / f"{digest}.json"
+        payload = self._read_json(path)
+        if payload.get("id") != reference:
+            raise TrainingArtifactConflict(f"{reference} ID does not match stored bytes")
+        identity = dict(payload)
+        identity.pop("id", None)
+        if hashlib.sha256(_canonical_json(identity)).hexdigest() != digest:
+            raise TrainingArtifactConflict(f"{reference} content hash does not match its ID")
+        manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
+        if (
+            manifest.artifact_type != artifact_type
+            or manifest.status != "succeeded"
+            or manifest.payload != payload
+        ):
+            raise TrainingArtifactConflict(f"{reference} manifest does not match stored bytes")
+        return payload
+
+    def _verify_prediction_reference(self, reference: str) -> None:
+        payload = self._verify_json_artifact(reference, "prediction:", "predictions", "prediction")
+        composition_ref = payload.get("composition_artifact_ref")
+        if not isinstance(composition_ref, str):
+            raise TrainingArtifactConflict("prediction lacks a composition artifact reference")
+        composition = self.derived.load_score_grid_composition_payload(composition_ref)
+        composition_manifest = self.derived._load_artifact_manifest_for_output_ref(composition_ref)
+        if (
+            composition_manifest.artifact_type != "score-grid-composition"
+            or composition_manifest.status != "succeeded"
+            or composition_manifest.payload != composition
+        ):
+            raise TrainingArtifactConflict("prediction composition manifest is invalid")
+        expected = _prediction_composition_payload(payload)
+        if composition != expected:
+            raise TrainingArtifactConflict("prediction composition does not match prediction")
+
+    def _verify_canonical_reference(self, reference: str) -> None:
+        path = self.layout.canonical / "platform.sqlite3"
+        if not path.exists():
+            raise TrainingArtifactConflict("canonical store is unavailable")
+        with sqlite3.connect(path) as connection:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            for (table_name,) in tables:
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+                if "record_id" not in columns:
+                    continue
+                if connection.execute(
+                    f"SELECT 1 FROM {table_name} WHERE record_id = ? LIMIT 1", (reference,)
+                ).fetchone():
+                    return
+        raise TrainingArtifactConflict(f"canonical record does not exist: {reference}")
+
+    def _validate_model_bytes(self, artifact: ModelRunArtifact) -> None:
+        for reference in artifact.model_artifact_refs:
+            self.verify_model_artifact(reference)
+        for reference, expected_hash in zip(
+            artifact.output_refs, artifact.output_hashes, strict=True
+        ):
+            self.verify_model_output(reference)
+            if reference.removeprefix(MODEL_OUTPUT_REF_PREFIX) != expected_hash:
+                raise TrainingArtifactConflict(
+                    "model output reference does not match its declared hash"
+                )
+
+    def _write_content_bytes(self, payload: bytes, *, prefix: str) -> str:
+        if not isinstance(payload, bytes):
+            raise TypeError("model artifact payload must be bytes")
+        digest = hashlib.sha256(payload).hexdigest()
+        reference = prefix + digest
+        path = (
+            self.model_artifact_path(reference)
+            if prefix == MODEL_ARTIFACT_REF_PREFIX
+            else self.model_output_path(reference)
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != payload:
+                raise TrainingArtifactConflict(f"model content conflicts at {path}")
+            return reference
+        try:
+            with path.open("xb") as destination:
+                destination.write(payload)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise TrainingArtifactConflict(f"model content conflicts at {path}") from None
+        return reference
+
+    def _verify_content_bytes(self, reference: str, *, prefix: str) -> None:
+        path = (
+            self.model_artifact_path(reference)
+            if prefix == MODEL_ARTIFACT_REF_PREFIX
+            else self.model_output_path(reference)
+        )
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise TrainingArtifactConflict(
+                f"model content is unavailable for {reference}"
+            ) from error
+        actual = hashlib.sha256(payload).hexdigest()
+        if reference != prefix + actual:
+            raise TrainingArtifactConflict(f"model content hash mismatch for {reference}")
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
@@ -357,6 +568,63 @@ def _digest_id(value: str, prefix: str) -> str:
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError(f"invalid {prefix} ID")
     return digest
+
+
+def _require_digest_reference(value: str, prefix: str) -> str:
+    return _digest_id(value, prefix)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _prediction_composition_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "schema_version",
+        "artifact_type",
+        "match_id",
+        "snapshot_id",
+        "model_run_id",
+        "model_version",
+        "generated_at",
+        "snapshot_as_of",
+        "baseline_lambda_home",
+        "baseline_lambda_away",
+        "contribution_keys",
+        "contribution_multipliers",
+        "composition_version",
+        "calibration_versions",
+        "lambda_home",
+        "lambda_away",
+        "rho",
+        "max_goals",
+        "normalization_residual",
+        "score_cells",
+        "input_refs",
+    )
+    try:
+        projected = {name: payload[name] for name in fields}
+    except KeyError as error:
+        raise TrainingArtifactConflict(
+            f"prediction payload is missing composition field: {error.args[0]}"
+        ) from error
+    projected["schema_version"] = 1
+    projected["artifact_type"] = "score-grid-composition"
+    projected["grid"] = {
+        "lambda_home": projected["lambda_home"],
+        "lambda_away": projected["lambda_away"],
+        "rho": projected["rho"],
+        "max_goals": projected["max_goals"],
+        "normalization_residual": projected["normalization_residual"],
+        "score_cells": projected["score_cells"],
+    }
+    return projected
 
 
 def _manifest_status(status: DatasetStatus | ModelRunStatus) -> str:

@@ -56,6 +56,8 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     )
     assert run_manifest.status == "succeeded"
     assert run_manifest.checkpoint == "static-report-written"
+    assert any(ref.startswith("vertical-slice-summary:") for ref in run_manifest.output_refs)
+    assert any(ref.startswith("vertical-slice-report:") for ref in run_manifest.output_refs)
     assert summary["run_id"] == run_manifest.run_id
     assert summary["snapshots"][0]["quality_status"] == "ready"
     assert summary["snapshots"][0]["capture_mode"] == "reconstructed"
@@ -65,6 +67,28 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     assert first.report_path.read_text(encoding="utf-8").startswith(
         "# Premier League 2025-26 Vertical Slice"
     )
+    derived = DerivedArchive(DataLayout(arguments["data_root"]))
+    artifacts = [
+        derived.load_artifact_manifest(json.loads(path.read_text(encoding="utf-8"))["id"])
+        for path in (arguments["data_root"] / "derived/manifests/artifacts").rglob("*.json")
+    ]
+    summary_artifact = next(
+        item for item in artifacts if item.artifact_type == "vertical-slice-summary"
+    )
+    report_artifact = next(
+        item for item in artifacts if item.artifact_type == "vertical-slice-report"
+    )
+    assert any(ref.startswith("file-sha256:") for ref in summary_artifact.output_refs)
+    assert any(ref.startswith("file-sha256:") for ref in report_artifact.output_refs)
+    registrations = [
+        derived.load_run_manifest(json.loads(path.read_text(encoding="utf-8"))["id"])
+        for path in (arguments["data_root"] / "derived/manifests/runs").rglob("*.json")
+    ]
+    registration = next(
+        item for item in registrations if item.run_type == "offline-golden-output-registration"
+    )
+    assert summary_artifact.artifact_id in registration.output_refs
+    assert report_artifact.artifact_id in registration.output_refs
 
     first.summary_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(ArchiveConflictError, match="summary conflicts"):

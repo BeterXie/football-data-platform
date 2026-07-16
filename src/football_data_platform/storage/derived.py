@@ -18,6 +18,8 @@ from football_data_platform.domain.predictions import (
     ModelRunValidator,
     ScorePrediction,
     prediction_payload,
+    score_grid_composition_artifact_id,
+    score_grid_composition_payload,
     verify_score_prediction,
 )
 from football_data_platform.domain.snapshots import (
@@ -681,10 +683,14 @@ class DerivedArchive:
         )
 
     def write_prediction(self, prediction: ScorePrediction) -> Path:
+        """Persist a prediction together with its immutable score-grid provenance."""
+
         verify_score_prediction(
             prediction,
             model_run_validator=self.model_run_validator,
         )
+        self.write_score_grid_composition(prediction)
+        self.verify_score_grid_composition(prediction)
         digest = prediction.id.value.removeprefix("prediction:")
         path = self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
         payload = prediction_payload(prediction)
@@ -697,7 +703,7 @@ class DerivedArchive:
                 generated_at=prediction.generated_at,
                 transform_version=prediction.model_version,
                 code_version=DERIVED_CODE_VERSION,
-                input_refs=prediction.input_refs,
+                input_refs=(*prediction.input_refs, prediction.composition_artifact_ref),
                 output_refs=(prediction.id.value,),
                 status="succeeded",
                 quality=prediction.snapshot_quality_status,
@@ -705,11 +711,104 @@ class DerivedArchive:
         )
         return result
 
+    def write_score_grid_composition(self, prediction: ScorePrediction) -> Path:
+        """Write the content-addressed composition/grid manifest for a prediction."""
+
+        verify_score_prediction(
+            prediction,
+            model_run_validator=self.model_run_validator,
+        )
+        payload = score_grid_composition_payload(prediction)
+        output_ref = score_grid_composition_artifact_id(payload)
+        if prediction.composition_artifact_ref != output_ref:
+            raise ArchiveConflictError("prediction composition artifact reference is not canonical")
+        composition_path = self.score_grid_composition_path(output_ref)
+        self._write_json(composition_path, {"id": output_ref, **payload})
+        manifest = DerivedArtifactManifest.create(
+            artifact_type="score-grid-composition",
+            schema_version=1,
+            payload=payload,
+            generated_at=prediction.generated_at,
+            started_at=prediction.generated_at,
+            ended_at=prediction.generated_at,
+            transform_version=prediction.composition_version,
+            code_version=DERIVED_CODE_VERSION,
+            input_refs=prediction.input_refs,
+            output_refs=(output_ref,),
+            status="succeeded",
+            quality=prediction.snapshot_quality_status,
+        )
+        self.write_artifact_manifest(manifest)
+        return composition_path
+
+    def verify_score_grid_composition(self, prediction: ScorePrediction) -> DerivedArtifactManifest:
+        """Verify the referenced composition bytes and manifest against a prediction."""
+
+        verify_score_prediction(
+            prediction,
+            model_run_validator=self.model_run_validator,
+        )
+        artifact_ref = prediction.composition_artifact_ref
+        if artifact_ref is None:
+            raise ArchiveConflictError("prediction has no composition artifact reference")
+        expected_payload = score_grid_composition_payload(prediction)
+        expected_output_ref = score_grid_composition_artifact_id(expected_payload)
+        if artifact_ref != expected_output_ref:
+            raise ArchiveConflictError("prediction composition artifact reference is not canonical")
+        try:
+            composition_payload = json.loads(
+                self.score_grid_composition_path(artifact_ref).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ArchiveConflictError(
+                "prediction composition artifact bytes are unavailable or invalid"
+            ) from error
+        if composition_payload.pop("id", None) != artifact_ref:
+            raise ArchiveConflictError("prediction composition artifact ID does not match bytes")
+        if composition_payload != expected_payload:
+            raise ArchiveConflictError("prediction composition bytes do not match prediction")
+        try:
+            manifest = self._load_artifact_manifest_for_output_ref(artifact_ref)
+        except (OSError, ValueError, ArchiveConflictError) as error:
+            raise ArchiveConflictError(
+                "prediction composition artifact is unavailable or invalid"
+            ) from error
+        if (
+            manifest.artifact_type != "score-grid-composition"
+            or manifest.status != "succeeded"
+            or manifest.quality != prediction.snapshot_quality_status
+            or manifest.generated_at != prediction.generated_at
+            or manifest.input_refs != prediction.input_refs
+            or manifest.transform_version != prediction.composition_version
+            or expected_output_ref not in manifest.output_refs
+            or manifest.payload != expected_payload
+        ):
+            raise ArchiveConflictError("prediction composition artifact does not match prediction")
+        if manifest.generated_at < prediction.snapshot_as_of:
+            raise ArchiveConflictError("composition artifact predates prediction snapshot as_of")
+        return manifest
+
+    def load_score_grid_composition_payload(self, artifact_ref: str) -> dict[str, Any]:
+        """Load and verify one standalone composition payload by content ID."""
+
+        _validate_score_grid_composition_ref(artifact_ref)
+        try:
+            payload = json.loads(
+                self.score_grid_composition_path(artifact_ref).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ArchiveConflictError("cannot load score-grid-composition bytes") from error
+        stored_id = payload.pop("id", None)
+        if stored_id != artifact_ref or score_grid_composition_artifact_id(payload) != artifact_ref:
+            raise ArchiveConflictError("score-grid-composition content identity failed")
+        return payload
+
     def load_prediction_payload(self, prediction: ScorePrediction) -> dict[str, Any]:
         verify_score_prediction(
             prediction,
             model_run_validator=self.model_run_validator,
         )
+        self.verify_score_grid_composition(prediction)
         digest = prediction.id.value.removeprefix("prediction:")
         path = self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -814,6 +913,38 @@ class DerivedArchive:
     def artifact_manifest_path(self, artifact_id: str) -> Path:
         digest = _manifest_digest(artifact_id, "derived-artifact")
         return self.layout.derived / "manifests" / "artifacts" / digest[:2] / f"{digest}.json"
+
+    def score_grid_composition_path(self, artifact_ref: str) -> Path:
+        _validate_score_grid_composition_ref(artifact_ref)
+        digest = artifact_ref.removeprefix("score-grid-composition:")
+        return self.layout.derived / "compositions" / digest[:2] / f"{digest}.json"
+
+    def _load_artifact_manifest_for_output_ref(self, output_ref: str) -> DerivedArtifactManifest:
+        """Resolve a logical output ref through immutable manifests.
+
+        Manifest IDs include execution metadata, whereas composition IDs are
+        payload content IDs.  Resolving by ``output_refs`` keeps those concerns
+        separate and lets the manifest remain fully content-addressed.
+        """
+
+        matches: list[DerivedArtifactManifest] = []
+        for path in (self.layout.derived / "manifests" / "artifacts").rglob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                manifest = _parse_artifact_manifest(payload)
+            except (OSError, json.JSONDecodeError, ArchiveConflictError):
+                continue
+            if output_ref in manifest.output_refs:
+                matches.append(manifest)
+        if not matches:
+            raise ArchiveConflictError(f"no derived manifest exposes output ref {output_ref}")
+        if len(matches) > 1:
+            identities = {item.artifact_id for item in matches}
+            if len(identities) > 1:
+                raise ArchiveConflictError(
+                    f"output ref {output_ref} resolves to conflicting manifests"
+                )
+        return matches[0]
 
     def run_manifest_path(self, run_id: str) -> Path:
         digest = _manifest_digest(run_id, "run")
@@ -1062,6 +1193,15 @@ def _manifest_digest(value: str, prefix: str) -> str:
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError(f"invalid {prefix} manifest ID")
     return digest
+
+
+def _validate_score_grid_composition_ref(value: str) -> None:
+    marker = "score-grid-composition:"
+    if not isinstance(value, str) or not value.startswith(marker):
+        raise ValueError("invalid score-grid-composition reference")
+    digest = value.removeprefix(marker)
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("invalid score-grid-composition reference digest")
 
 
 def _canonical_json(value: Any) -> bytes:

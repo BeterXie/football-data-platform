@@ -4,8 +4,10 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from _training_refs import seed_training_references
 
 from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId, TeamId
 from football_data_platform.domain.ledger import (
@@ -25,10 +27,17 @@ from football_data_platform.domain.predictions import (
     build_score_prediction,
 )
 from football_data_platform.domain.snapshots import (
+    CaptureMode,
     SnapshotFeature,
     SnapshotType,
     build_snapshot,
 )
+from football_data_platform.domain.training import (
+    ModelRunArtifact,
+    TrainingDatasetManifest,
+    TrainingSample,
+)
+from football_data_platform.features.contributions import compose_expected_goals
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
     build_team_baseline,
@@ -38,6 +47,7 @@ from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.ledger import LedgerConflictError, PaperBetLedger
 from football_data_platform.storage.raw import RawArchive
+from football_data_platform.storage.training import TrainingArtifactStore
 
 MATCH = MatchId("match:paper-ledger")
 HOME = TeamId("team:paper-ledger-home")
@@ -138,10 +148,83 @@ def _fixture(tmp_path: Path):
         away_team_id=AWAY,
         source_validator=derived,
     )
+    derived.write_snapshot(snapshot)
+    training = TrainingArtifactStore(layout)
+    _, label_ref = seed_training_references(layout)
+    train_sample = TrainingSample(
+        sample_id="sample:paper-ledger-train",
+        as_of=AS_OF - timedelta(days=2),
+        feature_known_at=AS_OF - timedelta(days=3),
+        label_known_at=AS_OF - timedelta(days=1),
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        feature_refs=tuple(sorted((baseline.artifact_id, evidence.id.value))),
+        label_ref=label_ref,
+        features={"home_strength": 1.7, "away_strength": 0.8},
+        label={"home_goals": 1, "away_goals": 0},
+        split="train",
+    )
+    holdout_sample = TrainingSample(
+        sample_id="sample:paper-ledger-holdout",
+        as_of=AS_OF,
+        feature_known_at=AS_OF - timedelta(hours=1),
+        label_known_at=AS_OF + timedelta(days=1),
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        feature_refs=tuple(sorted((baseline.artifact_id, snapshot.id.value))),
+        label_ref=label_ref,
+        features={"home_strength": 1.7, "away_strength": 0.8},
+        label={"home_goals": 2, "away_goals": 1},
+        split="holdout",
+    )
+    dataset = TrainingDatasetManifest.create(
+        dataset_version="score-dataset/paper-ledger",
+        task="score-model",
+        qualification="score-model-ready",
+        qualification_ruleset_version="readiness/1",
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        as_of=AS_OF,
+        split_strategy="forward-chaining/1",
+        samples=(train_sample, holdout_sample),
+        generated_at=AS_OF + timedelta(days=1),
+        code_version="git:test",
+    )
+    training.write_dataset(dataset)
+    model_ref = training.write_model_artifact(b"paper-ledger-model-v1")
+    output_ref = training.write_model_output(b"paper-ledger-output-v1")
+    model_run = ModelRunArtifact.create(
+        model_version="dixon-coles/paper-ledger",
+        run_role="research",
+        task="score-model",
+        dataset_id=dataset.dataset_id,
+        feature_version=dataset.feature_version,
+        label_version=dataset.label_version,
+        algorithm="dixon-coles",
+        parameters={"rho": -0.1, "max_goals": 11},
+        code_version="git:test",
+        environment_version="python:test-lock",
+        started_at=AS_OF - timedelta(seconds=2),
+        ended_at=AS_OF - timedelta(seconds=1),
+        random_seed=17,
+        model_artifact_refs=(model_ref,),
+        evaluation_cohort=(holdout_sample.sample_id,),
+        evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
+        output_refs=(output_ref,),
+        output_hashes=(output_ref.removeprefix("model-output:"),),
+    )
+    training.write_model_run(model_run)
+    derived.model_run_validator = training
     prediction = build_score_prediction(
         snapshot=snapshot,
         snapshot_validator=derived,
-        model_run_id=ModelRunId("model-run:paper-ledger"),
+        model_run_id=ModelRunId(model_run.model_run_id),
         model_version="dixon-coles/paper-ledger",
         generated_at=AS_OF,
         lambda_home=1.7,
@@ -149,7 +232,9 @@ def _fixture(tmp_path: Path):
         rho=-0.1,
         max_goals=11,
         input_refs=(),
+        expected_goals=compose_expected_goals(1.7, 0.8),
     )
+    derived.write_prediction(prediction)
     market_asset = raw.archive(
         b'{"market":"result_90"}',
         source="bookmaker",
@@ -385,8 +470,7 @@ def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
     )
     path = ledger.append(entry)
     assert ledger.append(entry) == path
-    with pytest.raises(ValueError, match="raw evidence validator"):
-        PaperBetLedger(layout).load(entry.entry_id)
+    assert PaperBetLedger(layout).load(entry.entry_id) == entry
     open_summary = ledger.recompute(initial_bankroll=100)
     assert open_summary.balance == 90
     assert open_summary.open_stake == 10
@@ -407,6 +491,13 @@ def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
     assert summary.total_payout == 20
     assert summary.balance == 110
     assert summary.open_stake == 0
+    latest = json.loads((layout.paper_ledger / "latest.json").read_text(encoding="utf-8"))
+    derived = DerivedArchive(layout)
+    artifact = derived.load_artifact_manifest(latest["artifact_id"])
+    run = derived.load_run_manifest(latest["run_id"])
+    assert artifact.artifact_type == "paper-ledger-summary"
+    assert artifact.artifact_id in run.output_refs
+    assert any(ref.startswith("file-sha256:") for ref in artifact.output_refs)
 
     with pytest.raises(ValueError, match="payout"):
         replace(settled, payout=999.0)
@@ -417,6 +508,41 @@ def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
     )
     with pytest.raises((LedgerConflictError, ValueError)):
         ledger.load(settled.entry_id)
+
+
+def test_retry_repairs_entry_when_derived_registration_failed_after_append(
+    tmp_path: Path,
+) -> None:
+    layout, raw, prediction, market = _fixture(tmp_path)
+    ledger = PaperBetLedger(layout, market_source_validator=raw)
+    entry = PaperBetEntry.accepted(
+        prediction=prediction,
+        market_snapshot=market,
+        market_source_validator=raw,
+        selection="home",
+        risk_config=RiskConfig(),
+        stake=10,
+        match_exposure=10,
+        daily_exposure=10,
+        placed_at=AS_OF,
+        settlement_rules=SettlementRules(selection="home"),
+    )
+    original_write_summary = PaperBetLedger._write_derived_summary
+    calls = 0
+
+    def flaky_write_summary(current: PaperBetLedger):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise LedgerConflictError("transient registry failure")
+        return original_write_summary(current)
+
+    with patch.object(PaperBetLedger, "_write_derived_summary", flaky_write_summary):
+        with pytest.raises(LedgerConflictError, match="transient registry failure"):
+            ledger.append(entry)
+        assert ledger.entry_path(entry.entry_id).is_file()
+        ledger.append(entry)
+    assert (layout.paper_ledger / "latest.json").is_file()
 
 
 def test_ledger_can_require_canonical_result_evidence_for_settlement_and_load(
@@ -509,6 +635,46 @@ def test_ledger_rejects_entries_that_reference_an_unavailable_model_run(
 
     with pytest.raises(ValueError, match="model run is unavailable or invalid"):
         ledger.append(entry)
+
+
+def test_default_ledger_rejects_missing_prediction_or_model_bytes(tmp_path: Path) -> None:
+    layout, raw, prediction, market = _fixture(tmp_path)
+    entry = PaperBetEntry.accepted(
+        prediction=prediction,
+        market_snapshot=market,
+        market_source_validator=raw,
+        selection="home",
+        risk_config=RiskConfig(),
+        stake=10,
+        match_exposure=10,
+        daily_exposure=10,
+        placed_at=AS_OF,
+        settlement_rules=SettlementRules(selection="home"),
+    )
+    ledger = PaperBetLedger(layout, market_source_validator=raw)
+    prediction_path = ledger._prediction_path(prediction.id.value)
+    prediction_path.unlink()
+    with pytest.raises(ValueError, match="prediction artifact"):
+        ledger.append(entry)
+
+    layout, raw, prediction, market = _fixture(tmp_path / "model")
+    entry = PaperBetEntry.accepted(
+        prediction=prediction,
+        market_snapshot=market,
+        market_source_validator=raw,
+        selection="home",
+        risk_config=RiskConfig(),
+        stake=10,
+        match_exposure=10,
+        daily_exposure=10,
+        placed_at=AS_OF,
+        settlement_rules=SettlementRules(selection="home"),
+    )
+    model_store = TrainingArtifactStore(layout)
+    run = model_store.load_model_run(prediction.model_run_id.value)
+    model_store.model_artifact_path(run.model_artifact_refs[0]).unlink()
+    with pytest.raises(ValueError, match="model artifact"):
+        PaperBetLedger(layout, market_source_validator=raw).append(entry)
 
 
 def test_ledger_parser_rejects_bool_schema_version(tmp_path: Path) -> None:

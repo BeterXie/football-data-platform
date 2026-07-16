@@ -693,6 +693,17 @@ class CanonicalStore:
             ).fetchall()
         return tuple(_collection_attempt_from_row(row) for row in rows)
 
+    def match_ids_for_season(self, season_id: SeasonId) -> tuple[MatchId, ...]:
+        """Return persisted canonical fixture IDs for one registered season."""
+
+        with self.connect() as connection:
+            _require_entity(connection, season_id, "season")
+            rows = connection.execute(
+                "SELECT match_id FROM matches WHERE season_id = ? ORDER BY match_id",
+                (season_id.value,),
+            ).fetchall()
+        return tuple(MatchId(row["match_id"]) for row in rows)
+
     def counts(self) -> dict[str, int]:
         tables = ("competitions", "seasons", "teams", "players", "matches")
         with self.connect() as connection:
