@@ -14,10 +14,20 @@
 The current checkout implements and tests the contract-level repairs for R01-R12: persisted
 raw/canonical/derived lineage, stable cross-source identities, lifecycle/readiness gates, the
 versioned feature composition, real-market evaluation gates, prematch evidence adapters, derived
-and run manifests, versioned training/model artifacts, and the append-only paper ledger. The
-206-test suite and the deterministic two-match golden replay are evidence for those contracts
-only. Full-season 20-team/380-match collection, live-source coverage, prospective `captured`
-cohorts, reviewed promotion policy, and multi-league expansion remain open by design.
+and run manifests, versioned training/model artifacts, and the append-only paper ledger. R03,
+R07, R09, and R10 are contract-implemented; their production evidence is still open. The
+latest suite, Ruff checks, format checks, compile check, and deterministic two-match golden
+replay are evidence for those contracts only. The prediction boundary now requires every
+composition contribution to cite a verified snapshot feature source, including when a
+prediction is persisted. Full-season 20-team/380-match collection with one persisted attempt
+per fixture, complete FBref statistics, prospective `captured` snapshots, real-market cohorts,
+a reviewed promotion policy, and multi-league expansion remain open by design.
+
+The current official-lineup DTO path verifies registered source/raw metadata and canonical
+identity, but a source-specific raw parser/replay contract is still required before production
+official-lineup evidence can be treated as independently replayable. Player-profile manifests
+verify profile shape and referenced inputs; a versioned observation artifact is still needed to
+recompute profile metrics independently at the storage boundary.
 
 ## Review Checkpoint (2026-07-16, orchestration follow-up)
 
@@ -28,14 +38,25 @@ checkpoints, content-addressed JSON/Markdown outputs, resume references, and lat
 `--resume-run-id` is an explicit idempotent replay (`resume_mode: replay`), not an implicit
 checkpoint jump; the run manifest records that mode and the parent run reference.
 `validate-schedule` ignores caller-supplied attempt IDs and queries canonical collection attempts;
-the FBref report pipeline now cross-checks raw-page match/competition/season identity, URL, teams,
-date, and score before writing facts. Golden summary/report files also have immutable derived artifact
-manifests and a separate output-registration run. Paper-ledger append/retry also registers an
-immutable summary artifact and recompute run, including repair after an entry was persisted before
-registry writing failed. Current evidence is 206 passing tests plus the two-match offline replay.
-This does not prove 20-team/380-match real coverage, live FBref access,
-one report attempt for every fixture, prospective captured samples, or a reviewed promotion policy;
-those production gates remain Open.
+the coverage ledger now persists source IDs, rejects swapped fixture/report identities, and keeps
+missing, blocked, failed, and successful states distinct. The FBref report pipeline cross-checks
+raw-page match/competition/season identity, URL, teams, date, score, required-table presence, and
+per-team missing-table diagnostics before writing facts. Production coverage requires the fixed
+seven-table contract plus a successful RawArchive replay of its content-addressed parser contract
+against canonical fixture identity and the 90-minute result;
+explicit summary-only preview attempts remain visible but cannot satisfy the full report gate.
+Player-profile and lineup-delta outputs
+retain independent raw/canonical/derived lineage and readiness reasons. Golden summary/report
+schemas and transforms are versioned, including JSON-safe fixture coverage and migration-safe
+source-id fields. Paper-ledger append/retry also registers an immutable summary artifact and
+recompute run, including repair after an entry was persisted before registry writing failed.
+Current evidence is 275 passing tests, `ruff check`, `ruff format --check`, `compileall`, and the
+two-match offline golden replay producing the same
+run/prediction IDs across two data roots and an idempotent retry. This does not prove 20-team/380-
+match real coverage, one
+persisted attempt for every real fixture, complete FBref statistics, live FBref access,
+prospective captured snapshots, a real market cohort, or a reviewed promotion policy; those
+production gates remain Open.
 
 ## 执行原则与依赖
 
@@ -84,7 +105,11 @@ those production gates remain Open.
 
 ### FDP-R03：全赛季覆盖门禁存在假阳性
 
-- 严重度：P1；状态：Open。
+- 严重度：P1；状态：契约已实现，生产证据开放。
+- 当前实现证据：canonical schema v4 持久化并迁移 collection-attempt `source_id`、版本化
+  prematch event 和 content-addressed match-report contract；覆盖校验从赛季映射和持久化
+  attempt 计算逐 fixture 状态，错误 source ID、报告 URL 和 swapped fixture/report 身份不会
+  满足 attempt 或 report-success gate，并保留可读 mismatch 诊断。
 - 设计依据：总体设计第 17 节；ADR-0004、ADR-0013、ADR-0017；`AGENTS.md` 全赛季边界。
 - 根因：门禁只比较数量和调用方提供的 attempt ID，没有验证双循环赛程结构，也没有查询
   持久化采集尝试。
@@ -149,7 +174,12 @@ those production gates remain Open.
 
 ### FDP-R07：FBref 逐场归档链路尚未证明适配真实报告
 
-- 严重度：P1；状态：Open。
+- 严重度：P1；状态：契约已实现，生产证据开放。
+- 当前实现证据：match-report 解析在写事实前交叉校验 raw 页面、赛事/赛季、双方、日期、比分、
+  URL 和来源身份；生产导入固定要求七张表，显式自定义表集合仅用于 preview/研究，不能满足
+  完整报告覆盖门禁；强门禁会从 RawArchive 重放并核对 parser version、source match、主客方向、
+  赛事/赛季、日期、90 分钟比分、逐队表集合、缺表和阻断诊断；缺失表、重复表、未知表及逐队
+  缺表均形成结构化诊断并阻断相应事实写入。真实 380 场成功报告覆盖仍未取得。
 - 设计依据：总体设计第 5.2、16、17 节；ADR-0004、ADR-0017、ADR-0022。
 - 根因：比赛报告管线信任调用方比赛 ID/比分，未与 raw 页面身份交叉核验；解析器依赖
   golden fixture 人工提供而真实 summary 可能缺少的字段。
@@ -179,7 +209,13 @@ those production gates remain Open.
 
 ### FDP-R09：赛前事件证据、确认时间与真实来源采集门禁缺失
 
-- 严重度：P1；状态：Open。
+- 严重度：P1；状态：契约已实现，生产证据开放。
+- 当前实现证据：新闻 canonical 记录强制匹配 raw source/URL/`observed_at`；事件证据必须来自
+  注册来源，确认级别由 official/独立来源规则计算，且满足
+  `max(published_at) <= known_at <= max(observed_at)` 和 `known_at <= as_of`。赛前 attempt
+  复用幂等 canonical ledger 并可保留失败 raw body/诊断；球员级事件持久化可见 match version，
+  并按事件 `known_at`/`as_of` 截断同版本 assignment；v3 legacy 未绑定球员事件迁移后不可修改
+  特征且保留原证据。真实持续来源运行仍未证明。
 - 设计依据：总体设计第 5.3、8、9、17 节；ADR-0004、ADR-0005、ADR-0018。
 - 根因：调用方可用单条新闻把事件标记为 `corroborated`，事件 `known_at` 未与支持证据的
   `published_at/observed_at` 交叉校验；当前纵向切片主要依赖人工 fixture，没有可持续的
@@ -200,7 +236,14 @@ those production gates remain Open.
 
 ### FDP-R10：球员画像与阵容增量可把空维度标记为 ready
 
-- 严重度：P1；状态：Open。
+- 严重度：P1；状态：契约已实现，生产证据开放。
+- 当前实现证据：画像 readiness 校验角色必需维度、N/A、分钟/比赛阈值、窗口和 `as_of`；
+  lineup delta 校验双方 11 人、非空 profile refs、契约版本、样本量、输入 raw/canonical
+  引用和非空适用维度；`lineup-delta-input/3` 会逐项加载 player-profile manifest、重算增量，
+  并与 `official-lineup-input/2` 绑定的 canonical official lineup facts 及其 raw refs 比对。
+  球员/球队归属由 canonical lineup fact 边界校验。
+  `prematch-features/1` lineup 仅作为只读 legacy artifact；`prematch-features/2` 的 ready
+  lineup 只接受 `/3` 证据。缺失、N/A、insufficient-sample 与 ready 保持独立。
 - 设计依据：总体设计第 10、11、13、17 节；ADR-0006、ADR-0007、ADR-0014。
 - 根因：画像 readiness 主要按总分钟判断，即使 `metrics` 为空也可 ready；阵容的所有球员
   `dimensions={}` 时会得到空 delta 且 ready。长期能力、近期状态、可用性和负荷也尚未作为

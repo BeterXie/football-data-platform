@@ -89,9 +89,12 @@ class CollectionAttempt:
     diagnostic_code: str | None
     diagnostic_message: str | None
     raw_asset_id: RawAssetId | None
+    source_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.source, "source")
+        if self.source_id is not None:
+            _require_text(self.source_id, "source_id")
         _require_text(self.target_url, "target_url")
         _require_text(self.collector_version, "collector_version")
         require_utc(self.observed_at, "observed_at")

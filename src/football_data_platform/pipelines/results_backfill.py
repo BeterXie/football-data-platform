@@ -115,6 +115,7 @@ def ingest_results_backfill(
         season,
         source="football-data",
         canonical=canonical,
+        archive=archive,
     )
     return ResultsBackfillResult(
         asset.id.value,

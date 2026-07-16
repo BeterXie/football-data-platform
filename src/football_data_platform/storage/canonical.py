@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterator, Sequence
@@ -32,7 +34,7 @@ from football_data_platform.domain.models import (
     require_utc,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 _ID_NAMESPACE = uuid.UUID("c62a4fc0-2e72-4d9c-b4b3-113b31c31982")
 
 
@@ -65,6 +67,43 @@ class ResolvedPlayer:
     canonical_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class MatchReportContractEvidence:
+    contract_id: str
+    collection_attempt_id: CollectionAttemptId
+    match_id: MatchId
+    match_version: int
+    raw_asset_id: RawAssetId
+    source_match_id: str
+    parser_version: str
+    required_tables: tuple[str, ...]
+    team_tables: tuple[tuple[str, tuple[str, ...]], ...]
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.match_version < 1:
+            raise ValueError("match_version must be positive")
+        for value, field_name in (
+            (self.contract_id, "contract_id"),
+            (self.source_match_id, "source_match_id"),
+            (self.parser_version, "parser_version"),
+        ):
+            if not value or value.strip() != value:
+                raise ValueError(f"{field_name} must be non-empty text")
+        if not self.required_tables:
+            raise ValueError("required_tables must not be empty")
+        if len(set(self.required_tables)) != len(self.required_tables):
+            raise ValueError("required_tables must be unique")
+        if len(self.team_tables) != 2:
+            raise ValueError("team_tables must contain exactly two report teams")
+        if len({team_id for team_id, _ in self.team_tables}) != len(self.team_tables):
+            raise ValueError("team_tables team IDs must be unique")
+        for team_id, tables in self.team_tables:
+            if not team_id or not tables or len(set(tables)) != len(tables):
+                raise ValueError("team table evidence must have a team ID and unique tables")
+        require_utc(self.observed_at, "observed_at")
+
+
 class CanonicalStore:
     """Own the normalized identity catalog and versioned fixture facts."""
 
@@ -85,6 +124,13 @@ class CanonicalStore:
                 )
             elif row["version"] == 1:
                 _migrate_v1_to_v2(connection)
+                _migrate_v2_to_v3(connection)
+                _migrate_v3_to_v4(connection)
+            elif row["version"] == 2:
+                _migrate_v2_to_v3(connection)
+                _migrate_v3_to_v4(connection)
+            elif row["version"] == 3:
+                _migrate_v3_to_v4(connection)
             elif row["version"] != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"canonical schema {row['version']} is not supported by "
@@ -614,6 +660,33 @@ class CanonicalStore:
             ).fetchall()
         return {str(row["source_id"]): MatchId(row["entity_id"]) for row in rows}
 
+    def mapped_match_source_ids(
+        self,
+        *,
+        source: str,
+        season_id: SeasonId,
+    ) -> dict[str, MatchId]:
+        """Return current provider match mappings for one persisted season.
+
+        Coverage validators must be able to inspect the canonical fixture catalog even when the
+        latest source page is partial or unavailable.  This query deliberately returns only
+        current, season-scoped mappings; it does not infer identities from display names or from
+        collection-attempt URLs.
+        """
+
+        with self.connect() as connection:
+            _require_entity(connection, season_id, "season")
+            rows = connection.execute(
+                "SELECT mapping.source_id, mapping.entity_id "
+                "FROM source_mappings AS mapping "
+                "JOIN matches AS match ON match.match_id = mapping.entity_id "
+                "WHERE mapping.source = ? AND mapping.entity_type = 'match' "
+                "AND mapping.valid_to IS NULL AND match.season_id = ? "
+                "ORDER BY mapping.source_id",
+                (source, season_id.value),
+            ).fetchall()
+        return {str(row["source_id"]): MatchId(row["entity_id"]) for row in rows}
+
     def record_collection_attempt(
         self,
         *,
@@ -643,6 +716,7 @@ class CanonicalStore:
             id=CollectionAttemptId(_stable_id("collection-attempt", source, identity)),
             match_id=match_id,
             source=source,
+            source_id=source_id,
             target_url=target_url,
             outcome=outcome,
             observed_at=observed_at,
@@ -670,6 +744,7 @@ class CanonicalStore:
                     "collection_attempt_id": attempt.id.value,
                     "match_id": match_id.value,
                     "source": source,
+                    "source_id": source_id,
                     "target_url": target_url,
                     "outcome": outcome.value,
                     "observed_at": _timestamp(observed_at),
@@ -692,6 +767,104 @@ class CanonicalStore:
                 (season_id.value,),
             ).fetchall()
         return tuple(_collection_attempt_from_row(row) for row in rows)
+
+    def record_match_report_contract(
+        self,
+        *,
+        collection_attempt_id: CollectionAttemptId,
+        match_id: MatchId,
+        match_version: int,
+        raw_asset_id: RawAssetId,
+        source_match_id: str,
+        parser_version: str,
+        required_tables: Sequence[str],
+        team_tables: dict[str, Sequence[str]],
+        observed_at: datetime,
+    ) -> MatchReportContractEvidence:
+        """Persist immutable parser-contract evidence for one successful report attempt."""
+
+        normalized_required = tuple(dict.fromkeys(required_tables))
+        normalized_team_tables = tuple(
+            sorted(
+                (
+                    team_id,
+                    tuple(dict.fromkeys(tables)),
+                )
+                for team_id, tables in team_tables.items()
+            )
+        )
+        contract_id = _match_report_contract_id(
+            collection_attempt_id=collection_attempt_id,
+            match_id=match_id,
+            match_version=match_version,
+            raw_asset_id=raw_asset_id,
+            source_match_id=source_match_id,
+            parser_version=parser_version,
+            required_tables=normalized_required,
+            team_tables=normalized_team_tables,
+            observed_at=observed_at,
+        )
+        evidence = MatchReportContractEvidence(
+            contract_id=contract_id,
+            collection_attempt_id=collection_attempt_id,
+            match_id=match_id,
+            match_version=match_version,
+            raw_asset_id=raw_asset_id,
+            source_match_id=source_match_id,
+            parser_version=parser_version,
+            required_tables=normalized_required,
+            team_tables=normalized_team_tables,
+            observed_at=observed_at,
+        )
+        with self.connect() as connection:
+            _validate_match_report_contract_lineage(connection, evidence)
+            _insert_exact(
+                connection,
+                "match_report_contracts",
+                {
+                    "contract_id": evidence.contract_id,
+                    "collection_attempt_id": evidence.collection_attempt_id.value,
+                    "match_id": evidence.match_id.value,
+                    "match_version": evidence.match_version,
+                    "raw_asset_id": evidence.raw_asset_id.value,
+                    "source_match_id": evidence.source_match_id,
+                    "parser_version": evidence.parser_version,
+                    "required_tables_json": _json_text(evidence.required_tables),
+                    "team_tables_json": _json_text(
+                        {team_id: tables for team_id, tables in evidence.team_tables}
+                    ),
+                    "observed_at": _timestamp(evidence.observed_at),
+                },
+                "contract_id",
+            )
+        return evidence
+
+    def match_report_contract_audit(
+        self,
+        season_id: SeasonId,
+    ) -> tuple[tuple[MatchReportContractEvidence, ...], tuple[str, ...]]:
+        """Load valid report contracts and retain tamper diagnostics per persisted row."""
+
+        with self.connect() as connection:
+            _require_entity(connection, season_id, "season")
+            rows = connection.execute(
+                "SELECT contract.* FROM match_report_contracts AS contract "
+                "JOIN matches AS match ON match.match_id = contract.match_id "
+                "WHERE match.season_id = ? ORDER BY contract.observed_at, contract.contract_id",
+                (season_id.value,),
+            ).fetchall()
+            valid: list[MatchReportContractEvidence] = []
+            diagnostics: list[str] = []
+            for row in rows:
+                contract_id = str(row["contract_id"])
+                try:
+                    evidence = _match_report_contract_from_row(row)
+                    _validate_match_report_contract_lineage(connection, evidence)
+                except (KeyError, TypeError, ValueError, CanonicalConflictError):
+                    diagnostics.append(f"match_report_contract_invalid:{contract_id}")
+                    continue
+                valid.append(evidence)
+        return tuple(valid), tuple(diagnostics)
 
     def match_ids_for_season(self, season_id: SeasonId) -> tuple[MatchId, ...]:
         """Return persisted canonical fixture IDs for one registered season."""
@@ -783,6 +956,49 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
     }
     if "round_name" not in columns:
         connection.execute("ALTER TABLE match_versions ADD COLUMN round_name TEXT")
+    connection.execute("UPDATE schema_meta SET version = 2 WHERE singleton = 1")
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(collection_attempts)").fetchall()
+    }
+    if "source_id" not in columns:
+        connection.execute("ALTER TABLE collection_attempts ADD COLUMN source_id TEXT")
+    connection.execute(
+        "UPDATE collection_attempts SET source_id = ("
+        "SELECT raw.source_id FROM raw_assets AS raw "
+        "WHERE raw.raw_asset_id = collection_attempts.raw_asset_id"
+        ") WHERE source_id IS NULL AND raw_asset_id IS NOT NULL"
+    )
+    connection.execute("UPDATE schema_meta SET version = 3 WHERE singleton = 1")
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(prematch_events)").fetchall()
+    }
+    match_version_value = "match_version" if "match_version" in columns else "NULL"
+    unbound_player = (
+        "player_id IS NOT NULL AND match_version IS NULL"
+        if "match_version" in columns
+        else "player_id IS NOT NULL"
+    )
+    connection.execute("DROP TABLE IF EXISTS prematch_events_v4")
+    connection.execute(_prematch_events_table_sql("prematch_events_v4", if_not_exists=False))
+    connection.execute(
+        "INSERT INTO prematch_events_v4(record_id, match_id, match_version, team_id, "
+        "player_id, event_type, occurred_at, known_at, confirmation_status, "
+        "evidence_refs_json, can_modify_features) "
+        f"SELECT record_id, match_id, {match_version_value}, team_id, player_id, event_type, "
+        "occurred_at, known_at, confirmation_status, evidence_refs_json, "
+        f"CASE WHEN {unbound_player} THEN 0 ELSE can_modify_features END "
+        "FROM prematch_events"
+    )
+    connection.execute("DROP TABLE prematch_events")
+    connection.execute("ALTER TABLE prematch_events_v4 RENAME TO prematch_events")
     connection.execute("UPDATE schema_meta SET version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
 
 
@@ -933,7 +1149,145 @@ def _collection_attempt_from_row(row: sqlite3.Row) -> CollectionAttempt:
         diagnostic_code=row["diagnostic_code"],
         diagnostic_message=row["diagnostic_message"],
         raw_asset_id=(RawAssetId(row["raw_asset_id"]) if row["raw_asset_id"] is not None else None),
+        source_id=row["source_id"],
     )
+
+
+def _match_report_contract_from_row(row: sqlite3.Row) -> MatchReportContractEvidence:
+    required_value = json.loads(row["required_tables_json"])
+    team_value = json.loads(row["team_tables_json"])
+    if not isinstance(required_value, list) or not all(
+        isinstance(item, str) for item in required_value
+    ):
+        raise ValueError("required report tables must be a string list")
+    if not isinstance(team_value, dict):
+        raise ValueError("team report tables must be an object")
+    team_tables: list[tuple[str, tuple[str, ...]]] = []
+    for team_id, tables in team_value.items():
+        if (
+            not isinstance(team_id, str)
+            or not isinstance(tables, list)
+            or not all(isinstance(item, str) for item in tables)
+        ):
+            raise ValueError("team report tables must map strings to string lists")
+        team_tables.append((team_id, tuple(tables)))
+    evidence = MatchReportContractEvidence(
+        contract_id=str(row["contract_id"]),
+        collection_attempt_id=CollectionAttemptId(row["collection_attempt_id"]),
+        match_id=MatchId(row["match_id"]),
+        match_version=int(row["match_version"]),
+        raw_asset_id=RawAssetId(row["raw_asset_id"]),
+        source_match_id=str(row["source_match_id"]),
+        parser_version=str(row["parser_version"]),
+        required_tables=tuple(required_value),
+        team_tables=tuple(sorted(team_tables)),
+        observed_at=_parse_timestamp(row["observed_at"]),
+    )
+    expected_id = _match_report_contract_id(
+        collection_attempt_id=evidence.collection_attempt_id,
+        match_id=evidence.match_id,
+        match_version=evidence.match_version,
+        raw_asset_id=evidence.raw_asset_id,
+        source_match_id=evidence.source_match_id,
+        parser_version=evidence.parser_version,
+        required_tables=evidence.required_tables,
+        team_tables=evidence.team_tables,
+        observed_at=evidence.observed_at,
+    )
+    if evidence.contract_id != expected_id:
+        raise CanonicalConflictError("match report contract content ID does not match payload")
+    return evidence
+
+
+def _validate_match_report_contract_lineage(
+    connection: sqlite3.Connection,
+    evidence: MatchReportContractEvidence,
+) -> None:
+    attempt = connection.execute(
+        "SELECT match_id, source, source_id, outcome, observed_at, raw_asset_id "
+        "FROM collection_attempts WHERE collection_attempt_id = ?",
+        (evidence.collection_attempt_id.value,),
+    ).fetchone()
+    if attempt is None:
+        raise KeyError(f"collection attempt {evidence.collection_attempt_id} does not exist")
+    expected_attempt = (
+        evidence.match_id.value,
+        "fbref-match-report",
+        evidence.source_match_id,
+        CollectionAttemptOutcome.SUCCEEDED.value,
+        _timestamp(evidence.observed_at),
+        evidence.raw_asset_id.value,
+    )
+    actual_attempt = (
+        attempt["match_id"],
+        attempt["source"],
+        attempt["source_id"],
+        attempt["outcome"],
+        attempt["observed_at"],
+        attempt["raw_asset_id"],
+    )
+    if actual_attempt != expected_attempt:
+        raise CanonicalConflictError("match report contract conflicts with collection attempt")
+
+    version = connection.execute(
+        "SELECT 1 FROM match_versions WHERE match_id = ? AND version = ?",
+        (evidence.match_id.value, evidence.match_version),
+    ).fetchone()
+    if version is None:
+        raise KeyError(f"match version {evidence.match_id}:{evidence.match_version} does not exist")
+    raw = connection.execute(
+        "SELECT source, source_id, observed_at FROM raw_assets WHERE raw_asset_id = ?",
+        (evidence.raw_asset_id.value,),
+    ).fetchone()
+    if raw is None:
+        raise KeyError(f"raw asset {evidence.raw_asset_id} does not exist")
+    if (raw["source"], raw["source_id"], raw["observed_at"]) != (
+        "fbref",
+        evidence.source_match_id,
+        _timestamp(evidence.observed_at),
+    ):
+        raise CanonicalConflictError("match report contract conflicts with raw evidence")
+
+    match = _load_match(connection, evidence.match_id)
+    resolved_team_ids = set()
+    for source_team_id, _ in evidence.team_tables:
+        mapped = _current_mapping(connection, "fbref", "team", source_team_id)
+        if mapped is None:
+            raise CanonicalConflictError("match report contract team mapping is missing")
+        resolved_team_ids.add(mapped)
+    if resolved_team_ids != {match.home_team_id.value, match.away_team_id.value}:
+        raise CanonicalConflictError("match report contract teams do not match fixture")
+
+
+def _match_report_contract_id(
+    *,
+    collection_attempt_id: CollectionAttemptId,
+    match_id: MatchId,
+    match_version: int,
+    raw_asset_id: RawAssetId,
+    source_match_id: str,
+    parser_version: str,
+    required_tables: tuple[str, ...],
+    team_tables: tuple[tuple[str, tuple[str, ...]], ...],
+    observed_at: datetime,
+) -> str:
+    payload = {
+        "collection_attempt_id": collection_attempt_id.value,
+        "match_id": match_id.value,
+        "match_version": match_version,
+        "raw_asset_id": raw_asset_id.value,
+        "source_match_id": source_match_id,
+        "parser_version": parser_version,
+        "required_tables": required_tables,
+        "team_tables": {team_id: tables for team_id, tables in team_tables},
+        "observed_at": _timestamp(observed_at),
+    }
+    digest = hashlib.sha256(_json_text(payload).encode("utf-8")).hexdigest()
+    return f"match-report-contract:{digest}"
+
+
+def _json_text(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
 def _require_raw_asset(connection: sqlite3.Connection, asset_id: RawAssetId) -> None:
@@ -1023,7 +1377,33 @@ def _require_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be non-empty text without surrounding whitespace")
 
 
-_SCHEMA = """
+def _prematch_events_table_sql(table_name: str, *, if_not_exists: bool) -> str:
+    if table_name not in {"prematch_events", "prematch_events_v4"}:
+        raise ValueError("unsupported prematch events table name")
+    qualifier = " IF NOT EXISTS" if if_not_exists else ""
+    return f"""
+CREATE TABLE{qualifier} {table_name} (
+    record_id TEXT PRIMARY KEY,
+    match_id TEXT NOT NULL REFERENCES matches(match_id),
+    match_version INTEGER,
+    team_id TEXT REFERENCES teams(team_id),
+    player_id TEXT REFERENCES players(player_id),
+    event_type TEXT NOT NULL,
+    occurred_at TEXT,
+    known_at TEXT NOT NULL,
+    confirmation_status TEXT NOT NULL CHECK (
+        confirmation_status IN ('official', 'corroborated', 'unconfirmed')
+    ),
+    evidence_refs_json TEXT NOT NULL,
+    can_modify_features INTEGER NOT NULL CHECK (can_modify_features IN (0, 1)),
+    CHECK (player_id IS NULL OR match_version IS NOT NULL OR can_modify_features = 0),
+    FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version)
+);
+"""
+
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     version INTEGER NOT NULL CHECK (version > 0)
@@ -1128,6 +1508,7 @@ CREATE TABLE IF NOT EXISTS collection_attempts (
     collection_attempt_id TEXT PRIMARY KEY,
     match_id TEXT NOT NULL REFERENCES matches(match_id),
     source TEXT NOT NULL,
+    source_id TEXT,
     target_url TEXT NOT NULL,
     outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'blocked', 'failed')),
     observed_at TEXT NOT NULL,
@@ -1141,6 +1522,24 @@ CREATE TABLE IF NOT EXISTS collection_attempts (
 
 CREATE INDEX IF NOT EXISTS collection_attempts_match
 ON collection_attempts(match_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS match_report_contracts (
+    contract_id TEXT PRIMARY KEY,
+    collection_attempt_id TEXT NOT NULL UNIQUE
+        REFERENCES collection_attempts(collection_attempt_id),
+    match_id TEXT NOT NULL,
+    match_version INTEGER NOT NULL,
+    raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id),
+    source_match_id TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    required_tables_json TEXT NOT NULL,
+    team_tables_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS match_report_contracts_match
+ON match_report_contracts(match_id, match_version);
 
 CREATE TABLE IF NOT EXISTS match_results_90 (
     record_id TEXT PRIMARY KEY,
@@ -1211,22 +1610,9 @@ CREATE TABLE IF NOT EXISTS news_evidence (
     observed_at TEXT NOT NULL,
     raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id)
 );
-
-CREATE TABLE IF NOT EXISTS prematch_events (
-    record_id TEXT PRIMARY KEY,
-    match_id TEXT NOT NULL REFERENCES matches(match_id),
-    team_id TEXT REFERENCES teams(team_id),
-    player_id TEXT REFERENCES players(player_id),
-    event_type TEXT NOT NULL,
-    occurred_at TEXT,
-    known_at TEXT NOT NULL,
-    confirmation_status TEXT NOT NULL CHECK (
-        confirmation_status IN ('official', 'corroborated', 'unconfirmed')
-    ),
-    evidence_refs_json TEXT NOT NULL,
-    can_modify_features INTEGER NOT NULL CHECK (can_modify_features IN (0, 1))
-);
-
+"""
+    + _prematch_events_table_sql("prematch_events", if_not_exists=True)
+    + """
 CREATE TABLE IF NOT EXISTS fact_evidence (
     record_id TEXT NOT NULL,
     raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id),
@@ -1234,3 +1620,4 @@ CREATE TABLE IF NOT EXISTS fact_evidence (
     PRIMARY KEY (record_id, raw_asset_id)
 );
 """
+)

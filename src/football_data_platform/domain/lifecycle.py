@@ -106,6 +106,15 @@ class LifecycleAssessment:
 
 _REQUIRED_TEAM_STAT_FIELDS = frozenset({"goals", "xg", "shots", "shots_on_target"})
 _SUPPORTED_RULESET_VERSIONS = frozenset({"readiness/1"})
+_PLAYER_REQUIRED_METRICS_BY_RULESET = {
+    "readiness/1": {
+        "forward": frozenset({"shots"}),
+        "FW": frozenset({"shots"}),
+        "MF": frozenset({"shots"}),
+        "DF": frozenset({"shots"}),
+        "GK": frozenset({"saves"}),
+    }
+}
 
 
 def assess_lifecycle(
@@ -215,6 +224,7 @@ def _player_profile_qualification(
     ruleset_version: str,
 ) -> QualificationResult:
     reasons: list[str] = []
+    required_metrics_by_role = _PLAYER_REQUIRED_METRICS_BY_RULESET[ruleset_version]
     if availability.match_status is not MatchStatus.FINISHED:
         reasons.append("match_not_finished")
     if _known_after(availability.as_of, evaluated_at):
@@ -235,10 +245,28 @@ def _player_profile_qualification(
                     continue
                 if observation.team_id != team_id:
                     reasons.append(f"player_observation_team_mismatch:{player_id}")
-                if not observation.role.strip() and observation.minutes <= 0:
+                role = observation.role.strip()
+                if not role:
+                    reasons.append(f"missing_player_role:{player_id}")
+                if observation.minutes <= 0:
+                    reasons.append(f"missing_player_minutes:{player_id}")
+                if not role or observation.minutes <= 0:
                     reasons.append(f"missing_player_role_or_minutes:{player_id}")
                 if not observation.metric_fields:
                     reasons.append(f"missing_player_metrics:{player_id}")
+                else:
+                    required_metrics = required_metrics_by_role.get(role)
+                    if required_metrics is None:
+                        reasons.append(
+                            f"missing_player_role_contract:{player_id}:{role or 'missing'}"
+                        )
+                        required_metrics = frozenset()
+                    reasons.extend(
+                        f"missing_player_metric:{player_id}:{metric}"
+                        for metric in sorted(required_metrics - observation.metric_fields)
+                    )
+                if observation.known_at is None:
+                    reasons.append(f"missing_player_known_at:{player_id}")
                 if _known_after(observation.known_at, evaluated_at):
                     reasons.append(f"player_observation_known_after_evaluation:{player_id}")
     return _qualification(Qualification.PLAYER_PROFILE, reasons, evaluated_at, ruleset_version)

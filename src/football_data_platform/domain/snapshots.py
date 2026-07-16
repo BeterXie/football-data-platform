@@ -36,6 +36,8 @@ class SnapshotSourceValidation:
     observed_at: datetime
     value: Any | None
     input_refs: tuple[str, ...]
+    known_at: datetime | None = None
+    source_context: dict[str, Any] | None = None
 
 
 class SnapshotSourceValidator(Protocol):
@@ -94,12 +96,18 @@ _FEATURE_SPEC_V1 = {
         {"team_baseline", "match_context", "lineup_delta", "official_lineup_confirmed"}
     ),
 }
-_FEATURE_SPECS = {"prematch-features/1": _FEATURE_SPEC_V1}
+_FEATURE_SPEC_V2 = _FEATURE_SPEC_V1
+_FEATURE_SPECS = {
+    "prematch-features/1": _FEATURE_SPEC_V1,
+    "prematch-features/2": _FEATURE_SPEC_V2,
+}
 _FEATURE_TRANSFORMS = {
     "team_baseline": frozenset({"team-baseline-input/1", "team-baseline-input/2"}),
     "match_context": frozenset({"match-context-input/1"}),
-    "lineup_delta": frozenset({"lineup-delta-input/1"}),
-    "official_lineup_confirmed": frozenset({"official-lineup-input/1"}),
+    "lineup_delta": frozenset(
+        {"lineup-delta-input/1", "lineup-delta-input/2", "lineup-delta-input/3"}
+    ),
+    "official_lineup_confirmed": frozenset({"official-lineup-input/1", "official-lineup-input/2"}),
 }
 
 
@@ -118,6 +126,11 @@ def build_snapshot(
 ) -> PreMatchSnapshot:
     """Build a snapshot from store-verified, versioned feature sources."""
 
+    if (
+        snapshot_type is SnapshotType.LINEUPS_CONFIRMED
+        and feature_spec_version == "prematch-features/1"
+    ):
+        raise ValueError("prematch-features/1 lineup snapshots are read-only legacy artifacts")
     features, observed_at, input_refs, missing_fields = _validated_state(
         match_id,
         match_version,
@@ -218,7 +231,28 @@ def _validated_state(
         away_team_id,
     )
     missing = _assess_readiness(spec_version, snapshot_type, features, home_team_id, away_team_id)
-    observed_at, input_refs = _validate_sources(features, source_validator)
+    observed_at, input_refs, validations = _validate_sources(
+        features, source_validator, spec_version
+    )
+    if snapshot_type is SnapshotType.LINEUPS_CONFIRMED:
+        official_lineups = _validate_lineups(
+            [feature for feature in features if feature.name == "official_lineup_confirmed"],
+            home_team_id,
+            away_team_id,
+        )
+        _validate_official_lineup_evidence(
+            features,
+            validations,
+            match_id=match_id,
+            match_version=match_version,
+        )
+        if not missing and any(
+            validations[feature.source_ref].transform_version != "official-lineup-input/2"
+            for feature in features
+            if feature.name == "official_lineup_confirmed"
+        ):
+            raise ValueError("ready lineup snapshot requires official-lineup-input/2 evidence")
+        _validate_lineup_delta_evidence(features, official_lineups, validations)
     return features, observed_at, input_refs, missing
 
 
@@ -260,8 +294,10 @@ def _validate_inputs(
 
 
 def _validate_sources(
-    features: tuple[SnapshotFeature, ...], validator: SnapshotSourceValidator
-) -> tuple[datetime, tuple[str, ...]]:
+    features: tuple[SnapshotFeature, ...],
+    validator: SnapshotSourceValidator,
+    spec_version: str,
+) -> tuple[datetime, tuple[str, ...], dict[str, SnapshotSourceValidation]]:
     if not features:
         raise ValueError("snapshot requires at least one versioned feature source")
     validations: dict[str, SnapshotSourceValidation] = {}
@@ -276,12 +312,88 @@ def _validate_sources(
         if result.transform_version not in _FEATURE_TRANSFORMS[feature.name]:
             raise ValueError(f"snapshot source transform does not match feature {feature.name!r}")
         require_utc(result.observed_at, "source observed_at")
+        if result.known_at is not None:
+            require_utc(result.known_at, "source known_at")
+            if result.known_at != feature.known_at:
+                raise ValueError(f"source known_at does not match feature {feature.name!r}")
+        if (
+            feature.name == "lineup_delta"
+            and spec_version != "prematch-features/1"
+            and _lineup_delta_has_ready_value(feature.value)
+            and result.transform_version != "lineup-delta-input/3"
+        ):
+            raise ValueError("ready lineup_delta requires lineup-delta-input/3 evidence")
         if _canonical_json(result.value) != _canonical_json(feature.value):
             raise ValueError(f"derived source value does not match feature {feature.name!r}")
     observed_at = max(item.observed_at for item in validations.values())
     refs = set(validations)
     refs.update(ref for item in validations.values() for ref in item.input_refs)
-    return observed_at, tuple(sorted(refs))
+    return observed_at, tuple(sorted(refs)), validations
+
+
+def _lineup_delta_has_ready_value(value: Any) -> bool:
+    return isinstance(value, dict) and any(
+        isinstance(item, dict) and item.get("quality_status") == "ready" for item in value.values()
+    )
+
+
+def _validate_lineup_delta_evidence(
+    features: tuple[SnapshotFeature, ...],
+    official_lineups: dict[str, set[str]],
+    validations: dict[str, SnapshotSourceValidation],
+) -> None:
+    delta_features = [feature for feature in features if feature.name == "lineup_delta"]
+    if not delta_features:
+        return
+    validation = validations[delta_features[0].source_ref]
+    if validation.transform_version != "lineup-delta-input/3":
+        return
+    value = validation.value
+    if not isinstance(value, dict):
+        raise ValueError("lineup-delta-input/3 value must be keyed by team")
+    official_features = {
+        feature.entity_id: feature
+        for feature in features
+        if feature.name == "official_lineup_confirmed"
+    }
+    for team_id, players in official_lineups.items():
+        item = value.get(team_id)
+        if not isinstance(item, dict) or set(item.get("starter_ids", ())) != players:
+            raise ValueError(f"lineup delta starter_ids do not match official lineup for {team_id}")
+        official_source = validations[official_features[team_id].source_ref]
+        official_raw_refs = {
+            reference
+            for reference in official_source.input_refs
+            if reference.startswith("raw-asset:")
+        }
+        if set(item.get("lineup_input_refs", ())) != official_raw_refs:
+            raise ValueError(
+                f"lineup delta lineup_input_refs do not match official lineup source for {team_id}"
+            )
+
+
+def _validate_official_lineup_evidence(
+    features: tuple[SnapshotFeature, ...],
+    validations: dict[str, SnapshotSourceValidation],
+    *,
+    match_id: MatchId,
+    match_version: int,
+) -> None:
+    for feature in features:
+        if feature.name != "official_lineup_confirmed":
+            continue
+        validation = validations[feature.source_ref]
+        if validation.transform_version != "official-lineup-input/2":
+            continue
+        context = validation.source_context
+        if (
+            not isinstance(context, dict)
+            or context.get("match_id") != match_id.value
+            or context.get("match_version") != match_version
+            or context.get("team_id") != feature.entity_id
+            or set(context.get("player_ids", ())) != set(feature.value)
+        ):
+            raise ValueError("official lineup source context does not match snapshot")
 
 
 def _assess_readiness(
@@ -307,8 +419,13 @@ def _assess_readiness(
     if snapshot_type is SnapshotType.LINEUPS_CONFIRMED:
         _validate_lineups(by_name.get("official_lineup_confirmed", []), home_team_id, away_team_id)
         if by_name.get("lineup_delta") and by_name["lineup_delta"][0].value is not None:
+            delta_validator = (
+                _lineup_delta_missing_v2
+                if spec_version == "prematch-features/2"
+                else _lineup_delta_missing_v1
+            )
             missing.update(
-                _lineup_delta_missing(by_name["lineup_delta"][0].value, home_team_id, away_team_id)
+                delta_validator(by_name["lineup_delta"][0].value, home_team_id, away_team_id)
             )
     return tuple(sorted(missing))
 
@@ -339,7 +456,7 @@ def _validate_core_values(by_name: dict[str, list[SnapshotFeature]]) -> None:
 
 def _validate_lineups(
     features: list[SnapshotFeature], home_team_id: TeamId, away_team_id: TeamId
-) -> None:
+) -> dict[str, set[str]]:
     expected = {home_team_id.value, away_team_id.value}
     by_team: dict[str, set[str]] = {}
     for feature in features:
@@ -363,9 +480,12 @@ def _validate_lineups(
         )
     if by_team[home_team_id.value] & by_team[away_team_id.value]:
         raise ValueError("official home and away lineups must not overlap")
+    return by_team
 
 
-def _lineup_delta_missing(value: Any, home: TeamId, away: TeamId) -> set[str]:
+def _lineup_delta_missing_v1(value: Any, home: TeamId, away: TeamId) -> set[str]:
+    """Validate the original compact lineup-delta payload for legacy snapshots."""
+
     if not isinstance(value, dict) or set(value) - {home.value, away.value}:
         raise ValueError("lineup_delta must be keyed by the match teams")
     missing: set[str] = set()
@@ -386,6 +506,78 @@ def _lineup_delta_missing(value: Any, home: TeamId, away: TeamId) -> set[str]:
             or (status == "preview" and not fields)
         ):
             raise ValueError(f"lineup_delta for {team_id} is invalid")
+        missing.update(f"{team_id}:{name}" for name in fields)
+    return missing
+
+
+def _lineup_delta_missing_v2(value: Any, home: TeamId, away: TeamId) -> set[str]:
+    if not isinstance(value, dict) or set(value) - {home.value, away.value}:
+        raise ValueError("lineup_delta must be keyed by the match teams")
+    missing: set[str] = set()
+    for team_id in (home.value, away.value):
+        item = value.get(team_id)
+        if item is None:
+            missing.add(f"lineup_delta:{team_id}")
+            continue
+        fields = item.get("missing_fields") if isinstance(item, dict) else None
+        dimensions = item.get("dimension_deltas") if isinstance(item, dict) else None
+        status = item.get("quality_status") if isinstance(item, dict) else None
+        input_refs = item.get("input_refs") if isinstance(item, dict) else None
+        transform_version = item.get("transform_version") if isinstance(item, dict) else None
+        role_versions = item.get("role_contract_versions") if isinstance(item, dict) else None
+        sample_sizes = item.get("dimension_sample_sizes") if isinstance(item, dict) else None
+        blockers = item.get("blocking_reasons") if isinstance(item, dict) else None
+        not_applicable = item.get("not_applicable_fields") if isinstance(item, dict) else None
+        if (
+            status not in {"ready", "preview"}
+            or not isinstance(fields, list)
+            or any(not isinstance(field, str) or not field for field in fields)
+            or len(fields) != len(set(fields))
+            or not isinstance(dimensions, dict)
+            or not isinstance(blockers, list)
+            or any(not isinstance(reason, str) or not reason for reason in blockers)
+            or len(blockers) != len(set(blockers))
+            or not isinstance(not_applicable, list)
+            or any(not isinstance(field, str) or not field for field in not_applicable)
+            or len(not_applicable) != len(set(not_applicable))
+            or not isinstance(input_refs, list)
+            or len(input_refs) != len(set(input_refs))
+            or any(not isinstance(ref, str) or not ref for ref in input_refs)
+            or not isinstance(transform_version, str)
+            or not transform_version
+            or not isinstance(role_versions, list)
+            or len(role_versions) != len(set(role_versions))
+            or any(not isinstance(version, str) or not version for version in role_versions)
+            or not isinstance(sample_sizes, dict)
+            or set(sample_sizes) != set(dimensions)
+        ):
+            raise ValueError(f"lineup_delta for {team_id} is invalid")
+        for dimension, raw_delta in dimensions.items():
+            if (
+                not isinstance(dimension, str)
+                or not dimension
+                or not isinstance(raw_delta, (int, float))
+                or isinstance(raw_delta, bool)
+                or not math.isfinite(float(raw_delta))
+            ):
+                raise ValueError(f"lineup_delta for {team_id} has invalid dimensions")
+        if status == "ready":
+            if not dimensions:
+                raise ValueError(f"lineup_delta for {team_id} requires dimensions")
+            if fields or blockers or not input_refs or not role_versions:
+                raise ValueError(f"lineup_delta for {team_id} lacks lineage metadata")
+            for pair in sample_sizes.values():
+                if (
+                    not isinstance(pair, list)
+                    or len(pair) != 2
+                    or any(
+                        not isinstance(size, int) or isinstance(size, bool) or size < 1
+                        for size in pair
+                    )
+                ):
+                    raise ValueError(f"lineup_delta for {team_id} has invalid sample sizes")
+        elif dimensions or not (fields or blockers):
+            raise ValueError(f"preview lineup_delta for {team_id} is not explainable")
         missing.update(f"{team_id}:{name}" for name in fields)
     return missing
 

@@ -23,12 +23,11 @@ from football_data_platform.domain.models import CollectionAttemptOutcome, Match
 from football_data_platform.domain.predictions import MatchResult90
 from football_data_platform.evaluation.governance import assess_promotion
 from football_data_platform.pipelines.match_report import (
-    COLLECTOR_VERSION as MATCH_REPORT_COLLECTOR_VERSION,
-)
-from football_data_platform.pipelines.match_report import (
+    PRODUCTION_REQUIRED_TABLES,
     MatchReportIngestError,
     canonical_report_page_url,
     ingest_fbref_match_report,
+    report_collector_version,
     report_page_match_id,
 )
 from football_data_platform.pipelines.results_backfill import ingest_results_backfill
@@ -168,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--source-match-id", required=True)
     report.add_argument("--page-url")
     report.add_argument("--match-version", type=int)
+    report.add_argument(
+        "--required-report-table",
+        action="append",
+        dest="required_report_tables",
+        choices=("summary", "passing", "passing_types", "defense", "possession", "misc", "keeper"),
+        help="require an FBref report table (repeat for multiple tables)",
+    )
     report.add_argument("--known-at", type=_utc_datetime, required=True)
     report.add_argument("--observed-at", type=_utc_datetime, default=None)
 
@@ -423,8 +429,13 @@ def _validate_schedule(
         season,
         source="fbref",
         canonical=canonical,
+        archive=RawArchive(layout),
     )
-    passed = coverage.complete if arguments.require_report_attempts else coverage.schedule_complete
+    passed = (
+        coverage.attempt_coverage_complete
+        if arguments.require_report_attempts
+        else coverage.schedule_complete
+    )
     payload = {
         "status": "ok" if passed else "gate_failed",
         **_coverage_payload(coverage),
@@ -583,7 +594,7 @@ def _backfill_results(
         "actual_teams": result.coverage.actual_teams,
         "expected_teams": result.coverage.expected_teams,
         "schedule_complete": result.coverage.schedule_complete,
-        "full_collection_gate": result.coverage.complete,
+        "full_collection_gate": result.coverage.report_collection_complete,
         "result_facts": len(result.result_fact_ids),
         "diagnostic_codes": result.diagnostic_codes,
         "coverage": _coverage_payload(result.coverage),
@@ -614,6 +625,8 @@ def _ingest_match_report(
     observed_at = arguments.observed_at or started_at
     source_match_id = str(arguments.source_match_id)
     page_url = arguments.page_url or f"https://fbref.com/en/matches/{source_match_id}/"
+    required_tables = tuple(arguments.required_report_tables or PRODUCTION_REQUIRED_TABLES)
+    collector_version = report_collector_version(required_tables)
     content = arguments.file.read_bytes()
     archive = RawArchive(layout)
     canonical.register_registry(registry, registered_at=observed_at)
@@ -634,6 +647,7 @@ def _ingest_match_report(
             diagnostic_message=(
                 f"no canonical match mapping exists for fbref-schedule:{source_match_id}"
             ),
+            collector_version=collector_version,
         )
         return _CommandResult(
             2,
@@ -644,6 +658,8 @@ def _ingest_match_report(
                 "diagnostic_message": "canonical match mapping is required before report ingest",
                 "raw_asset_id": archived.raw_asset.id.value,
                 "attempt_recorded": False,
+                "required_report_tables": required_tables,
+                "collector_version": collector_version,
             },
             "failed",
             "raw-archived-mapping-missing",
@@ -668,6 +684,7 @@ def _ingest_match_report(
             message=(
                 f"report page URL {page_url!r} does not identify source match {source_match_id!r}"
             ),
+            collector_version=collector_version,
         )
 
     canonical_match = canonical.match(mapped)
@@ -686,6 +703,7 @@ def _ingest_match_report(
                 f"mapped match {mapped} belongs to {canonical_match.competition_id}/"
                 f"{canonical_match.season_id}, requested {competition.id}/{season.id}"
             ),
+            collector_version=collector_version,
         )
 
     if arguments.known_at > observed_at:
@@ -700,6 +718,7 @@ def _ingest_match_report(
             match_id=mapped,
             code="report_temporal_boundary_invalid",
             message="known_at cannot be later than observed_at",
+            collector_version=collector_version,
         )
 
     versions = canonical.match_versions(mapped)
@@ -715,6 +734,7 @@ def _ingest_match_report(
             match_id=mapped,
             code="match_version_missing",
             message=f"canonical match {mapped} has no version",
+            collector_version=collector_version,
         )
     try:
         report_identity = parse_match_report(content).identity
@@ -742,6 +762,7 @@ def _ingest_match_report(
                 if version_error is not None
                 else f"canonical match {mapped} has no version {arguments.match_version}"
             ),
+            collector_version=collector_version,
         )
     if version.status is not MatchStatus.FINISHED:
         return _report_precondition_failure(
@@ -755,6 +776,7 @@ def _ingest_match_report(
             match_id=mapped,
             code="match_version_not_finished",
             message=f"canonical match version {mapped}:{version.version} is not finished",
+            collector_version=collector_version,
         )
     result_row = _latest_result(
         canonical,
@@ -775,6 +797,7 @@ def _ingest_match_report(
             match_id=mapped,
             code="canonical_result_missing",
             message=f"canonical result missing for {mapped}:{version.version}",
+            collector_version=collector_version,
         )
     result_fact_id, home_goals, away_goals = result_row
     try:
@@ -790,6 +813,7 @@ def _ingest_match_report(
             observed_at=observed_at,
             archive=archive,
             canonical=canonical,
+            required_tables=required_tables,
         )
     except MatchReportIngestError as error:
         return _CommandResult(
@@ -803,6 +827,8 @@ def _ingest_match_report(
                 "attempt_raw_asset_id": error.attempt_raw_asset_id,
                 "match_id": mapped.value,
                 "match_version": version.version,
+                "required_report_tables": required_tables,
+                "collector_version": collector_version,
             },
             "failed",
             "report-attempt-recorded",
@@ -833,6 +859,10 @@ def _ingest_match_report(
         "parser_version": getattr(ingested.parsed, "parser_version", None),
         "tables_present": getattr(ingested.parsed, "tables_present", ()),
         "diagnostics": [asdict(item) for item in ingested.parsed.diagnostics],
+        "required_report_tables": ingested.parsed.required_tables,
+        "missing_required_tables": ingested.parsed.missing_required_tables,
+        "collector_version": collector_version,
+        "report_contract_id": ingested.contract_id,
     }
     return _CommandResult(
         0,
@@ -844,6 +874,7 @@ def _ingest_match_report(
         output_refs=(
             ingested.raw_asset_id,
             ingested.result_fact_id,
+            ingested.contract_id,
             _file_content_ref(canonical.path),
         ),
     )
@@ -1165,6 +1196,7 @@ def _report_precondition_failure(
     match_id: MatchId,
     code: str,
     message: str,
+    collector_version: str,
 ) -> _CommandResult:
     archived = _archive_report_failure(
         content=content,
@@ -1177,6 +1209,7 @@ def _report_precondition_failure(
         match_id=match_id,
         diagnostic_code=code,
         diagnostic_message=message,
+        collector_version=collector_version,
     )
     return _CommandResult(
         2,
@@ -1193,6 +1226,7 @@ def _report_precondition_failure(
             ),
             "match_id": match_id.value,
             "attempt_recorded": True,
+            "collector_version": collector_version,
         },
         "failed",
         "report-attempt-recorded",
@@ -1221,6 +1255,7 @@ def _archive_report_failure(
     match_id: MatchId | None,
     diagnostic_code: str,
     diagnostic_message: str,
+    collector_version: str,
 ):
     asset = archive.archive(
         content,
@@ -1229,7 +1264,7 @@ def _archive_report_failure(
         url=page_url,
         observed_at=observed_at,
         target_event_time=known_at,
-        collector_version=MATCH_REPORT_COLLECTOR_VERSION,
+        collector_version=collector_version,
         media_type="text/html",
     )
     canonical.register_raw_asset(asset)
@@ -1246,7 +1281,7 @@ def _archive_report_failure(
             url=safe_url,
             observed_at=observed_at,
             target_event_time=known_at,
-            collector_version=MATCH_REPORT_COLLECTOR_VERSION,
+            collector_version=collector_version,
             media_type="text/html",
         )
         canonical.register_raw_asset(attempt_asset)
@@ -1262,7 +1297,7 @@ def _archive_report_failure(
             target_url=attempt_asset.url,
             outcome=CollectionAttemptOutcome.FAILED,
             observed_at=observed_at,
-            collector_version=MATCH_REPORT_COLLECTOR_VERSION,
+            collector_version=collector_version,
             diagnostic_code=diagnostic_code,
             diagnostic_message=diagnostic_message,
             raw_asset_id=attempt_asset.id,
@@ -1692,9 +1727,12 @@ def _latest_failed_golden_manifest(data_root: Path):
 
 
 def _coverage_payload(coverage) -> dict[str, object]:
+    fixture_rows = [item.to_payload() for item in getattr(coverage, "fixture_coverage", ())]
     return {
         "schedule_complete": coverage.schedule_complete,
         "complete": coverage.complete,
+        "attempt_coverage_complete": coverage.attempt_coverage_complete,
+        "report_collection_complete": coverage.report_collection_complete,
         "expected_matches": coverage.expected_matches,
         "actual_matches": coverage.actual_matches,
         "expected_teams": coverage.expected_teams,
@@ -1705,6 +1743,16 @@ def _coverage_payload(coverage) -> dict[str, object]:
         "structural_violations": coverage.structural_violations,
         "missing_collection_attempts": coverage.missing_collection_attempts,
         "blocking_diagnostics": coverage.blocking_diagnostics,
+        "report_contract_diagnostics": coverage.report_contract_diagnostics,
+        "fixture_coverage": tuple(fixture_rows),
+        "fixture_status_counts": coverage.fixture_status_counts,
+        "missing_fixture_ids": coverage.missing_fixture_ids,
+        "pending_fixture_ids": coverage.pending_fixture_ids,
+        "blocked_fixture_ids": coverage.blocked_fixture_ids,
+        "failed_fixture_ids": coverage.failed_fixture_ids,
+        "succeeded_fixture_ids": coverage.succeeded_fixture_ids,
+        "attempted_fixture_ids": coverage.attempted_fixture_ids,
+        "attempt_identity_mismatch_fixture_ids": (coverage.attempt_identity_mismatch_fixture_ids),
     }
 
 

@@ -9,12 +9,23 @@ from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import MatchId, RawAssetId
 from football_data_platform.domain.models import CollectionAttemptOutcome
 from football_data_platform.pipelines.match_report import (
+    PRODUCTION_COLLECTOR_VERSION,
+    PRODUCTION_REQUIRED_TABLES,
     MatchReportIngestError,
-    ingest_fbref_match_report,
 )
-from football_data_platform.pipelines.schedule import ingest_fbref_schedule
+from football_data_platform.pipelines.match_report import (
+    ingest_fbref_match_report as _ingest_fbref_match_report,
+)
+from football_data_platform.pipelines.schedule import (
+    SeasonCoverage,
+    assess_season_coverage,
+    ingest_fbref_schedule,
+)
 from football_data_platform.sources.fbref import schedule_url
-from football_data_platform.sources.fbref_match_report import parse_match_report
+from football_data_platform.sources.fbref_match_report import (
+    REPORT_PARSER_VERSION,
+    parse_match_report,
+)
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
@@ -22,6 +33,13 @@ from football_data_platform.storage.raw import RawArchive
 
 ROOT = Path(__file__).parents[1]
 OBSERVED_AT = datetime(2026, 7, 16, 6, 0, tzinfo=UTC)
+
+
+def ingest_fbref_match_report(content, **kwargs):
+    """Keep existing fixtures on the explicit summary-only preview contract."""
+
+    kwargs.setdefault("required_tables", ("summary",))
+    return _ingest_fbref_match_report(content, **kwargs)
 
 
 def _prepare_schedule(tmp_path: Path, content: bytes | None = None):
@@ -65,6 +83,18 @@ def _seed_first_result(canonical: CanonicalStore, schedule) -> str:
 
 def _report_content() -> bytes:
     return (ROOT / "tests/fixtures/fbref_premier_league_match_report.html").read_bytes()
+
+
+def _complete_report_content() -> bytes:
+    missing_tables = (
+        b'<table id="stats_18bb7c10_keeper"><tbody>'
+        b'<tr><th data-stat="player">Team Total</th></tr>'
+        b"</tbody></table>"
+        b'<table id="stats_cff3d9bb_passing"><tbody>'
+        b'<tr><th data-stat="player">Team Total</th></tr>'
+        b"</tbody></table>"
+    )
+    return _report_content().replace(b"</body>", missing_tables + b"</body>")
 
 
 def test_match_report_parses_normal_and_comment_wrapped_summary_tables() -> None:
@@ -117,6 +147,361 @@ def test_match_report_required_auxiliary_table_missing_is_diagnostic() -> None:
 
     missing = [item for item in parsed.diagnostics if item.code == "required_report_table_missing"]
     assert {item.subject_id for item in missing} == {"18bb7c10"}
+
+
+def test_match_report_parse_result_exposes_required_and_missing_tables() -> None:
+    parsed = parse_match_report(_report_content(), required_tables=("summary", "keeper"))
+
+    assert parsed.required_tables == ("summary", "keeper")
+    assert parsed.missing_required_tables == ("keeper",)
+    assert [item.source_team_id for item in parsed.teams if item.missing_tables] == ["18bb7c10"]
+
+
+def test_match_report_required_table_gate_records_failure_before_fact_write(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            _report_content(),
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+            required_tables=("summary", "keeper"),
+        )
+
+    assert caught.value.code == "match_report_parse_diagnostics"
+    attempt = next(
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    )
+    assert attempt.diagnostic_code == "match_report_parse_diagnostics"
+    with canonical.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM team_match_observations").fetchone()[0] == 0
+
+
+def test_default_production_contract_blocks_incomplete_report_and_persists_contract(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+
+    with pytest.raises(MatchReportIngestError) as caught:
+        _ingest_fbref_match_report(
+            _report_content(),
+            page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+            source_match_id="aaaaaaaa",
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+
+    assert caught.value.code == "match_report_parse_diagnostics"
+    attempt = next(
+        item
+        for item in canonical.collection_attempts(season.id)
+        if item.source == "fbref-match-report"
+    )
+    assert attempt.collector_version == PRODUCTION_COLLECTOR_VERSION
+    coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    row = next(item for item in coverage.fixture_coverage if item.fixture_id == "aaaaaaaa")
+    assert row.status == "failed"
+    assert row.production_contract_satisfied is False
+    assert row.report_contract_verified is False
+    assert row.report_contract_diagnostics[0].startswith("report_contract_missing:")
+    assert coverage.report_collection_complete is False
+
+
+def test_complete_report_contract_is_persisted_and_can_pass_strong_fixture_gate(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    content = _complete_report_content()
+
+    result = _ingest_fbref_match_report(
+        content,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=OBSERVED_AT,
+        archive=archive,
+        canonical=canonical,
+    )
+    with canonical.connect() as connection:
+        report_lineups = connection.execute(
+            "SELECT official FROM lineup_facts WHERE match_id = ?",
+            (schedule.canonical_match_ids[0],),
+        ).fetchall()
+    assert report_lineups
+    assert {row["official"] for row in report_lineups} == {0}
+    contracts, diagnostics = canonical.match_report_contract_audit(season.id)
+    assert diagnostics == ()
+    assert [item.contract_id for item in contracts] == [result.contract_id]
+    evidence = contracts[0]
+    assert set(evidence.required_tables) == {
+        "summary",
+        "passing",
+        "passing_types",
+        "defense",
+        "possession",
+        "misc",
+        "keeper",
+    }
+
+    coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    row = next(item for item in coverage.fixture_coverage if item.fixture_id == "aaaaaaaa")
+    assert row.production_contract_satisfied is True
+    without_archive = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+    )
+    assert without_archive.report_contract_diagnostics == (
+        f"match_report_contract_replay_unavailable:{result.contract_id}",
+    )
+    unverified_row = next(
+        item for item in without_archive.fixture_coverage if item.fixture_id == "aaaaaaaa"
+    )
+    assert unverified_row.report_contract_verified is False
+    assert unverified_row.production_contract_satisfied is False
+    complete = SeasonCoverage(
+        expected_matches=1,
+        actual_matches=1,
+        expected_teams=2,
+        actual_teams=2,
+        duplicate_fixture_ids=(),
+        unregistered_team_ids=(),
+        missing_registered_teams=(),
+        structural_violations=(),
+        missing_collection_attempts=(),
+        blocking_diagnostics=(),
+        fixture_coverage=(row,),
+    )
+    assert complete.report_collection_complete is True
+
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE match_report_contracts SET required_tables_json = ? WHERE contract_id = ?",
+            ('["summary"]', result.contract_id),
+        )
+    tampered_contracts, tamper_diagnostics = canonical.match_report_contract_audit(season.id)
+    assert tampered_contracts == ()
+    assert tamper_diagnostics == (f"match_report_contract_invalid:{result.contract_id}",)
+    tampered_coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    assert tampered_coverage.report_contract_diagnostics == tamper_diagnostics
+    tampered_row = next(
+        item for item in tampered_coverage.fixture_coverage if item.fixture_id == "aaaaaaaa"
+    )
+    assert tampered_row.report_contract_verified is False
+    assert tampered_row.production_contract_satisfied is False
+
+
+def test_forged_report_contract_cannot_pass_without_matching_raw_parser_output(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    fixture = schedule.parsed.matches[0]
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    observed_at = OBSERVED_AT + timedelta(seconds=1)
+    report_url = "https://fbref.example/en/matches/aaaaaaaa/report"
+    asset = archive.archive(
+        _report_content(),
+        source="fbref",
+        source_id="aaaaaaaa",
+        url=report_url,
+        observed_at=observed_at,
+        target_event_time=OBSERVED_AT,
+        collector_version=PRODUCTION_COLLECTOR_VERSION,
+        media_type="text/html",
+    )
+    canonical.register_raw_asset(asset)
+    attempt = canonical.record_collection_attempt(
+        match_id=match_id,
+        source="fbref-match-report",
+        source_id="aaaaaaaa",
+        target_url=report_url,
+        outcome=CollectionAttemptOutcome.SUCCEEDED,
+        observed_at=observed_at,
+        collector_version=PRODUCTION_COLLECTOR_VERSION,
+        raw_asset_id=asset.id,
+    )
+    claimed_tables = {
+        fixture.home_source_id: PRODUCTION_REQUIRED_TABLES,
+        fixture.away_source_id: PRODUCTION_REQUIRED_TABLES,
+    }
+    contract = canonical.record_match_report_contract(
+        collection_attempt_id=attempt.id,
+        match_id=match_id,
+        match_version=1,
+        raw_asset_id=asset.id,
+        source_match_id="aaaaaaaa",
+        parser_version=REPORT_PARSER_VERSION,
+        required_tables=PRODUCTION_REQUIRED_TABLES,
+        team_tables=claimed_tables,
+        observed_at=observed_at,
+    )
+
+    structurally_valid, structural_diagnostics = canonical.match_report_contract_audit(season.id)
+    assert structurally_valid == (contract,)
+    assert structural_diagnostics == ()
+
+    coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    assert coverage.report_contract_diagnostics == (
+        f"match_report_contract_replay_mismatch:{contract.contract_id}",
+    )
+    row = next(item for item in coverage.fixture_coverage if item.fixture_id == "aaaaaaaa")
+    assert row.status == "succeeded"
+    assert row.report_contract_verified is False
+    assert row.production_contract_satisfied is False
+    assert coverage.report_collection_complete is False
+
+
+@pytest.mark.parametrize(
+    ("replacements", "expected_code"),
+    [
+        (
+            (
+                (
+                    b"/en/squads/18bb7c10/Arsenal-Stats",
+                    b"/en/squads/cff3d9bb/Arsenal-Stats",
+                ),
+                (
+                    b"/en/squads/cff3d9bb/Chelsea-Stats",
+                    b"/en/squads/18bb7c10/Chelsea-Stats",
+                ),
+            ),
+            "report_team_identity_mismatch",
+        ),
+        (
+            ((b"/comps/9/2025-2026/", b"/comps/8/2025-2026/"),),
+            "report_competition_identity_mismatch",
+        ),
+        (
+            ((b"/comps/9/2025-2026/", b"/comps/9/2024-2025/"),),
+            "report_season_identity_mismatch",
+        ),
+        (
+            ((b'data-venue-date="2025-08-15"', b'data-venue-date="2025-08-16"'),),
+            "report_date_identity_mismatch",
+        ),
+        (
+            ((b'<div class="score">2</div>', b'<div class="score">9</div>'),),
+            "report_score_identity_mismatch",
+        ),
+    ],
+)
+def test_self_consistent_raw_contract_must_match_canonical_fixture_identity(
+    tmp_path: Path,
+    replacements: tuple[tuple[bytes, bytes], ...],
+    expected_code: str,
+) -> None:
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    content = _complete_report_content()
+    for old, new in replacements:
+        content = content.replace(old, new)
+    parsed = parse_match_report(content, required_tables=PRODUCTION_REQUIRED_TABLES)
+    assert parsed.missing_required_tables == ()
+
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    observed_at = OBSERVED_AT + timedelta(seconds=1)
+    report_url = "https://fbref.example/en/matches/aaaaaaaa/report"
+    asset = archive.archive(
+        content,
+        source="fbref",
+        source_id="aaaaaaaa",
+        url=report_url,
+        observed_at=observed_at,
+        target_event_time=OBSERVED_AT,
+        collector_version=PRODUCTION_COLLECTOR_VERSION,
+        media_type="text/html",
+    )
+    canonical.register_raw_asset(asset)
+    attempt = canonical.record_collection_attempt(
+        match_id=match_id,
+        source="fbref-match-report",
+        source_id="aaaaaaaa",
+        target_url=report_url,
+        outcome=CollectionAttemptOutcome.SUCCEEDED,
+        observed_at=observed_at,
+        collector_version=PRODUCTION_COLLECTOR_VERSION,
+        raw_asset_id=asset.id,
+    )
+    contract = canonical.record_match_report_contract(
+        collection_attempt_id=attempt.id,
+        match_id=match_id,
+        match_version=1,
+        raw_asset_id=asset.id,
+        source_match_id="aaaaaaaa",
+        parser_version=parsed.parser_version,
+        required_tables=parsed.required_tables,
+        team_tables={team.source_team_id: team.tables_present for team in parsed.teams},
+        observed_at=observed_at,
+    )
+    structurally_valid, structural_diagnostics = canonical.match_report_contract_audit(season.id)
+    assert structurally_valid == (contract,)
+    assert structural_diagnostics == ()
+
+    coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    assert coverage.report_contract_diagnostics == (
+        f"match_report_contract_identity_mismatch:{contract.contract_id}:{expected_code}",
+    )
+    row = next(item for item in coverage.fixture_coverage if item.fixture_id == "aaaaaaaa")
+    assert row.status == "succeeded"
+    assert row.report_contract_verified is False
+    assert row.production_contract_satisfied is False
+    assert coverage.report_collection_complete is False
 
 
 def test_match_report_identity_conflicts_are_visible() -> None:
@@ -238,6 +623,25 @@ def test_match_report_ingest_creates_canonical_team_and_player_facts(tmp_path: P
     report_attempts = [item for item in attempts if item.source == "fbref-match-report"]
     assert len(report_attempts) == 1
     assert report_attempts[0].outcome is CollectionAttemptOutcome.SUCCEEDED
+    assert report_attempts[0].collector_version.startswith(
+        "fbref-match-report/3+custom-tables:summary"
+    )
+    coverage = assess_season_coverage(
+        schedule.parsed,
+        season,
+        source="fbref",
+        canonical=canonical,
+        archive=archive,
+    )
+    fixture_coverage = next(
+        item for item in coverage.fixture_coverage if item.fixture_id == "aaaaaaaa"
+    )
+    assert fixture_coverage.status == "succeeded"
+    assert fixture_coverage.report_contract_verified is True
+    assert fixture_coverage.report_contract_id == first.contract_id
+    assert fixture_coverage.report_contract_required_tables == ("summary",)
+    assert fixture_coverage.production_contract_satisfied is False
+    assert coverage.report_collection_complete is False
     home = canonical.mapped_team(source="fbref", source_id="18bb7c10")
     with canonical.connect() as connection:
         stats = connection.execute(

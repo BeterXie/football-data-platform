@@ -12,6 +12,7 @@ import pytest
 from football_data_platform.domain.ids import (
     MatchId,
     ModelRunId,
+    PredictionId,
     RawAssetId,
     SnapshotId,
     TeamId,
@@ -26,6 +27,9 @@ from football_data_platform.domain.predictions import (
     parse_prediction_payload,
     prediction_payload,
     result_probabilities,
+    score_grid_composition_artifact_id,
+    score_grid_composition_payload,
+    verify_score_prediction,
 )
 from football_data_platform.domain.snapshots import (
     CaptureMode,
@@ -187,6 +191,23 @@ def _prediction(
     )
 
 
+def _reidentify_prediction(prediction):
+    composition_ref = score_grid_composition_artifact_id(score_grid_composition_payload(prediction))
+    prediction = replace(prediction, composition_artifact_ref=composition_ref)
+    payload = prediction_payload(prediction)
+    payload.pop("id")
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return replace(prediction, id=PredictionId(f"prediction:{digest}"))
+
+
 def _model_run(
     *,
     model_version: str = "dixon-coles/1",
@@ -301,6 +322,9 @@ def test_prediction_schema_has_one_coordinate_explicit_normalized_grid(tmp_path:
 
 def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_path: Path) -> None:
     snapshot, validator = _snapshot(tmp_path)
+    context_source_ref = next(
+        feature.source_ref for feature in snapshot.features if feature.name == "match_context"
+    )
     composition = compose_expected_goals(
         1.7,
         0.8,
@@ -309,7 +333,7 @@ def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_pat
                 contribution_key="context:rest-days:calibration/1",
                 lambda_home_multiplier=1.02,
                 lambda_away_multiplier=0.98,
-                source_ref="derived-source:context",
+                source_ref=context_source_ref,
                 version="calibration/1",
             ),
         ),
@@ -338,13 +362,15 @@ def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_pat
     assert payload["calibration_versions"] == ["calibration/1"]
     assert prediction.composition_artifact_ref.startswith("score-grid-composition:")
     assert DEFAULT_MODEL_RUN_ID.value in prediction.input_refs
+    assert context_source_ref in snapshot.input_refs
+    assert "derived-source:baseline" in prediction.input_refs
 
-    archive = DerivedArchive(DataLayout(tmp_path / "prediction-data"))
+    archive = validator
     composition_path = archive.write_score_grid_composition(prediction)
     assert composition_path == archive.score_grid_composition_path(
         prediction.composition_artifact_ref
     )
-    archive.write_prediction(prediction)
+    archive.write_prediction(prediction, snapshot=snapshot)
     assert archive.verify_score_grid_composition(prediction).artifact_type == (
         "score-grid-composition"
     )
@@ -353,10 +379,91 @@ def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_pat
     ] == pytest.approx(-0.12)
 
 
+def test_prediction_rejects_contribution_source_outside_verified_snapshot(tmp_path: Path) -> None:
+    snapshot, validator = _snapshot(tmp_path)
+    feature_source_refs = {feature.source_ref for feature in snapshot.features}
+    nested_raw_ref = next(ref for ref in snapshot.input_refs if ref not in feature_source_refs)
+    for invalid_source_ref in (nested_raw_ref, "derived-source:" + "f" * 64):
+        composition = compose_expected_goals(
+            1.7,
+            0.8,
+            (
+                ExpectedGoalsContribution(
+                    contribution_key="context:rest-days:calibration/1",
+                    lambda_home_multiplier=1.02,
+                    lambda_away_multiplier=0.98,
+                    source_ref=invalid_source_ref,
+                    version="calibration/1",
+                ),
+            ),
+        )
+
+        with pytest.raises(ValueError, match="verified snapshot feature sources"):
+            build_score_prediction(
+                snapshot=snapshot,
+                snapshot_validator=validator,
+                model_run_id=DEFAULT_MODEL_RUN_ID,
+                model_version="dixon-coles/1",
+                generated_at=GENERATED_AT,
+                lambda_home=composition.lambda_home,
+                lambda_away=composition.lambda_away,
+                rho=-0.12,
+                max_goals=11,
+                input_refs=("baseline:v1",),
+                expected_goals=composition,
+            )
+
+
+def test_prediction_archive_rejects_forged_contribution_lineage(tmp_path: Path) -> None:
+    snapshot, archive = _snapshot(tmp_path)
+    context_source_ref = next(
+        feature.source_ref for feature in snapshot.features if feature.name == "match_context"
+    )
+    prediction = build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=archive,
+        model_run_id=DEFAULT_MODEL_RUN_ID,
+        model_version="dixon-coles/1",
+        generated_at=GENERATED_AT,
+        lambda_home=1.7 * 1.02,
+        lambda_away=0.8 * 0.98,
+        rho=-0.12,
+        max_goals=11,
+        input_refs=("baseline:v1",),
+        expected_goals=compose_expected_goals(
+            1.7,
+            0.8,
+            (
+                ExpectedGoalsContribution(
+                    contribution_key="context:rest-days:calibration/1",
+                    lambda_home_multiplier=1.02,
+                    lambda_away_multiplier=0.98,
+                    source_ref=context_source_ref,
+                    version="calibration/1",
+                ),
+            ),
+        ),
+    )
+    feature_source_refs = {feature.source_ref for feature in snapshot.features}
+    nested_raw_ref = next(ref for ref in snapshot.input_refs if ref not in feature_source_refs)
+    forged = replace(
+        prediction,
+        input_refs=tuple(sorted({*prediction.input_refs, nested_raw_ref})),
+        contribution_multipliers=(
+            replace(prediction.contribution_multipliers[0], source_ref=nested_raw_ref),
+        ),
+    )
+    forged = _reidentify_prediction(forged)
+    verify_score_prediction(forged)
+
+    with pytest.raises(ValueError, match="verified snapshot feature sources"):
+        archive.write_prediction(forged, snapshot=snapshot)
+
+
 def test_prediction_composition_bytes_are_tamper_evident(tmp_path: Path) -> None:
-    prediction = _prediction(_snapshot(tmp_path))
-    archive = DerivedArchive(DataLayout(tmp_path / "prediction-data"))
-    archive.write_prediction(prediction)
+    snapshot, archive = _snapshot(tmp_path)
+    prediction = _prediction((snapshot, archive))
+    archive.write_prediction(prediction, snapshot=snapshot)
     path = archive.score_grid_composition_path(prediction.composition_artifact_ref)
     tampered = json.loads(path.read_text(encoding="utf-8"))
     tampered["lambda_home"] = 9.0
@@ -561,11 +668,11 @@ def test_brier_and_log_loss_use_known_toy_values(tmp_path: Path) -> None:
 
 
 def test_prediction_archive_never_mixes_batches_or_market_objects(tmp_path: Path) -> None:
-    prediction = _prediction(_snapshot(tmp_path))
-    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    snapshot, archive = _snapshot(tmp_path)
+    prediction = _prediction((snapshot, archive))
 
-    first = archive.write_prediction(prediction)
-    second = archive.write_prediction(prediction)
+    first = archive.write_prediction(prediction, snapshot=snapshot)
+    second = archive.write_prediction(prediction, snapshot=snapshot)
 
     assert first == second
     assert archive.load_prediction_payload(prediction)["id"] == prediction.id.value
@@ -575,24 +682,22 @@ def test_prediction_archive_never_mixes_batches_or_market_objects(tmp_path: Path
 def test_prediction_archive_optionally_requires_a_valid_model_run(tmp_path: Path) -> None:
     artifact = _model_run()
     registry = _ModelRunRegistry(artifact)
+    snapshot, archive = _snapshot(tmp_path)
     prediction = _prediction(
-        _snapshot(tmp_path),
+        (snapshot, archive),
         model_run_id=ModelRunId(artifact.model_run_id),
         model_run_validator=registry,
     )
-    archive = DerivedArchive(
-        DataLayout(tmp_path / "data"),
-        model_run_validator=registry,
-    )
+    archive.model_run_validator = registry
 
-    archive.write_prediction(prediction)
+    archive.write_prediction(prediction, snapshot=snapshot)
     assert archive.load_prediction_payload(prediction)["model_run_id"] == artifact.model_run_id
 
     with pytest.raises(ValueError, match="model run is unavailable or invalid"):
         DerivedArchive(
-            DataLayout(tmp_path / "missing-model-data"),
+            archive.layout,
             model_run_validator=_ModelRunRegistry(None),
-        ).write_prediction(prediction)
+        ).write_prediction(prediction, snapshot=snapshot)
 
 
 @pytest.mark.parametrize(
@@ -637,8 +742,8 @@ def test_prediction_model_run_contract_rejects_mismatched_or_unusable_artifacts(
 
 
 def test_evaluation_and_archive_reject_tampered_prediction_content(tmp_path: Path) -> None:
-    prediction = _prediction(_snapshot(tmp_path))
-    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    snapshot, archive = _snapshot(tmp_path)
+    prediction = _prediction((snapshot, archive))
     shifted_as_of = replace(
         prediction,
         snapshot_as_of=prediction.snapshot_as_of - timedelta(minutes=1),
@@ -659,7 +764,7 @@ def test_evaluation_and_archive_reject_tampered_prediction_content(tmp_path: Pat
                 evaluated_at=datetime(2025, 8, 17, tzinfo=UTC),
             )
         with pytest.raises(ValueError, match="prediction (identity|score cells)"):
-            archive.write_prediction(tampered)
+            archive.write_prediction(tampered, snapshot=snapshot)
 
 
 def test_challenger_promotion_requires_an_explicit_policy() -> None:
@@ -835,6 +940,59 @@ def test_prediction_loader_rejects_unknown_or_tampered_schema(tmp_path: Path) ->
         "probability": 0.99,
     }
     with pytest.raises(ValueError, match="canonical score grid"):
+        parse_prediction_payload(
+            tampered,
+            snapshot=snapshot,
+            snapshot_validator=validator,
+        )
+
+
+def test_prediction_loader_rejects_contribution_source_outside_snapshot(tmp_path: Path) -> None:
+    snapshot, validator = _snapshot(tmp_path)
+    context_source_ref = next(
+        feature.source_ref for feature in snapshot.features if feature.name == "match_context"
+    )
+    composition = compose_expected_goals(
+        1.7,
+        0.8,
+        (
+            ExpectedGoalsContribution(
+                contribution_key="context:rest-days:calibration/1",
+                lambda_home_multiplier=1.02,
+                lambda_away_multiplier=0.98,
+                source_ref=context_source_ref,
+                version="calibration/1",
+            ),
+        ),
+    )
+    prediction = build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=validator,
+        model_run_id=DEFAULT_MODEL_RUN_ID,
+        model_version="dixon-coles/1",
+        generated_at=GENERATED_AT,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
+        rho=-0.12,
+        max_goals=11,
+        input_refs=("baseline:v1",),
+        expected_goals=composition,
+        calibration_versions=("calibration/1",),
+    )
+    payload = prediction_payload(prediction)
+    unrelated_source_ref = "derived-source:" + "f" * 64
+    tampered = {
+        **payload,
+        "contribution_multipliers": [
+            {
+                **payload["contribution_multipliers"][0],
+                "source_ref": unrelated_source_ref,
+            }
+        ],
+        "input_refs": sorted({*payload["input_refs"], unrelated_source_ref}),
+    }
+
+    with pytest.raises(ValueError, match="verified snapshot feature sources"):
         parse_prediction_payload(
             tampered,
             snapshot=snapshot,

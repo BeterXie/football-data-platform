@@ -15,7 +15,12 @@ from football_data_platform.domain.lifecycle import (
     PlayerObservationAvailability,
     SnapshotAvailability,
 )
-from football_data_platform.domain.models import MatchStatus, require_utc
+from football_data_platform.domain.models import (
+    CollectionAttempt,
+    CollectionAttemptOutcome,
+    MatchStatus,
+    require_utc,
+)
 from football_data_platform.domain.predictions import MatchResult90
 from football_data_platform.sources.prematch import (
     NewsEvidenceDTO,
@@ -211,6 +216,8 @@ class CanonicalFactStore:
         observed_at: datetime,
         raw_asset_id: RawAssetId,
     ) -> StoredFact:
+        if not isinstance(official, bool) or official:
+            raise ValueError("official lineup facts must be written through append_official_lineup")
         if lineup_role not in {"starter", "bench"}:
             raise ValueError("lineup_role must be starter or bench")
         _require_temporal_order(known_at, observed_at)
@@ -220,7 +227,7 @@ class CanonicalFactStore:
             "team_id": team_id.value,
             "player_id": player_id.value,
             "lineup_role": lineup_role,
-            "official": int(official),
+            "official": 0,
             "known_at": _timestamp(known_at),
             "observed_at": _timestamp(observed_at),
             "raw_asset_id": raw_asset_id.value,
@@ -266,15 +273,13 @@ class CanonicalFactStore:
                 raise KeyError(f"raw asset {raw_asset_id} is not registered")
             if raw["observed_at"] != _timestamp(observed_at):
                 raise ValueError("news observed_at must match the raw archive observation")
-            descriptor = self.source_registry.get(source)
-            if descriptor is not None and raw["source"] != source:
+            if raw["source"] != source:
                 message = (
-                    f"raw asset source {raw['source']!r} does not match "
-                    f"registered source {source!r}"
+                    f"raw asset source {raw['source']!r} does not match news source {source!r}"
                 )
                 raise ValueError(message)
-            if descriptor is not None and raw["url"] != url:
-                raise ValueError("news URL does not match the registered raw archive")
+            if raw["url"] != url:
+                raise ValueError("news URL does not match the raw archive")
         payload = {
             "source": source,
             "url": url,
@@ -312,6 +317,7 @@ class CanonicalFactStore:
         evidence_refs: tuple[str, ...] = (),
         as_of: datetime | None = None,
     ) -> StoredFact:
+        _require_text(event_type, "event_type")
         require_utc(known_at, "known_at")
         if as_of is not None:
             require_utc(as_of, "as_of")
@@ -326,10 +332,14 @@ class CanonicalFactStore:
         unique_refs = tuple(dict.fromkeys(evidence_refs))
         if any(not isinstance(ref, str) or not ref for ref in unique_refs):
             raise ValueError("pre-match event evidence references must be non-empty text")
+        effective_as_of = as_of if as_of is not None else known_at
+        match_version: int | None = None
         with self.canonical.connect() as connection:
             placeholders = ",".join("?" for _ in unique_refs)
             evidence_rows = connection.execute(
-                "SELECT n.record_id, n.source, n.published_at, n.observed_at, n.raw_asset_id "
+                "SELECT n.record_id, n.source, n.url, n.published_at, n.observed_at, "
+                "n.raw_asset_id, r.source AS raw_source, r.url AS raw_url, "
+                "r.observed_at AS raw_observed_at "
                 "FROM news_evidence AS n JOIN raw_assets AS r "
                 "ON r.raw_asset_id = n.raw_asset_id "
                 f"WHERE n.record_id IN ({placeholders})",
@@ -337,12 +347,25 @@ class CanonicalFactStore:
             ).fetchall()
             if len(evidence_rows) != len(unique_refs):
                 raise KeyError("pre-match event references unknown news evidence")
-            latest_evidence_time = max(
-                max(_parse_timestamp(row["published_at"]), _parse_timestamp(row["observed_at"]))
-                for row in evidence_rows
+            for row in evidence_rows:
+                if row["raw_source"] != row["source"]:
+                    raise ValueError(
+                        "news evidence source does not match its registered raw archive"
+                    )
+                if row["raw_url"] != row["url"]:
+                    raise ValueError("news evidence URL does not match its raw archive")
+                if row["raw_observed_at"] != row["observed_at"]:
+                    raise ValueError("news evidence observed_at does not match its raw archive")
+                if self.source_registry.get(row["source"]) is None:
+                    raise ValueError(f"event evidence source {row['source']!r} is not registered")
+            latest_published_at = max(
+                _parse_timestamp(row["published_at"]) for row in evidence_rows
             )
-            if known_at < latest_evidence_time:
-                raise ValueError("known_at cannot precede supporting evidence")
+            latest_observed_at = max(_parse_timestamp(row["observed_at"]) for row in evidence_rows)
+            if known_at < latest_published_at:
+                raise ValueError("known_at cannot precede supporting evidence publication")
+            if known_at > latest_observed_at:
+                raise ValueError("known_at cannot follow supporting evidence observation")
             confirmation_status = classify_confirmation(
                 tuple(row["source"] for row in evidence_rows),
                 self.source_registry,
@@ -353,14 +376,21 @@ class CanonicalFactStore:
                 _require_match_team(match_row, team_id)
             if player_id is not None:
                 _require_registered_player(connection, player_id)
-                if team_id is not None:
-                    _require_player_assignment(
-                        connection,
-                        match_id=match_id,
-                        match_version=None,
-                        player_id=player_id,
-                        team_id=team_id,
-                    )
+                match_version = _visible_match_version(
+                    connection,
+                    match_id=match_id,
+                    visible_at=effective_as_of,
+                )
+                _require_existing_player_assignment(
+                    connection,
+                    match_row=match_row,
+                    match_id=match_id,
+                    match_version=match_version,
+                    player_id=player_id,
+                    team_id=team_id,
+                    known_at_cutoff=known_at,
+                    observed_at_cutoff=effective_as_of,
+                )
         payload = {
             "match_id": match_id.value,
             "team_id": team_id.value if team_id is not None else None,
@@ -372,9 +402,56 @@ class CanonicalFactStore:
             "evidence_refs_json": _json_text(sorted(unique_refs)),
             "can_modify_features": int(confirmation_status in {"official", "corroborated"}),
         }
+        if match_version is not None:
+            payload["match_version"] = match_version
         record_id = _record_id("prematch-event", payload)
         self._insert_unversioned("prematch_events", record_id, payload)
         return StoredFact(record_id, None)
+
+    def record_prematch_collection_attempt(
+        self,
+        *,
+        match_id: MatchId,
+        source: str,
+        kind: SourceKind,
+        target_url: str,
+        observed_at: datetime,
+        collector_version: str,
+        outcome: CollectionAttemptOutcome,
+        source_id: str | None = None,
+        diagnostic_code: str | None = None,
+        diagnostic_message: str | None = None,
+        raw_asset_id: RawAssetId | None = None,
+    ) -> CollectionAttempt:
+        """Persist a source-registered prematch attempt with optional raw response evidence.
+
+        The canonical attempt store supplies idempotent identity and raw lineage checks.  This
+        wrapper adds the R09 source registry gate so an unregistered or misclassified adapter
+        cannot silently create a successful (or diagnostic) prematch attempt.
+        """
+
+        descriptor = self.source_registry.get(source)
+        if descriptor is None:
+            raise ValueError(f"prematch source {source!r} is not registered")
+        requested_kind = SourceKind(kind)
+        if descriptor.kind is not requested_kind:
+            raise ValueError(
+                f"prematch source {source!r} is registered as {descriptor.kind.value!r}, "
+                f"not {requested_kind.value!r}"
+            )
+        self.source_registry.validate_url(source, target_url)
+        return self.canonical.record_collection_attempt(
+            match_id=match_id,
+            source=source,
+            source_id=source_id,
+            target_url=target_url,
+            outcome=CollectionAttemptOutcome(outcome),
+            observed_at=observed_at,
+            collector_version=collector_version,
+            diagnostic_code=diagnostic_code,
+            diagnostic_message=diagnostic_message,
+            raw_asset_id=raw_asset_id,
+        )
 
     def add_prematch_event_dto(self, event: PrematchEventDTO) -> StoredFact:
         """Persist an event after recalculating confirmation from canonical evidence."""
@@ -708,6 +785,77 @@ def _require_player_assignment(
             raise ValueError(
                 f"player {player_id} is already assigned to {row['team_id']} for match {match_id}"
             )
+
+
+def _require_existing_player_assignment(
+    connection,
+    *,
+    match_row,
+    match_id: MatchId,
+    match_version: int,
+    player_id: PlayerId,
+    team_id: TeamId | None,
+    known_at_cutoff: datetime,
+    observed_at_cutoff: datetime,
+) -> None:
+    known_at_text = _timestamp(known_at_cutoff)
+    observed_at_text = _timestamp(observed_at_cutoff)
+    rows = connection.execute(
+        "SELECT team_id FROM player_match_observations "
+        "WHERE match_id = ? AND match_version = ? AND player_id = ? "
+        "AND known_at <= ? AND observed_at <= ? "
+        "UNION SELECT team_id FROM lineup_facts "
+        "WHERE match_id = ? AND match_version = ? AND player_id = ? "
+        "AND known_at <= ? AND observed_at <= ?",
+        (
+            match_id.value,
+            match_version,
+            player_id.value,
+            known_at_text,
+            observed_at_text,
+            match_id.value,
+            match_version,
+            player_id.value,
+            known_at_text,
+            observed_at_text,
+        ),
+    ).fetchall()
+    assigned_team_ids = {row["team_id"] for row in rows}
+    if not assigned_team_ids:
+        raise ValueError(
+            f"player {player_id} has no assignment for match {match_id} version "
+            f"{match_version} visible at {observed_at_text}"
+        )
+
+    participant_team_ids = {match_row["home_team_id"], match_row["away_team_id"]}
+    if not assigned_team_ids <= participant_team_ids:
+        raise ValueError(f"player {player_id} has an assignment outside match {match_id}")
+    if len(assigned_team_ids) != 1:
+        raise ValueError(f"player {player_id} has conflicting assignments for match {match_id}")
+
+    assigned_team_id = next(iter(assigned_team_ids))
+    if team_id is not None and assigned_team_id != team_id.value:
+        raise ValueError(
+            f"player {player_id} is assigned to {assigned_team_id} for match {match_id}, "
+            f"not {team_id}"
+        )
+
+
+def _visible_match_version(
+    connection,
+    *,
+    match_id: MatchId,
+    visible_at: datetime,
+) -> int:
+    visible_at_text = _timestamp(visible_at)
+    row = connection.execute(
+        "SELECT version FROM match_versions WHERE match_id = ? AND observed_at <= ? "
+        "ORDER BY version DESC LIMIT 1",
+        (match_id.value, visible_at_text),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"match {match_id} has no version visible at {visible_at_text}")
+    return int(row["version"])
 
 
 def _record_id(kind: str, payload: dict[str, Any]) -> str:

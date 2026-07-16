@@ -26,8 +26,19 @@ def render_vertical_slice_report(summary: Mapping[str, Any]) -> str:
         f"`{coverage['expected_matches']}` matches",
         f"- Current evidence: `{coverage['actual_teams']}` teams / "
         f"`{coverage['actual_matches']}` matches",
-        f"- Full-season gate: `{'pass' if coverage['complete'] else 'not-yet-pass'}`",
+        "- Full-season fixture/attempt gate: "
+        f"`{'pass' if coverage['attempt_coverage_complete'] else 'not-yet-pass'}`",
+        "- Full FBref report-success gate: "
+        f"`{'pass' if coverage['report_collection_complete'] else 'not-yet-pass'}`",
         f"- Missing match-report attempts: `{len(coverage['missing_collection_attempts'])}`",
+        "- Attempt identity mismatches: "
+        f"`{len(coverage.get('attempt_identity_mismatch_fixture_ids', ()))}`",
+        f"- Invalid report contracts: `{len(coverage.get('report_contract_diagnostics', ()))}`",
+        "- Attempt states: "
+        + ", ".join(
+            f"`{status}={coverage['fixture_status_counts'].get(status, 0)}`"
+            for status in ("missing", "pending", "blocked", "failed", "succeeded")
+        ),
         f"- Blocking diagnostics: `{', '.join(coverage['blocking_diagnostics']) or 'none'}`",
         "",
         "## Prematch Snapshots",

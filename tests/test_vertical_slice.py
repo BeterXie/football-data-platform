@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from football_data_platform.pipelines.vertical_slice import run_offline_vertical_slice
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError
@@ -67,6 +68,18 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     assert first.report_path.read_text(encoding="utf-8").startswith(
         "# Premier League 2025-26 Vertical Slice"
     )
+    canonical = CanonicalStore(DataLayout(arguments["data_root"]).canonical / "platform.sqlite3")
+    with canonical.connect() as connection:
+        lineup_sources = connection.execute(
+            "SELECT lineup.official, raw.source, COUNT(*) AS count "
+            "FROM lineup_facts AS lineup JOIN raw_assets AS raw "
+            "ON raw.raw_asset_id = lineup.raw_asset_id "
+            "GROUP BY lineup.official, raw.source"
+        ).fetchall()
+    assert {(row["official"], row["source"]): row["count"] for row in lineup_sources} == {
+        (0, "fbref"): 3,
+        (1, "golden-official-lineup-fixture"): 22,
+    }
     derived = DerivedArchive(DataLayout(arguments["data_root"]))
     artifacts = [
         derived.load_artifact_manifest(json.loads(path.read_text(encoding="utf-8"))["id"])

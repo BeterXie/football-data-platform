@@ -337,6 +337,7 @@ def build_score_prediction(
         lambda_away=lambda_away,
         calibration_versions=calibration_versions,
     )
+    _verify_prediction_contribution_sources(snapshot, contribution_multipliers)
     normalized_input_refs = tuple(
         sorted({*input_refs, snapshot.id.value, model_run_id.value, *composition_input_refs})
     )
@@ -506,6 +507,30 @@ def verify_score_prediction(
         _verify_prediction_model_run(prediction, model_run_validator)
 
 
+def verify_prediction_snapshot(
+    prediction: ScorePrediction,
+    *,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
+    model_run_validator: ModelRunValidator | None = None,
+) -> None:
+    """Verify a formal prediction against its validated prematch snapshot."""
+
+    verify_snapshot(snapshot, source_validator=snapshot_validator)
+    verify_score_prediction(prediction, model_run_validator=model_run_validator)
+    if prediction.snapshot_id != snapshot.id:
+        raise ValueError("prediction snapshot_id does not match the validated snapshot")
+    if prediction.match_id != snapshot.match_id:
+        raise ValueError("prediction match_id does not match the validated snapshot")
+    if prediction.snapshot_as_of != snapshot.as_of:
+        raise ValueError("prediction snapshot_as_of does not match the validated snapshot")
+    if prediction.capture_mode != snapshot.capture_mode:
+        raise ValueError("prediction capture_mode does not match the validated snapshot")
+    if prediction.snapshot_quality_status != snapshot.quality_status:
+        raise ValueError("prediction quality does not match the validated snapshot")
+    _verify_prediction_contribution_sources(snapshot, prediction.contribution_multipliers)
+
+
 def prediction_payload(prediction: ScorePrediction) -> dict[str, Any]:
     return {
         "id": prediction.id.value,
@@ -603,6 +628,17 @@ def parse_prediction_payload(
     if prediction_payload(prediction) != payload:
         raise ValueError("prediction payload does not match its canonical score grid")
     return prediction
+
+
+def _verify_prediction_contribution_sources(
+    snapshot: PreMatchSnapshot,
+    contributions: tuple[PredictionContribution, ...],
+) -> None:
+    feature_source_refs = frozenset(feature.source_ref for feature in snapshot.features)
+    if any(item.source_ref not in feature_source_refs for item in contributions):
+        raise ValueError(
+            "expected-goals contribution source refs must cite verified snapshot feature sources"
+        )
 
 
 def _prediction_composition_metadata(

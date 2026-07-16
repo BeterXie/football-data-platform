@@ -401,6 +401,8 @@ def test_cli_ingest_match_report_persists_success_and_identity_failure(
         "aaaaaaaa",
         "--page-url",
         "https://fbref.com/en/matches/aaaaaaaa/report",
+        "--required-report-table",
+        "summary",
         "--known-at",
         "2025-08-15T22:00:00Z",
         "--observed-at",

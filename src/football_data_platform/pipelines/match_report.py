@@ -8,8 +8,16 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from football_data_platform.domain.ids import MatchId, RawAssetId
-from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus, RawAsset
+from football_data_platform.domain.models import (
+    CollectionAttemptOutcome,
+    Match,
+    MatchStatus,
+    MatchVersion,
+    RawAsset,
+)
+from football_data_platform.sources.fbref import ParseDiagnostic
 from football_data_platform.sources.fbref_match_report import (
+    REPORT_TABLE_NAMES,
     MatchReportParseResult,
     parse_match_report,
 )
@@ -17,7 +25,10 @@ from football_data_platform.storage.canonical import CanonicalStore, ResolvedTea
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.raw import RawArchive
 
-COLLECTOR_VERSION = "fbref-match-report/2"
+COLLECTOR_VERSION = "fbref-match-report/3"
+PRODUCTION_REQUIRED_TABLES = REPORT_TABLE_NAMES
+PRODUCTION_COMPLETENESS_CONTRACT = "complete-tables/1"
+PRODUCTION_COLLECTOR_VERSION = f"{COLLECTOR_VERSION}+{PRODUCTION_COMPLETENESS_CONTRACT}"
 MATCH_MAPPING_SOURCE = "fbref-schedule"
 _MATCH_PATH = re.compile(r"/matches/([^/?#]+)(?:/|$)", re.IGNORECASE)
 _BLOCKING_DIAGNOSTICS = frozenset(
@@ -43,6 +54,17 @@ _BLOCKING_DIAGNOSTICS = frozenset(
         "match_date_conflict",
     }
 )
+
+
+def blocking_match_report_diagnostics(
+    parsed: MatchReportParseResult,
+) -> tuple[ParseDiagnostic, ...]:
+    """Return parser diagnostics that make report facts unsafe to persist."""
+
+    blocking_codes = _BLOCKING_DIAGNOSTICS | {"required_report_table_missing"}
+    return tuple(
+        diagnostic for diagnostic in parsed.diagnostics if diagnostic.code in blocking_codes
+    )
 
 
 def report_page_match_id(page_url: str) -> str | None:
@@ -82,6 +104,235 @@ class MatchReportIngestResult:
     team_fact_ids: tuple[str, ...]
     player_fact_ids: tuple[str, ...]
     result_fact_id: str
+    contract_id: str
+
+
+class MatchReportCanonicalValidationError(ValueError):
+    """A raw report identity or result that conflicts with canonical state."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class MatchReportIdentityValidation:
+    match: Match
+    version: MatchVersion
+    resolved_teams: dict[str, ResolvedTeam]
+
+
+@dataclass(frozen=True, slots=True)
+class MatchReportResultValidation:
+    result_fact_id: str
+    home_goals: int
+    away_goals: int
+
+
+def validate_match_report_identity(
+    parsed: MatchReportParseResult,
+    *,
+    source_match_id: str,
+    match_id: MatchId,
+    match_version: int,
+    canonical: CanonicalStore,
+) -> MatchReportIdentityValidation:
+    """Validate raw report identity against one canonical match version."""
+
+    mapped_match_id = canonical.mapped_match_ids(
+        source=MATCH_MAPPING_SOURCE,
+        source_ids=(source_match_id,),
+    ).get(source_match_id)
+    if mapped_match_id is None:
+        raise MatchReportCanonicalValidationError(
+            "source_match_mapping_missing",
+            f"no canonical match mapping exists for {MATCH_MAPPING_SOURCE}:{source_match_id}",
+        )
+    if mapped_match_id != match_id:
+        raise MatchReportCanonicalValidationError(
+            "match_identity_mismatch",
+            f"mapped match is {mapped_match_id}, contract identifies {match_id}",
+        )
+
+    versions = {version.version: version for version in canonical.match_versions(match_id)}
+    version = versions.get(match_version)
+    if version is None:
+        raise MatchReportCanonicalValidationError(
+            "match_version_missing",
+            f"canonical match version {match_id}:{match_version} does not exist",
+        )
+    if version.status is not MatchStatus.FINISHED:
+        raise MatchReportCanonicalValidationError(
+            "match_version_not_finished",
+            f"canonical match version {match_id}:{match_version} has status {version.status.value}",
+        )
+
+    source_team_ids = tuple(team.source_team_id for team in parsed.teams)
+    if len(source_team_ids) != 2 or len(set(source_team_ids)) != 2:
+        raise MatchReportCanonicalValidationError(
+            "report_team_coverage_invalid",
+            "match report must contain exactly two distinct team summary tables",
+        )
+
+    resolved_teams: dict[str, ResolvedTeam] = {}
+    try:
+        for source_team_id in source_team_ids:
+            resolved_teams[source_team_id] = canonical.mapped_team(
+                source="fbref", source_id=source_team_id
+            )
+    except KeyError as error:
+        raise MatchReportCanonicalValidationError(
+            "report_team_mapping_missing",
+            str(error),
+        ) from error
+
+    match = canonical.match(match_id)
+    expected_team_ids = {match.home_team_id, match.away_team_id}
+    report_team_ids = {team.id for team in resolved_teams.values()}
+    if report_team_ids != expected_team_ids:
+        raise MatchReportCanonicalValidationError(
+            "report_teams_do_not_match_fixture",
+            (
+                f"report teams {sorted(str(item) for item in report_team_ids)} do not match "
+                f"fixture teams {sorted(str(item) for item in expected_team_ids)}"
+            ),
+        )
+
+    identity = parsed.identity
+    if identity.source_match_id != source_match_id:
+        raise MatchReportCanonicalValidationError(
+            "report_source_match_identity_mismatch",
+            f"raw report identifies {identity.source_match_id}, expected {source_match_id}",
+        )
+
+    expected_competition_id = _expected_competition_source_id(canonical, match)
+    if expected_competition_id is None:
+        raise MatchReportCanonicalValidationError(
+            "report_competition_identity_unverifiable",
+            f"canonical competition source identity is missing for {match.season_id}",
+        )
+    if identity.competition_source_id != expected_competition_id:
+        raise MatchReportCanonicalValidationError(
+            "report_competition_identity_mismatch",
+            (
+                f"raw report identifies competition {identity.competition_source_id}, expected "
+                f"{expected_competition_id}"
+            ),
+        )
+
+    expected_season_id = _expected_season_source_id(canonical, match)
+    if expected_season_id is None:
+        raise MatchReportCanonicalValidationError(
+            "report_season_identity_unverifiable",
+            f"canonical season source identity is missing for {match.season_id}",
+        )
+    if identity.season_source_id != expected_season_id:
+        raise MatchReportCanonicalValidationError(
+            "report_season_identity_mismatch",
+            (
+                f"raw report identifies season {identity.season_source_id}, expected "
+                f"{expected_season_id}"
+            ),
+        )
+
+    if identity.home_source_id is None or identity.away_source_id is None:
+        raise MatchReportCanonicalValidationError(
+            "report_team_identity_mismatch",
+            "raw report does not identify canonical home and away teams",
+        )
+    try:
+        identity_home = canonical.mapped_team(source="fbref", source_id=identity.home_source_id)
+        identity_away = canonical.mapped_team(source="fbref", source_id=identity.away_source_id)
+    except KeyError as error:
+        raise MatchReportCanonicalValidationError(
+            "report_team_identity_mapping_missing",
+            str(error),
+        ) from error
+    if identity_home.id != match.home_team_id or identity_away.id != match.away_team_id:
+        raise MatchReportCanonicalValidationError(
+            "report_team_identity_mismatch",
+            (
+                f"raw report teams {identity.home_source_id}/{identity.away_source_id} do not "
+                "match canonical home/away teams"
+            ),
+        )
+
+    if version.kickoff_at is None:
+        raise MatchReportCanonicalValidationError(
+            "report_date_identity_unverifiable",
+            f"canonical match version {match_id}:{match_version} has no kickoff date",
+        )
+    if identity.played_on != version.kickoff_at.date():
+        raw_date = None if identity.played_on is None else identity.played_on.isoformat()
+        raise MatchReportCanonicalValidationError(
+            "report_date_identity_mismatch",
+            (
+                f"raw report date {raw_date} does not match canonical kickoff date "
+                f"{version.kickoff_at.date().isoformat()}"
+            ),
+        )
+
+    return MatchReportIdentityValidation(match, version, resolved_teams)
+
+
+def validate_match_report_result(
+    parsed: MatchReportParseResult,
+    *,
+    match_id: MatchId,
+    match_version: int,
+    known_at: datetime,
+    observed_at: datetime,
+    canonical: CanonicalStore,
+    claimed_score: tuple[int, int] | None = None,
+) -> MatchReportResultValidation:
+    """Validate the raw 90-minute score at the report knowledge boundary."""
+
+    if known_at > observed_at:
+        raise MatchReportCanonicalValidationError(
+            "report_temporal_boundary_invalid",
+            "known_at cannot be later than observed_at",
+        )
+    canonical_result = _result_as_of(
+        canonical,
+        match_id=match_id,
+        match_version=match_version,
+        known_at=known_at,
+        observed_at=observed_at,
+    )
+    if canonical_result is None:
+        raise MatchReportCanonicalValidationError(
+            "canonical_result_missing",
+            (
+                f"no canonical 90-minute result exists for {match_id}:{match_version} "
+                "at the report knowledge boundary"
+            ),
+        )
+    result_fact_id, canonical_home_goals, canonical_away_goals = canonical_result
+    if claimed_score is not None and claimed_score != (
+        canonical_home_goals,
+        canonical_away_goals,
+    ):
+        raise MatchReportCanonicalValidationError(
+            "score_conflicts_with_canonical",
+            (
+                f"claimed score {claimed_score[0]}-{claimed_score[1]} conflicts with canonical "
+                f"score {canonical_home_goals}-{canonical_away_goals}"
+            ),
+        )
+    raw_score = (parsed.identity.home_goals, parsed.identity.away_goals)
+    if raw_score != (canonical_home_goals, canonical_away_goals):
+        raise MatchReportCanonicalValidationError(
+            "report_score_identity_mismatch",
+            (
+                f"raw report score {raw_score[0]}-{raw_score[1]} conflicts with canonical score "
+                f"{canonical_home_goals}-{canonical_away_goals}"
+            ),
+        )
+    return MatchReportResultValidation(
+        result_fact_id,
+        canonical_home_goals,
+        canonical_away_goals,
+    )
 
 
 def ingest_fbref_match_report(
@@ -97,9 +348,12 @@ def ingest_fbref_match_report(
     observed_at: datetime,
     archive: RawArchive,
     canonical: CanonicalStore,
+    required_tables: tuple[str, ...] = PRODUCTION_REQUIRED_TABLES,
 ) -> MatchReportIngestResult:
     """Persist raw evidence, then emit facts only for a verified canonical match."""
 
+    required_tables = tuple(dict.fromkeys(required_tables))
+    collector_version = report_collector_version(required_tables)
     asset = archive.archive(
         content,
         source="fbref",
@@ -107,7 +361,7 @@ def ingest_fbref_match_report(
         url=page_url,
         observed_at=observed_at,
         target_event_time=known_at,
-        collector_version=COLLECTOR_VERSION,
+        collector_version=collector_version,
         media_type="text/html",
     )
     canonical.register_raw_asset(asset)
@@ -133,8 +387,9 @@ def ingest_fbref_match_report(
             canonical=canonical,
             match_id=mapped_match_id,
             raw_asset_id=asset,
+            collector_version=collector_version,
         )
-    parsed = parse_match_report(content)
+    parsed = parse_match_report(content, required_tables=required_tables)
     if mapped_match_id != match_id:
         raise _record_failure(
             canonical=canonical,
@@ -172,9 +427,7 @@ def ingest_fbref_match_report(
             ),
         )
 
-    blocking_diagnostics = tuple(
-        diagnostic for diagnostic in parsed.diagnostics if diagnostic.code in _BLOCKING_DIAGNOSTICS
-    )
+    blocking_diagnostics = blocking_match_report_diagnostics(parsed)
     if blocking_diagnostics:
         codes = ", ".join(sorted({diagnostic.code for diagnostic in blocking_diagnostics}))
         raise _record_failure(
@@ -187,142 +440,26 @@ def ingest_fbref_match_report(
             message=f"blocking parser diagnostics: {codes}",
         )
 
-    source_team_ids = tuple(team.source_team_id for team in parsed.teams)
-    if len(source_team_ids) != 2 or len(set(source_team_ids)) != 2:
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="report_team_coverage_invalid",
-            message="match report must contain exactly two distinct team summary tables",
-        )
-
-    resolved_teams = {}
     try:
-        for source_team_id in source_team_ids:
-            resolved_teams[source_team_id] = canonical.mapped_team(
-                source="fbref", source_id=source_team_id
-            )
-    except KeyError as error:
+        identity_validation = validate_match_report_identity(
+            parsed,
+            source_match_id=source_match_id,
+            match_id=mapped_match_id,
+            match_version=match_version,
+            canonical=canonical,
+        )
+    except MatchReportCanonicalValidationError as error:
         raise _record_failure(
             canonical=canonical,
             match_id=mapped_match_id,
             page_url=page_url,
             observed_at=observed_at,
             raw_asset_id=asset.id,
-            code="report_team_mapping_missing",
+            code=error.code,
             message=str(error),
         ) from error
-
-    match = canonical.match(mapped_match_id)
-    expected_team_ids = {match.home_team_id, match.away_team_id}
-    report_team_ids = {team.id for team in resolved_teams.values()}
-    if report_team_ids != expected_team_ids:
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="report_teams_do_not_match_fixture",
-            message=(
-                f"report teams {sorted(str(item) for item in report_team_ids)} do not match "
-                f"fixture teams {sorted(str(item) for item in expected_team_ids)}"
-            ),
-        )
-
-    identity = parsed.identity
-    if identity.source_match_id is not None and identity.source_match_id != source_match_id:
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="report_source_match_identity_mismatch",
-            message=(
-                f"raw report identifies {identity.source_match_id}, expected {source_match_id}"
-            ),
-        )
-    expected_competition_id = _expected_competition_source_id(canonical, match)
-    if (
-        identity.competition_source_id is not None
-        and expected_competition_id is not None
-        and identity.competition_source_id != expected_competition_id
-    ):
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="report_competition_identity_mismatch",
-            message=(
-                f"raw report identifies competition {identity.competition_source_id}, expected "
-                f"{expected_competition_id}"
-            ),
-        )
-    expected_season_id = _expected_season_source_id(canonical, match)
-    if (
-        identity.season_source_id is not None
-        and expected_season_id is not None
-        and identity.season_source_id != expected_season_id
-    ):
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="report_season_identity_mismatch",
-            message=(
-                f"raw report identifies season {identity.season_source_id}, expected "
-                f"{expected_season_id}"
-            ),
-        )
-    if identity.home_source_id is not None and identity.away_source_id is not None:
-        try:
-            identity_home = canonical.mapped_team(source="fbref", source_id=identity.home_source_id)
-            identity_away = canonical.mapped_team(source="fbref", source_id=identity.away_source_id)
-        except KeyError as error:
-            raise _record_failure(
-                canonical=canonical,
-                match_id=mapped_match_id,
-                page_url=page_url,
-                observed_at=observed_at,
-                raw_asset_id=asset.id,
-                code="report_team_identity_mapping_missing",
-                message=str(error),
-            ) from error
-        if identity_home.id != match.home_team_id or identity_away.id != match.away_team_id:
-            raise _record_failure(
-                canonical=canonical,
-                match_id=mapped_match_id,
-                page_url=page_url,
-                observed_at=observed_at,
-                raw_asset_id=asset.id,
-                code="report_team_identity_mismatch",
-                message=(
-                    f"raw report teams {identity.home_source_id}/{identity.away_source_id} do not "
-                    "match canonical home/away teams"
-                ),
-            )
-    if identity.played_on is not None and version.kickoff_at is not None:
-        if identity.played_on != version.kickoff_at.date():
-            raise _record_failure(
-                canonical=canonical,
-                match_id=mapped_match_id,
-                page_url=page_url,
-                observed_at=observed_at,
-                raw_asset_id=asset.id,
-                code="report_date_identity_mismatch",
-                message=(
-                    f"raw report date {identity.played_on.isoformat()} does not match canonical "
-                    f"kickoff date {version.kickoff_at.date().isoformat()}"
-                ),
-            )
+    match = identity_validation.match
+    resolved_teams = identity_validation.resolved_teams
 
     player_validation_error = _validate_player_rows(
         parsed,
@@ -341,68 +478,29 @@ def ingest_fbref_match_report(
             code=code,
             message=message,
         )
-    if known_at > observed_at:
+    try:
+        result_validation = validate_match_report_result(
+            parsed,
+            match_id=mapped_match_id,
+            match_version=match_version,
+            known_at=known_at,
+            observed_at=observed_at,
+            canonical=canonical,
+            claimed_score=(home_goals, away_goals),
+        )
+    except MatchReportCanonicalValidationError as error:
         raise _record_failure(
             canonical=canonical,
             match_id=mapped_match_id,
             page_url=page_url,
             observed_at=observed_at,
             raw_asset_id=asset.id,
-            code="report_temporal_boundary_invalid",
-            message="known_at cannot be later than observed_at",
-        )
-
-    canonical_result = _result_as_of(
-        canonical,
-        match_id=mapped_match_id,
-        match_version=match_version,
-        known_at=known_at,
-        observed_at=observed_at,
-    )
-    if canonical_result is None:
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="canonical_result_missing",
-            message=(
-                f"no canonical 90-minute result exists for {mapped_match_id}:{match_version} "
-                "at the report knowledge boundary"
-            ),
-        )
-    result_fact_id, canonical_home_goals, canonical_away_goals = canonical_result
-    if (home_goals, away_goals) != (canonical_home_goals, canonical_away_goals):
-        raise _record_failure(
-            canonical=canonical,
-            match_id=mapped_match_id,
-            page_url=page_url,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            code="score_conflicts_with_canonical",
-            message=(
-                f"claimed score {home_goals}-{away_goals} conflicts with canonical score "
-                f"{canonical_home_goals}-{canonical_away_goals}"
-            ),
-        )
-    if identity.home_goals is not None and identity.away_goals is not None:
-        if (identity.home_goals, identity.away_goals) != (
-            canonical_home_goals,
-            canonical_away_goals,
-        ):
-            raise _record_failure(
-                canonical=canonical,
-                match_id=mapped_match_id,
-                page_url=page_url,
-                observed_at=observed_at,
-                raw_asset_id=asset.id,
-                code="report_score_identity_mismatch",
-                message=(
-                    f"raw report score {identity.home_goals}-{identity.away_goals} conflicts with "
-                    f"canonical score {canonical_home_goals}-{canonical_away_goals}"
-                ),
-            )
+            code=error.code,
+            message=str(error),
+        ) from error
+    result_fact_id = result_validation.result_fact_id
+    canonical_home_goals = result_validation.home_goals
+    canonical_away_goals = result_validation.away_goals
 
     facts = CanonicalFactStore(canonical)
     team_fact_ids: list[str] = []
@@ -448,21 +546,32 @@ def ingest_fbref_match_report(
                     team_id=team.id,
                     player_id=player.id,
                     lineup_role="starter" if player_row.starter else "bench",
-                    official=True,
+                    official=False,
                     known_at=known_at,
                     observed_at=observed_at,
                     raw_asset_id=asset.id,
                 )
 
-    canonical.record_collection_attempt(
+    attempt = canonical.record_collection_attempt(
         match_id=mapped_match_id,
         source="fbref-match-report",
         source_id=source_match_id,
         target_url=page_url,
         outcome=CollectionAttemptOutcome.SUCCEEDED,
         observed_at=observed_at,
-        collector_version=COLLECTOR_VERSION,
+        collector_version=collector_version,
         raw_asset_id=asset.id,
+    )
+    contract = canonical.record_match_report_contract(
+        collection_attempt_id=attempt.id,
+        match_id=mapped_match_id,
+        match_version=match_version,
+        raw_asset_id=asset.id,
+        source_match_id=source_match_id,
+        parser_version=parsed.parser_version,
+        required_tables=parsed.required_tables,
+        team_tables={team.source_team_id: team.tables_present for team in parsed.teams},
+        observed_at=observed_at,
     )
     return MatchReportIngestResult(
         asset.id.value,
@@ -470,6 +579,7 @@ def ingest_fbref_match_report(
         tuple(team_fact_ids),
         tuple(player_fact_ids),
         result_fact_id,
+        contract.contract_id,
     )
 
 
@@ -484,6 +594,7 @@ def _record_failure(
     message: str,
 ) -> MatchReportIngestError:
     source_match_id = _raw_source_id(canonical, raw_asset_id)
+    collector_version = _raw_collector_version(canonical, raw_asset_id)
     canonical.record_collection_attempt(
         match_id=match_id,
         source="fbref-match-report",
@@ -491,7 +602,7 @@ def _record_failure(
         target_url=page_url,
         outcome=CollectionAttemptOutcome.FAILED,
         observed_at=observed_at,
-        collector_version=COLLECTOR_VERSION,
+        collector_version=collector_version,
         diagnostic_code=code,
         diagnostic_message=message,
         raw_asset_id=raw_asset_id,
@@ -510,6 +621,7 @@ def _record_page_url_failure(
     canonical: CanonicalStore,
     match_id: MatchId,
     raw_asset_id: RawAsset,
+    collector_version: str,
 ) -> MatchReportIngestError:
     """Keep the operator-supplied URL as raw evidence while recording a safe attempt URL.
 
@@ -526,7 +638,7 @@ def _record_page_url_failure(
         url=safe_url,
         observed_at=observed_at,
         target_event_time=known_at,
-        collector_version=COLLECTOR_VERSION,
+        collector_version=collector_version,
         media_type="text/html",
     )
     canonical.register_raw_asset(safe_asset)
@@ -541,7 +653,7 @@ def _record_page_url_failure(
         target_url=safe_url,
         outcome=CollectionAttemptOutcome.FAILED,
         observed_at=observed_at,
-        collector_version=COLLECTOR_VERSION,
+        collector_version=collector_version,
         diagnostic_code="report_page_url_identity_mismatch",
         diagnostic_message=message,
         raw_asset_id=safe_asset.id,
@@ -561,6 +673,29 @@ def _raw_source_id(canonical: CanonicalStore, raw_asset_id: RawAssetId) -> str |
             (raw_asset_id.value,),
         ).fetchone()
     return None if row is None else str(row["source_id"])
+
+
+def _raw_collector_version(canonical: CanonicalStore, raw_asset_id: RawAssetId) -> str:
+    with canonical.connect() as connection:
+        row = connection.execute(
+            "SELECT collector_version FROM raw_assets WHERE raw_asset_id = ?",
+            (raw_asset_id.value,),
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"raw asset {raw_asset_id} is not registered")
+    return str(row["collector_version"])
+
+
+def report_collector_version(required_tables: tuple[str, ...]) -> str:
+    normalized = tuple(dict.fromkeys(required_tables))
+    if len(normalized) == len(PRODUCTION_REQUIRED_TABLES) and set(normalized) == set(
+        PRODUCTION_REQUIRED_TABLES
+    ):
+        return PRODUCTION_COLLECTOR_VERSION
+    known = [name for name in PRODUCTION_REQUIRED_TABLES if name in normalized]
+    unknown = sorted(set(normalized) - set(PRODUCTION_REQUIRED_TABLES))
+    contract = ",".join((*known, *unknown)) or "none"
+    return f"{COLLECTOR_VERSION}+custom-tables:{contract}"
 
 
 def _expected_competition_source_id(canonical: CanonicalStore, match) -> str | None:

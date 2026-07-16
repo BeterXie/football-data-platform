@@ -240,6 +240,7 @@ def test_collection_attempts_are_persisted_and_blocked_attempts_need_no_raw(
     blocked = store.record_collection_attempt(
         match_id=match.id,
         source="fbref-match-report",
+        source_id="attempt-match",
         target_url="https://fbref.example/matches/attempt-match",
         outcome=CollectionAttemptOutcome.BLOCKED,
         observed_at=NOW + timedelta(minutes=1),
@@ -249,6 +250,7 @@ def test_collection_attempts_are_persisted_and_blocked_attempts_need_no_raw(
     )
 
     assert blocked.raw_asset_id is None
+    assert blocked.source_id == "attempt-match"
     assert store.collection_attempts(SEASON_ID) == (blocked,)
     with pytest.raises(ValueError, match="successful collection attempts require raw_asset_id"):
         store.record_collection_attempt(
@@ -291,10 +293,258 @@ def test_initialize_migrates_v1_match_versions_and_collection_attempts(
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 2
+            == 4
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(match_versions)")}
         assert "round_name" in columns
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'collection_attempts'"
         ).fetchone()
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(collection_attempts)")
+        }
+        assert "source_id" in columns
+        prematch_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(prematch_events)")
+        }
+        assert "match_version" in prematch_columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'match_report_contracts'"
+        ).fetchone()
+
+
+def test_initialize_migrates_v2_attempt_source_id_from_raw_asset(tmp_path: Path) -> None:
+    path = tmp_path / "canonical-v2.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            );
+            INSERT INTO schema_meta(singleton, version) VALUES (1, 2);
+            CREATE TABLE raw_assets (
+                raw_asset_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                collector_version TEXT NOT NULL
+            );
+            CREATE TABLE collection_attempts (
+                collection_attempt_id TEXT PRIMARY KEY,
+                match_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                collector_version TEXT NOT NULL,
+                diagnostic_code TEXT,
+                diagnostic_message TEXT,
+                raw_asset_id TEXT
+            );
+            INSERT INTO raw_assets VALUES (
+                'raw-asset:legacy', 'fbref', 'aaaaaaaa',
+                'https://fbref.example/en/matches/aaaaaaaa/report',
+                '2026-07-16T03:00:00Z', 'fbref-match-report/2'
+            );
+            INSERT INTO collection_attempts VALUES (
+                'collection-attempt:legacy', 'match:legacy', 'fbref-match-report',
+                'https://fbref.example/en/matches/aaaaaaaa/report', 'succeeded',
+                '2026-07-16T03:00:00Z', 'fbref-match-report/2', NULL, NULL,
+                'raw-asset:legacy'
+            );
+            """
+        )
+
+    store = CanonicalStore(path)
+    store.initialize()
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
+            == 4
+        )
+        row = connection.execute(
+            "SELECT source_id FROM collection_attempts "
+            "WHERE collection_attempt_id = 'collection-attempt:legacy'"
+        ).fetchone()
+    assert row["source_id"] == "aaaaaaaa"
+
+
+def test_initialize_rebuilds_v3_prematch_events_with_v4_constraints(
+    prepared_store: tuple[CanonicalStore, object],
+) -> None:
+    store, asset = prepared_store
+    teams = [
+        store.resolve_or_create_team(
+            source="fbref",
+            source_id=f"migration-team-{index}",
+            canonical_name=f"Migration Team {index}",
+            competition_id=COMPETITION_ID,
+            observed_at=NOW,
+            raw_asset_id=asset.id,  # type: ignore[attr-defined]
+        )
+        for index in range(2)
+    ]
+    player = store.resolve_or_create_player(
+        source="fbref",
+        source_id="migration-player",
+        canonical_name="Migration Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,  # type: ignore[attr-defined]
+    )
+    match, version = store.resolve_or_create_match(
+        source="fbref",
+        source_id="migration-match",
+        competition_id=COMPETITION_ID,
+        season_id=SEASON_ID,
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        kickoff_at=NOW + timedelta(days=1),
+        status=MatchStatus.SCHEDULED,
+        observed_at=NOW,
+        raw_asset_id=asset.id,  # type: ignore[attr-defined]
+    )
+    with store.connect() as connection:
+        connection.executescript(
+            """
+            DROP TABLE prematch_events;
+            CREATE TABLE prematch_events (
+                record_id TEXT PRIMARY KEY,
+                match_id TEXT NOT NULL REFERENCES matches(match_id),
+                team_id TEXT REFERENCES teams(team_id),
+                player_id TEXT REFERENCES players(player_id),
+                event_type TEXT NOT NULL,
+                occurred_at TEXT,
+                known_at TEXT NOT NULL,
+                confirmation_status TEXT NOT NULL CHECK (
+                    confirmation_status IN ('official', 'corroborated', 'unconfirmed')
+                ),
+                evidence_refs_json TEXT NOT NULL,
+                can_modify_features INTEGER NOT NULL CHECK (can_modify_features IN (0, 1))
+            );
+            UPDATE schema_meta SET version = 3 WHERE singleton = 1;
+            """
+        )
+        connection.executemany(
+            "INSERT INTO prematch_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    "fact:legacy-player-event",
+                    match.id.value,
+                    teams[0].id.value,
+                    player.id.value,
+                    "injury",
+                    None,
+                    "2026-07-16T02:00:00Z",
+                    "official",
+                    '["news:legacy-player"]',
+                    1,
+                ),
+                (
+                    "fact:legacy-team-event",
+                    match.id.value,
+                    teams[0].id.value,
+                    None,
+                    "travel-disruption",
+                    None,
+                    "2026-07-16T02:00:00Z",
+                    "official",
+                    '["news:legacy-team"]',
+                    1,
+                ),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO fact_evidence(record_id, raw_asset_id, observed_at) VALUES (?, ?, ?)",
+            (
+                (
+                    "fact:legacy-player-event",
+                    asset.id.value,  # type: ignore[attr-defined]
+                    "2026-07-16T02:00:00Z",
+                ),
+                (
+                    "fact:legacy-team-event",
+                    asset.id.value,  # type: ignore[attr-defined]
+                    "2026-07-16T02:00:00Z",
+                ),
+            ),
+        )
+
+    store.initialize()
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
+            == 4
+        )
+        rows = connection.execute(
+            "SELECT record_id, match_id, match_version, team_id, player_id, event_type, "
+            "evidence_refs_json, can_modify_features FROM prematch_events ORDER BY record_id"
+        ).fetchall()
+        migrated = {row["record_id"]: row for row in rows}
+        assert set(migrated) == {"fact:legacy-player-event", "fact:legacy-team-event"}
+        assert migrated["fact:legacy-player-event"]["match_id"] == match.id.value
+        assert migrated["fact:legacy-player-event"]["match_version"] is None
+        assert migrated["fact:legacy-player-event"]["player_id"] == player.id.value
+        assert migrated["fact:legacy-player-event"]["event_type"] == "injury"
+        assert migrated["fact:legacy-player-event"]["evidence_refs_json"] == (
+            '["news:legacy-player"]'
+        )
+        assert migrated["fact:legacy-player-event"]["can_modify_features"] == 0
+        assert migrated["fact:legacy-team-event"]["match_version"] is None
+        assert migrated["fact:legacy-team-event"]["player_id"] is None
+        assert migrated["fact:legacy-team-event"]["can_modify_features"] == 1
+        evidence_ids = {
+            row["record_id"]
+            for row in connection.execute(
+                "SELECT record_id FROM fact_evidence WHERE record_id LIKE 'fact:legacy-%'"
+            )
+        }
+        assert evidence_ids == {"fact:legacy-player-event", "fact:legacy-team-event"}
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'match_report_contracts'"
+        ).fetchone()
+
+    insert_sql = (
+        "INSERT INTO prematch_events(record_id, match_id, match_version, team_id, player_id, "
+        "event_type, occurred_at, known_at, confirmation_status, evidence_refs_json, "
+        "can_modify_features) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    with store.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            connection.execute(
+                insert_sql,
+                (
+                    "fact:invalid-match-version",
+                    match.id.value,
+                    version.version + 99,
+                    teams[0].id.value,
+                    player.id.value,
+                    "injury",
+                    None,
+                    "2026-07-16T02:00:00Z",
+                    "official",
+                    "[]",
+                    1,
+                ),
+            )
+    with store.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                insert_sql,
+                (
+                    "fact:unbound-modifying-player",
+                    match.id.value,
+                    None,
+                    teams[0].id.value,
+                    player.id.value,
+                    "injury",
+                    None,
+                    "2026-07-16T02:00:00Z",
+                    "official",
+                    "[]",
+                    1,
+                ),
+            )

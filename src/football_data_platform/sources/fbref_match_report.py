@@ -70,6 +70,7 @@ class TeamReport:
     # the match-report pipeline.
     table_stats: dict[str, dict[str, float | None]] = field(default_factory=dict)
     tables_present: tuple[str, ...] = ()
+    missing_tables: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,8 @@ class MatchReportParseResult:
     parser_version: str = REPORT_PARSER_VERSION
     tables_present: tuple[str, ...] = ()
     identity: MatchReportIdentity = field(default_factory=MatchReportIdentity)
+    required_tables: tuple[str, ...] = ("summary",)
+    missing_required_tables: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -399,6 +402,7 @@ def parse_match_report(
         table_stats[table_name] = table_total
 
     teams: list[TeamReport] = []
+    missing_required_tables: set[str] = set()
     for source_team_id, state in team_state.items():
         tables = state["tables"]
         summary = state["summary"]
@@ -410,6 +414,18 @@ def parse_match_report(
         assert isinstance(auxiliary, dict)
         assert isinstance(table_stats, dict)
         assert isinstance(summary_totals, dict)
+        team_missing_tables = tuple(name for name in required if name not in tables)
+        missing_required_tables.update(team_missing_tables)
+        for required_name in team_missing_tables:
+            if required_name == "summary":
+                continue
+            diagnostics.append(
+                ParseDiagnostic(
+                    "required_report_table_missing",
+                    f"team {source_team_id} is missing required table {required_name!r}",
+                    subject_id=source_team_id,
+                )
+            )
         if "summary" not in tables:
             diagnostics.append(
                 ParseDiagnostic(
@@ -422,15 +438,6 @@ def parse_match_report(
             # summary remain visible through diagnostics but cannot provide canonical player
             # identity/minutes and therefore are not emitted as a TeamReport.
             continue
-        for required_name in required:
-            if required_name not in tables:
-                diagnostics.append(
-                    ParseDiagnostic(
-                        "required_report_table_missing",
-                        f"team {source_team_id} is missing required table {required_name!r}",
-                        subject_id=source_team_id,
-                    )
-                )
         for table_name, rows in auxiliary.items():
             for source_player_id, metrics in rows.items():
                 player = summary.get(source_player_id)
@@ -460,10 +467,12 @@ def parse_match_report(
                 aggregated_stats=core,
                 table_stats={name: dict(values) for name, values in table_stats.items()},
                 tables_present=tuple(tables),
+                missing_tables=team_missing_tables,
             )
         )
 
     if not team_state:
+        missing_required_tables.update(required)
         diagnostics.append(
             ParseDiagnostic("player_summary_tables_missing", "no player summary tables found")
         )
@@ -479,6 +488,8 @@ def parse_match_report(
         parser_version=REPORT_PARSER_VERSION,
         tables_present=tuple(table_names),
         identity=identity,
+        required_tables=required,
+        missing_required_tables=tuple(sorted(missing_required_tables)),
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from football_data_platform.domain.ids import RawAssetId
+from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.predictions import (
     ModelRunValidator,
@@ -20,6 +21,7 @@ from football_data_platform.domain.predictions import (
     prediction_payload,
     score_grid_composition_artifact_id,
     score_grid_composition_payload,
+    verify_prediction_snapshot,
     verify_score_prediction,
 )
 from football_data_platform.domain.snapshots import (
@@ -27,6 +29,16 @@ from football_data_platform.domain.snapshots import (
     SnapshotSourceValidation,
     snapshot_payload,
     verify_snapshot,
+)
+from football_data_platform.features.lineup import (
+    LINEUP_DELTA_INPUT_TRANSFORM_V3,
+    lineup_delta_input_payload,
+    parse_lineup_delta_payload,
+)
+from football_data_platform.features.player_profiles import (
+    PlayerProfile,
+    parse_player_profile_payload,
+    validate_player_profile,
 )
 from football_data_platform.features.team_baseline import (
     TeamBaselineArtifact,
@@ -615,31 +627,130 @@ class DerivedArchive:
         self,
         *,
         value: Any,
-        input_refs: tuple[RawAssetId, ...],
+        input_refs: tuple[RawAssetId | str, ...],
         transform_version: str,
         generated_at: datetime,
+        known_at: datetime | None = None,
     ) -> str:
-        """Archive one content-addressed feature value and its verified raw lineage."""
+        """Archive one content-addressed feature value and its verified lineage."""
+
+        if transform_version == "official-lineup-input/2":
+            raise ValueError("use write_official_lineup_source for official-lineup-input/2")
+        return self._write_snapshot_source(
+            value=value,
+            input_refs=input_refs,
+            transform_version=transform_version,
+            generated_at=generated_at,
+            known_at=known_at,
+            source_context=None,
+        )
+
+    def write_official_lineup_source(
+        self,
+        *,
+        match_id: MatchId,
+        match_version: int,
+        team_id: TeamId,
+        player_ids: tuple[PlayerId, ...],
+        known_at: datetime,
+        observed_at: datetime,
+        raw_asset_id: RawAssetId,
+    ) -> str:
+        """Persist an official XI only when exact canonical facts already exist."""
+
+        if not isinstance(match_id, MatchId) or not isinstance(team_id, TeamId):
+            raise TypeError("official lineup match_id and team_id must be platform IDs")
+        if (
+            not isinstance(match_version, int)
+            or isinstance(match_version, bool)
+            or match_version < 1
+        ):
+            raise ValueError("official lineup match_version must be a positive integer")
+        if (
+            len(player_ids) != 11
+            or len(set(player_ids)) != 11
+            or any(not isinstance(player_id, PlayerId) for player_id in player_ids)
+        ):
+            raise ValueError("official lineup source requires 11 unique PlayerId values")
+        if not isinstance(raw_asset_id, RawAssetId):
+            raise TypeError("official lineup raw_asset_id must be a RawAssetId")
+        require_utc(known_at, "known_at")
+        require_utc(observed_at, "observed_at")
+        source_context = {
+            "match_id": match_id.value,
+            "match_version": match_version,
+            "team_id": team_id.value,
+            "player_ids": [player_id.value for player_id in player_ids],
+            "known_at": _timestamp(known_at),
+            "observed_at": _timestamp(observed_at),
+        }
+        return self._write_snapshot_source(
+            value=[player_id.value for player_id in player_ids],
+            input_refs=(raw_asset_id,),
+            transform_version="official-lineup-input/2",
+            generated_at=observed_at,
+            known_at=known_at,
+            source_context=source_context,
+        )
+
+    def _write_snapshot_source(
+        self,
+        *,
+        value: Any,
+        input_refs: tuple[RawAssetId | str, ...],
+        transform_version: str,
+        generated_at: datetime,
+        known_at: datetime | None,
+        source_context: dict[str, Any] | None,
+    ) -> str:
 
         require_utc(generated_at, "generated_at")
         if not transform_version or transform_version.strip() != transform_version:
             raise ValueError("transform_version must be non-empty text")
         if not input_refs:
-            raise ValueError("derived snapshot sources require raw input_refs")
-        raw = RawArchive(self.layout)
-        input_observed_at = []
-        for input_ref in input_refs:
-            raw.verify(input_ref)
-            input_observed_at.append(raw.load(input_ref).observed_at)
+            raise ValueError("derived snapshot sources require input_refs")
+        normalized_refs = tuple(
+            sorted({_snapshot_source_ref_value(reference) for reference in input_refs})
+        )
+        input_observed_at = [
+            self._validate_snapshot_source_input_ref(reference) for reference in normalized_refs
+        ]
         if generated_at < max(input_observed_at):
-            raise ValueError("generated_at cannot precede a raw input observation")
+            raise ValueError("generated_at cannot precede an input observation")
+        if known_at is not None:
+            require_utc(known_at, "known_at")
+            if known_at > generated_at:
+                raise ValueError("known_at cannot follow generated_at")
+        if transform_version == LINEUP_DELTA_INPUT_TRANSFORM_V3:
+            if known_at is None:
+                raise ValueError("lineup-delta-input/3 requires known_at")
+            self._validate_lineup_delta_source(
+                value,
+                normalized_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+            )
+        if transform_version == "official-lineup-input/2":
+            if known_at is None or source_context is None:
+                raise ValueError("official-lineup-input/2 requires canonical source context")
+            self._validate_official_lineup_source(
+                value,
+                normalized_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
+            )
         identity = {
             "schema_version": 1,
             "value": value,
-            "input_refs": sorted({item.value for item in input_refs}),
+            "input_refs": list(normalized_refs),
             "transform_version": transform_version,
             "generated_at": _timestamp(generated_at),
         }
+        if known_at is not None:
+            identity["known_at"] = _timestamp(known_at)
+        if source_context is not None:
+            identity["source_context"] = source_context
         digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
         source_ref = f"derived-source:{digest}"
         self._write_json(self._snapshot_source_path(source_ref), {"id": source_ref, **identity})
@@ -648,7 +759,6 @@ class DerivedArchive:
     def validate_snapshot_source(self, source_ref: str) -> SnapshotSourceValidation:
         """Verify a raw or derived snapshot source against immutable storage."""
 
-        raw = RawArchive(self.layout)
         if not source_ref.startswith("derived-source:"):
             raise ValueError(f"snapshot source is not available in derived storage: {source_ref}")
         path = self._snapshot_source_path(source_ref)
@@ -660,19 +770,50 @@ class DerivedArchive:
         if payload.get("schema_version") != 1:
             raise ArchiveConflictError("unsupported derived snapshot source schema")
         input_refs = tuple(str(item) for item in payload.get("input_refs", ()))
-        input_observed_at = []
-        for input_ref in input_refs:
-            asset_id = RawAssetId(input_ref)
-            raw.verify(asset_id)
-            input_observed_at.append(raw.load(asset_id).observed_at)
+        if tuple(sorted(set(input_refs))) != input_refs:
+            raise ArchiveConflictError("derived snapshot source input_refs are not canonical")
+        input_observed_at = [
+            self._validate_snapshot_source_input_ref(reference) for reference in input_refs
+        ]
         generated_at = datetime.fromisoformat(str(payload["generated_at"]).replace("Z", "+00:00"))
         require_utc(generated_at, "generated_at")
         if not input_observed_at or generated_at < max(input_observed_at):
             raise ArchiveConflictError("derived snapshot source has invalid observation lineage")
+        raw_known_at = payload.get("known_at")
+        known_at = None
+        if raw_known_at is not None:
+            known_at = datetime.fromisoformat(str(raw_known_at).replace("Z", "+00:00"))
+            require_utc(known_at, "known_at")
+            if known_at > generated_at:
+                raise ArchiveConflictError("derived snapshot source has invalid known_at")
+        source_context = payload.get("source_context")
+        if source_context is not None and not isinstance(source_context, dict):
+            raise ArchiveConflictError("derived snapshot source context must be an object")
         transform_version = str(payload["transform_version"])
         value = payload["value"]
         if transform_version in {"team-baseline-input/1", "team-baseline-input/2"}:
             self._validate_team_baseline_source(value, input_refs)
+        if transform_version == LINEUP_DELTA_INPUT_TRANSFORM_V3:
+            if known_at is None:
+                raise ArchiveConflictError("lineup-delta-input/3 source is missing known_at")
+            self._validate_lineup_delta_source(
+                value,
+                input_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+            )
+        if transform_version == "official-lineup-input/2":
+            if known_at is None or source_context is None:
+                raise ArchiveConflictError(
+                    "official-lineup-input/2 source is missing canonical context"
+                )
+            self._validate_official_lineup_source(
+                value,
+                input_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
+            )
         return SnapshotSourceValidation(
             source_ref,
             "derived",
@@ -680,13 +821,22 @@ class DerivedArchive:
             generated_at,
             value,
             input_refs,
+            known_at,
+            source_context,
         )
 
-    def write_prediction(self, prediction: ScorePrediction) -> Path:
+    def write_prediction(
+        self,
+        prediction: ScorePrediction,
+        *,
+        snapshot: PreMatchSnapshot,
+    ) -> Path:
         """Persist a prediction together with its immutable score-grid provenance."""
 
-        verify_score_prediction(
+        verify_prediction_snapshot(
             prediction,
+            snapshot=snapshot,
+            snapshot_validator=self,
             model_run_validator=self.model_run_validator,
         )
         self.write_score_grid_composition(prediction)
@@ -826,6 +976,21 @@ class DerivedArchive:
         """Archive a profile build result as one lineage-addressed artifact."""
 
         profile_items = tuple(getattr(profiles, "profiles", profiles))
+        for profile in profile_items:
+            if not isinstance(profile, PlayerProfile):
+                raise TypeError("player profile artifacts must be PlayerProfile values")
+            validate_player_profile(profile)
+        transform_versions = {
+            str(item.transform_version)
+            for item in profile_items
+            if getattr(item, "transform_version", None)
+        }
+        if len(transform_versions) > 1:
+            raise ValueError("player profiles must use one transform_version per manifest")
+        for reference in sorted(
+            {ref for item in profile_items for ref in getattr(item, "input_refs", ())}
+        ):
+            self._verify_player_profile_input_ref(reference)
         profile_payload = {
             "profiles": [_json_safe(item) for item in profile_items],
             "excluded_input_refs": list(getattr(profiles, "excluded_input_refs", ())),
@@ -833,6 +998,8 @@ class DerivedArchive:
                 _json_safe(item) for item in getattr(profiles, "partition_audits", ())
             ],
         }
+        for reference in sorted(set(profile_payload["excluded_input_refs"])):
+            self._verify_player_profile_input_ref(reference)
         input_refs = tuple(
             sorted(
                 {ref for item in profile_items for ref in getattr(item, "input_refs", ())}
@@ -857,11 +1024,6 @@ class DerivedArchive:
         status = "succeeded" if ready else ("partial" if profile_items else "failed")
         error = None if profile_items else "no_player_profiles"
         quality = "ready" if ready else ("preview" if profile_items else "failed")
-        transform_versions = {
-            str(item.transform_version)
-            for item in profile_items
-            if getattr(item, "transform_version", None)
-        }
         transform_version = (
             sorted(transform_versions)[0] if transform_versions else "player-profile/unknown"
         )
@@ -878,6 +1040,134 @@ class DerivedArchive:
             quality=quality,
         )
         return self.write_artifact_manifest(manifest)
+
+    def load_player_profile(self, artifact_id: str) -> PlayerProfile:
+        """Load one profile only after validating its enclosing manifest."""
+
+        profile, _ = self._load_player_profile_with_manifest(artifact_id)
+        return profile
+
+    def _load_player_profile_with_manifest(
+        self, artifact_id: str
+    ) -> tuple[PlayerProfile, DerivedArtifactManifest]:
+        if not isinstance(artifact_id, str) or not artifact_id.startswith("player-profile:"):
+            raise ArchiveConflictError("invalid player profile artifact reference")
+        manifest = self._load_artifact_manifest_for_output_ref(artifact_id)
+        if manifest.artifact_type != "player-profiles":
+            raise ArchiveConflictError(
+                "player profile reference resolves to the wrong artifact type"
+            )
+        payload = manifest.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "profiles",
+            "excluded_input_refs",
+            "partition_audits",
+        }:
+            raise ArchiveConflictError("player profile manifest payload is invalid")
+        raw_profiles = payload["profiles"]
+        if not isinstance(raw_profiles, list):
+            raise ArchiveConflictError("player profile manifest profiles are invalid")
+        try:
+            profiles = tuple(parse_player_profile_payload(item) for item in raw_profiles)
+        except ValueError as error:
+            raise ArchiveConflictError(
+                "player profile manifest contains an invalid profile"
+            ) from error
+        by_id = {profile.artifact_id: profile for profile in profiles}
+        if len(by_id) != len(profiles) or set(by_id) != set(manifest.output_refs):
+            raise ArchiveConflictError("player profile manifest outputs do not match profiles")
+        if artifact_id not in by_id:
+            raise ArchiveConflictError("player profile artifact is not exposed by its manifest")
+        excluded = payload["excluded_input_refs"]
+        if not isinstance(excluded, list) or any(not isinstance(item, str) for item in excluded):
+            raise ArchiveConflictError("player profile manifest excluded refs are invalid")
+        for reference in sorted(set(excluded)):
+            self._verify_player_profile_input_ref(reference)
+        expected_inputs = tuple(
+            sorted({ref for profile in profiles for ref in profile.input_refs} | set(excluded))
+        )
+        if manifest.input_refs != expected_inputs:
+            raise ArchiveConflictError("player profile manifest inputs do not match profiles")
+        transforms = {profile.transform_version for profile in profiles}
+        expected_quality = (
+            "ready"
+            if profiles and all(profile.quality_status == "ready" for profile in profiles)
+            else ("preview" if profiles else "failed")
+        )
+        expected_status = (
+            "succeeded" if expected_quality == "ready" else ("partial" if profiles else "failed")
+        )
+        expected_error = None if profiles else "no_player_profiles"
+        expected_transform = sorted(transforms)[0] if transforms else "player-profile/unknown"
+        if (
+            len(transforms) > 1
+            or manifest.transform_version != expected_transform
+            or manifest.quality != expected_quality
+            or manifest.status != expected_status
+            or manifest.error != expected_error
+            or any(manifest.generated_at < profile.as_of for profile in profiles)
+        ):
+            raise ArchiveConflictError("player profile manifest metadata does not match profiles")
+        for profile in profiles:
+            for reference in profile.input_refs:
+                self._verify_player_profile_input_ref(reference)
+        return by_id[artifact_id], manifest
+
+    def _verify_player_profile_input_ref(self, reference: str) -> None:
+        """Resolve a profile input through an immutable raw, derived, or canonical store."""
+
+        if not isinstance(reference, str) or not reference or reference.strip() != reference:
+            raise ArchiveConflictError("player profile input reference must be non-empty text")
+        try:
+            if reference.startswith("raw-asset:"):
+                RawArchive(self.layout).verify(RawAssetId(reference))
+                return
+            if reference.startswith("derived-source:"):
+                self.validate_snapshot_source(reference)
+                return
+            if reference.startswith("derived-artifact:"):
+                self.load_artifact_manifest(reference)
+                return
+            if reference.startswith("team-baseline:"):
+                self.load_team_baseline(reference)
+                manifest = self._load_artifact_manifest_for_output_ref(reference)
+                if manifest.artifact_type != "team-baseline":
+                    raise ArchiveConflictError(
+                        "profile input team baseline manifest has wrong type"
+                    )
+                return
+            if reference.startswith("player-profile:"):
+                self._load_player_profile_with_manifest(reference)
+                return
+            if reference.startswith(("canonical:", "fact:", "event:", "lineup:")):
+                self._verify_canonical_player_profile_ref(reference)
+                return
+        except (OSError, KeyError, ValueError, sqlite3.Error, ArchiveConflictError) as error:
+            raise ArchiveConflictError(
+                f"player profile input reference is unavailable or invalid: {reference}"
+            ) from error
+        raise ArchiveConflictError(f"unsupported player profile input reference: {reference}")
+
+    def _verify_canonical_player_profile_ref(self, reference: str) -> None:
+        path = self.layout.canonical / "platform.sqlite3"
+        if not path.exists():
+            raise ArchiveConflictError("canonical store is unavailable for player profile input")
+        with sqlite3.connect(path) as connection:
+            table_rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            for (table_name,) in table_rows:
+                if not isinstance(table_name, str) or '"' in table_name:
+                    continue
+                columns = {
+                    row[1] for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+                }
+                if "record_id" not in columns:
+                    continue
+                query = f'SELECT 1 FROM "{table_name}" WHERE record_id = ? LIMIT 1'
+                if connection.execute(query, (reference,)).fetchone() is not None:
+                    return
+        raise ArchiveConflictError(f"canonical player profile input does not exist: {reference}")
 
     def write_evaluation(
         self,
@@ -965,6 +1255,248 @@ class DerivedArchive:
     def _snapshot_source_path(self, source_ref: str) -> Path:
         digest = source_ref.removeprefix("derived-source:")
         return self.layout.derived / "snapshot-sources" / digest[:2] / f"{digest}.json"
+
+    def _validate_snapshot_source_input_ref(self, reference: str) -> datetime:
+        if reference.startswith("raw-asset:"):
+            asset_id = RawAssetId(reference)
+            raw = RawArchive(self.layout)
+            raw.verify(asset_id)
+            return raw.load(asset_id).observed_at
+        try:
+            if reference.startswith("player-profile:"):
+                _, manifest = self._load_player_profile_with_manifest(reference)
+                return manifest.generated_at
+            if reference.startswith("derived-source:"):
+                return self.validate_snapshot_source(reference).observed_at
+        except (OSError, KeyError, TypeError, ValueError, ArchiveConflictError) as error:
+            raise ArchiveConflictError(
+                f"snapshot source input reference is unavailable or invalid: {reference}"
+            ) from error
+        raise ArchiveConflictError(f"unsupported snapshot source input reference: {reference}")
+
+    def _validate_official_lineup_source(
+        self,
+        value: Any,
+        input_refs: tuple[str, ...],
+        *,
+        generated_at: datetime,
+        known_at: datetime,
+        source_context: dict[str, Any],
+    ) -> None:
+        expected_fields = {
+            "match_id",
+            "match_version",
+            "team_id",
+            "player_ids",
+            "known_at",
+            "observed_at",
+        }
+        if (
+            set(source_context) != expected_fields
+            or not isinstance(value, list)
+            or len(value) != 11
+            or any(not isinstance(player_id, str) for player_id in value)
+            or len(set(value)) != 11
+            or source_context.get("player_ids") != value
+            or source_context.get("known_at") != _timestamp(known_at)
+            or source_context.get("observed_at") != _timestamp(generated_at)
+            or len(input_refs) != 1
+            or not input_refs[0].startswith("raw-asset:")
+        ):
+            raise ArchiveConflictError("official-lineup-input/2 source context is invalid")
+        try:
+            MatchId(source_context["match_id"])
+            TeamId(source_context["team_id"])
+            players = {PlayerId(player_id).value for player_id in value}
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArchiveConflictError(
+                "official-lineup-input/2 platform IDs are invalid"
+            ) from error
+        match_version = source_context["match_version"]
+        if (
+            not isinstance(match_version, int)
+            or isinstance(match_version, bool)
+            or match_version < 1
+        ):
+            raise ArchiveConflictError("official-lineup-input/2 match_version is invalid")
+        canonical_path = self.layout.canonical / "platform.sqlite3"
+        if not canonical_path.exists():
+            raise ArchiveConflictError("canonical store is unavailable for official lineup source")
+        try:
+            with sqlite3.connect(canonical_path) as connection:
+                rows = connection.execute(
+                    "SELECT player_id, raw_asset_id FROM lineup_facts "
+                    "WHERE match_id = ? AND match_version = ? AND team_id = ? "
+                    "AND lineup_role = 'starter' AND official = 1 "
+                    "AND known_at = ? AND observed_at = ?",
+                    (
+                        source_context["match_id"],
+                        match_version,
+                        source_context["team_id"],
+                        source_context["known_at"],
+                        source_context["observed_at"],
+                    ),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise ArchiveConflictError("cannot query canonical official lineup facts") from error
+        if (
+            len(rows) != 11
+            or {row[0] for row in rows} != players
+            or {row[1] for row in rows} != set(input_refs)
+        ):
+            raise ArchiveConflictError(
+                "official-lineup-input/2 does not match canonical lineup facts"
+            )
+
+    def _validate_lineup_delta_source(
+        self,
+        value: Any,
+        input_refs: tuple[str, ...],
+        *,
+        generated_at: datetime,
+        known_at: datetime,
+    ) -> None:
+        if not isinstance(value, dict) or not value:
+            raise ArchiveConflictError("lineup-delta-input/3 value must be keyed by team")
+        if not any(reference.startswith("raw-asset:") for reference in input_refs):
+            raise ArchiveConflictError("lineup-delta-input/3 requires raw lineup evidence")
+        aggregate_fields = {
+            "quality_status",
+            "dimension_deltas",
+            "missing_fields",
+            "input_refs",
+            "not_applicable_fields",
+            "blocking_reasons",
+            "transform_version",
+            "role_contract_versions",
+            "dimension_sample_sizes",
+        }
+        evidence_fields = {
+            "starter_ids",
+            "reference_starter_ids",
+            "player_profile_refs",
+            "profile_window",
+            "profile_window_version",
+            "lineup_input_refs",
+            "reference_lineup_ref",
+        }
+        nested_profile_refs: set[str] = set()
+        nested_lineup_refs: set[str] = set()
+        nested_reference_refs: set[str] = set()
+        for team_id, item in sorted(value.items()):
+            if (
+                not isinstance(team_id, str)
+                or not team_id
+                or team_id.strip() != team_id
+                or not isinstance(item, dict)
+                or set(item) != aggregate_fields | evidence_fields
+            ):
+                raise ArchiveConflictError("lineup-delta-input/3 team evidence is invalid")
+            raw_starters = item["starter_ids"]
+            raw_reference = item["reference_starter_ids"]
+            raw_profile_refs = item["player_profile_refs"]
+            raw_lineup_refs = item["lineup_input_refs"]
+            raw_reference_ref = item["reference_lineup_ref"]
+            if (
+                not isinstance(raw_starters, list)
+                or any(not isinstance(player_id, str) for player_id in raw_starters)
+                or (
+                    raw_reference is not None
+                    and (
+                        not isinstance(raw_reference, list)
+                        or any(not isinstance(player_id, str) for player_id in raw_reference)
+                    )
+                )
+                or not isinstance(raw_profile_refs, dict)
+                or any(
+                    not isinstance(player_id, str)
+                    or not isinstance(reference, str)
+                    or not reference.startswith("player-profile:")
+                    for player_id, reference in raw_profile_refs.items()
+                )
+                or not isinstance(raw_lineup_refs, list)
+                or len(raw_lineup_refs) != len(set(raw_lineup_refs))
+                or any(
+                    not isinstance(reference, str) or not reference.startswith("raw-asset:")
+                    for reference in raw_lineup_refs
+                )
+                or (
+                    raw_reference_ref is not None
+                    and (
+                        not isinstance(raw_reference_ref, str)
+                        or not raw_reference_ref.startswith("derived-source:")
+                    )
+                )
+                or ((raw_reference is None) != (raw_reference_ref is None))
+            ):
+                raise ArchiveConflictError("lineup-delta-input/3 player evidence is invalid")
+            starters = tuple(raw_starters)
+            reference = None if raw_reference is None else tuple(raw_reference)
+            profile_refs = dict(raw_profile_refs)
+            lineup_refs = tuple(raw_lineup_refs)
+            nested_lineup_refs.update(lineup_refs)
+            reference_source_ids: tuple[str, ...] | None = None
+            if raw_reference_ref is not None:
+                reference_validation = self.validate_snapshot_source(raw_reference_ref)
+                context = reference_validation.source_context
+                if (
+                    reference_validation.transform_version != "official-lineup-input/2"
+                    or not isinstance(reference_validation.value, list)
+                    or not isinstance(context, dict)
+                    or context.get("team_id") != team_id
+                    or reference_validation.known_at is None
+                    or reference_validation.known_at > known_at
+                    or reference_validation.observed_at > generated_at
+                ):
+                    raise ArchiveConflictError(
+                        "reference lineup source does not match lineup delta context"
+                    )
+                reference_source_ids = tuple(reference_validation.value)
+                if tuple(raw_reference or ()) != reference_source_ids:
+                    raise ArchiveConflictError(
+                        "reference lineup IDs do not match referenced lineup source"
+                    )
+                nested_reference_refs.add(raw_reference_ref)
+            required_players = set(starters) | set(reference or ())
+            if set(profile_refs) - required_players:
+                raise ArchiveConflictError("lineup profile refs contain players outside the XI")
+            profiles: list[PlayerProfile] = []
+            for player_id, profile_ref in sorted(profile_refs.items()):
+                profile, manifest = self._load_player_profile_with_manifest(profile_ref)
+                if (
+                    profile.player_id != player_id
+                    or profile.team_id != team_id
+                    or profile.as_of > known_at
+                    or manifest.generated_at > generated_at
+                ):
+                    raise ArchiveConflictError(
+                        "lineup player profile identity or time does not match evidence"
+                    )
+                profiles.append(profile)
+                nested_profile_refs.add(profile_ref)
+            try:
+                expected = lineup_delta_input_payload(
+                    starter_ids=starters,
+                    reference_starter_ids=reference,
+                    profiles=tuple(profiles),
+                    profile_window=item["profile_window"],
+                    profile_window_version=item["profile_window_version"],
+                    lineup_input_refs=lineup_refs,
+                    reference_lineup_ref=raw_reference_ref,
+                )
+                delta = parse_lineup_delta_payload(item)
+            except (TypeError, ValueError) as error:
+                raise ArchiveConflictError("lineup-delta-input/3 cannot be recomputed") from error
+            if _canonical_json(expected) != _canonical_json(item):
+                raise ArchiveConflictError(
+                    "lineup-delta-input/3 does not match recomputed profiles"
+                )
+            if delta.quality_status == "ready" and any(
+                profile.quality_status != "ready" for profile in profiles
+            ):
+                raise ArchiveConflictError("ready lineup delta requires ready player profiles")
+        if nested_profile_refs | nested_lineup_refs | nested_reference_refs != set(input_refs):
+            raise ArchiveConflictError("lineup delta nested refs do not match source input_refs")
 
     def _validate_team_baseline_source(
         self, value: Any, input_refs: tuple[str, ...]
@@ -1183,6 +1715,13 @@ def _parse_manifest_datetime(value: Any, field_name: str) -> datetime:
         return parsed.astimezone(UTC)
     except (TypeError, ValueError) as error:
         raise ArchiveConflictError(f"invalid manifest {field_name}") from error
+
+
+def _snapshot_source_ref_value(reference: RawAssetId | str) -> str:
+    value = reference.value if isinstance(reference, RawAssetId) else reference
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError("snapshot source input_refs must contain typed references")
+    return value
 
 
 def _manifest_digest(value: str, prefix: str) -> str:

@@ -234,7 +234,7 @@ def _fixture(tmp_path: Path):
         input_refs=(),
         expected_goals=compose_expected_goals(1.7, 0.8),
     )
-    derived.write_prediction(prediction)
+    derived.write_prediction(prediction, snapshot=snapshot)
     market_asset = raw.archive(
         b'{"market":"result_90"}',
         source="bookmaker",

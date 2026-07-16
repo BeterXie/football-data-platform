@@ -11,6 +11,7 @@ from football_data_platform.domain.ids import CompetitionId, SeasonId
 from football_data_platform.domain.lifecycle import Qualification, assess_lifecycle
 from football_data_platform.domain.models import MatchStatus
 from football_data_platform.domain.predictions import MatchResult90
+from football_data_platform.sources.prematch import SourceDescriptor, SourceKind, SourceRegistry
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
@@ -64,7 +65,15 @@ def fact_context(tmp_path: Path):
         observed_at=NOW,
         raw_asset_id=asset.id,
     )
-    return canonical, CanonicalFactStore(canonical), asset, teams, match, version
+    source_registry = SourceRegistry((SourceDescriptor("fbref", SourceKind.NEWS, "fbref"),))
+    return (
+        canonical,
+        CanonicalFactStore(canonical, source_registry=source_registry),
+        asset,
+        teams,
+        match,
+        version,
+    )
 
 
 def test_result_and_team_observations_are_versioned_and_idempotent(fact_context) -> None:
@@ -153,8 +162,8 @@ def test_missing_is_preserved_and_readiness_explains_it(fact_context) -> None:
 def test_unconfirmed_event_cannot_modify_features(fact_context) -> None:
     canonical, facts, asset, teams, match, _ = fact_context
     evidence = facts.add_news_evidence(
-        source="club-site",
-        url="https://club.example/news",
+        source="fbref",
+        url="https://fbref.example/report-1",
         title="Training update",
         published_at=NOW - timedelta(hours=2),
         observed_at=NOW,
@@ -319,7 +328,7 @@ def test_player_observation_and_lineup_reject_cross_team_assignment(fact_context
             team_id=teams[1].id,
             player_id=player.id,
             lineup_role="starter",
-            official=True,
+            official=False,
             known_at=NOW,
             observed_at=NOW,
             raw_asset_id=asset.id,
@@ -351,10 +360,43 @@ def test_lineup_rejects_a_non_participant_team(fact_context) -> None:
             team_id=foreign.id,
             player_id=player.id,
             lineup_role="starter",
+            official=False,
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_lineup_fact_rejects_caller_claimed_official_provenance(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="forged-official-player",
+        canonical_name="Forged Official Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="append_official_lineup"):
+        facts.append_lineup_fact(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[0].id,
+            player_id=player.id,
+            lineup_role="starter",
             official=True,
             known_at=NOW,
             observed_at=NOW,
             raw_asset_id=asset.id,
+        )
+
+    with canonical.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM lineup_facts WHERE player_id = ?",
+                (player.id.value,),
+            ).fetchone()[0]
+            == 0
         )
 
 
@@ -369,8 +411,8 @@ def test_prematch_event_rejects_a_non_participant_team(fact_context) -> None:
         raw_asset_id=asset.id,
     )
     evidence = facts.add_news_evidence(
-        source="club-site",
-        url="https://club.example/foreign-event",
+        source="fbref",
+        url="https://fbref.example/report-1",
         title="Foreign event",
         published_at=NOW - timedelta(hours=1),
         observed_at=NOW,
@@ -382,6 +424,70 @@ def test_prematch_event_rejects_a_non_participant_team(fact_context) -> None:
             match_id=match.id,
             team_id=foreign.id,
             player_id=None,
+            event_type="injury",
+            occurred_at=None,
+            known_at=NOW,
+            confirmation_status="unconfirmed",
+            evidence_refs=(evidence.record_id,),
+        )
+
+
+def test_prematch_event_rejects_registered_player_without_match_assignment(
+    fact_context,
+) -> None:
+    canonical, facts, asset, _, match, _ = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="unassigned-event-player",
+        canonical_name="Unassigned Event Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    evidence = facts.add_news_evidence(
+        source="fbref",
+        url="https://fbref.example/report-1",
+        title="Unassigned player event",
+        published_at=NOW - timedelta(hours=1),
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="has no assignment for match"):
+        facts.add_prematch_event(
+            match_id=match.id,
+            team_id=None,
+            player_id=player.id,
+            event_type="injury",
+            occurred_at=None,
+            known_at=NOW,
+            confirmation_status="unconfirmed",
+            evidence_refs=(evidence.record_id,),
+        )
+
+
+def test_prematch_event_rejects_team_without_matching_player_assignment(fact_context) -> None:
+    canonical, facts, asset, teams, match, _ = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="unassigned-team-event-player",
+        canonical_name="Unassigned Team Event Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    evidence = facts.add_news_evidence(
+        source="fbref",
+        url="https://fbref.example/report-1",
+        title="Unassigned team player event",
+        published_at=NOW - timedelta(hours=1),
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="has no assignment for match"):
+        facts.add_prematch_event(
+            match_id=match.id,
+            team_id=teams[0].id,
+            player_id=player.id,
             event_type="injury",
             occurred_at=None,
             known_at=NOW,

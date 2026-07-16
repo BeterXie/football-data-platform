@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId
+from football_data_platform.domain.ids import MatchId, ModelRunId, PlayerId, RawAssetId
 from football_data_platform.domain.lifecycle import (
     SnapshotAvailability,
     assess_lifecycle,
@@ -37,7 +37,10 @@ from football_data_platform.features.contributions import (
     context_contribution,
     lineup_delta_contributions,
 )
-from football_data_platform.features.lineup import build_lineup_delta
+from football_data_platform.features.lineup import (
+    LINEUP_DELTA_INPUT_TRANSFORM_V3,
+    lineup_delta_input_payload,
+)
 from football_data_platform.features.player_profiles import (
     PlayerMatchObservation,
     build_player_profiles,
@@ -58,6 +61,12 @@ from football_data_platform.reporting.vertical_slice import (
     write_static_report,
 )
 from football_data_platform.sources.fbref import schedule_url
+from football_data_platform.sources.prematch import (
+    OfficialLineupDTO,
+    SourceDescriptor,
+    SourceKind,
+    SourceRegistry,
+)
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
@@ -191,6 +200,7 @@ def _run_offline_vertical_slice(
         observed_at=observed_at,
         archive=archive,
         canonical=canonical,
+        required_tables=("summary",),
     )
     result_fact = facts.append_result_90(
         match_id=second_match_id,
@@ -207,17 +217,32 @@ def _run_offline_vertical_slice(
         raise ValueError("unsupported lineup fixture schema")
     lineup_known_at = _parse_timestamp(lineup_payload["published_at"])
     schedule_known_at = _parse_timestamp(lineup_payload["schedule_published_at"])
+    lineup_source = str(lineup_payload["source"])
+    lineup_url = "fixture://official-lineups"
     lineup_asset = archive.archive(
         lineups_file.read_bytes(),
-        source=str(lineup_payload["source"]),
+        source=lineup_source,
         source_id=second_fixture.source_fixture_id,
-        url="fixture://official-lineups",
+        url=lineup_url,
         observed_at=observed_at,
         target_event_time=lineup_known_at,
         collector_version="manual-lineup-import/1",
         media_type="application/json",
     )
     canonical.register_raw_asset(lineup_asset)
+    official_lineup_facts = CanonicalFactStore(
+        canonical,
+        source_registry=SourceRegistry(
+            (
+                SourceDescriptor(
+                    lineup_source,
+                    SourceKind.OFFICIAL_LINEUP,
+                    lineup_source,
+                    official=True,
+                ),
+            )
+        ),
+    )
     lineup_features: list[SnapshotFeature] = []
     lineup_player_ids_by_team: dict[str, tuple[str, ...]] = {}
     for team_payload in lineup_payload["teams"]:
@@ -232,25 +257,30 @@ def _run_offline_vertical_slice(
                 raw_asset_id=lineup_asset.id,
             )
             player_ids.append(player.id.value)
-            facts.append_lineup_fact(
+        if len(player_ids) != 11:
+            raise ValueError(f"official lineup for {team.id} must contain 11 starters")
+        official_lineup_facts.append_official_lineup(
+            OfficialLineupDTO(
                 match_id=second_match_id,
                 match_version=1,
                 team_id=team.id,
-                player_id=player.id,
-                lineup_role="starter",
-                official=True,
-                known_at=lineup_known_at,
+                player_ids=tuple(PlayerId(player_id) for player_id in player_ids),
+                source=lineup_source,
+                published_at=lineup_known_at,
                 observed_at=observed_at,
                 raw_asset_id=lineup_asset.id,
+                url=lineup_url,
             )
-        if len(player_ids) != 11:
-            raise ValueError(f"official lineup for {team.id} must contain 11 starters")
+        )
         lineup_player_ids_by_team[team.id.value] = tuple(player_ids)
-        lineup_source_ref = derived.write_snapshot_source(
-            value=player_ids,
-            input_refs=(lineup_asset.id,),
-            transform_version="official-lineup-input/1",
-            generated_at=observed_at,
+        lineup_source_ref = derived.write_official_lineup_source(
+            match_id=second_match_id,
+            match_version=1,
+            team_id=team.id,
+            player_ids=tuple(PlayerId(player_id) for player_id in player_ids),
+            known_at=lineup_known_at,
+            observed_at=observed_at,
+            raw_asset_id=lineup_asset.id,
         )
         lineup_features.append(
             SnapshotFeature(
@@ -365,33 +395,27 @@ def _run_offline_vertical_slice(
         snapshot_type=SnapshotType.T24H,
         as_of=t24_as_of,
         scheduled_kickoff_used=second_fixture.kickoff_at,
-        feature_spec_version="prematch-features/1",
+        feature_spec_version="prematch-features/2",
         features=(baseline_feature, context_feature),
         home_team_id=second_home.id,
         away_team_id=second_away.id,
         source_validator=derived,
     )
-    lineup_deltas = {
-        team_id: build_lineup_delta(
+    lineup_delta_value = {
+        team_id: lineup_delta_input_payload(
             starter_ids=player_ids,
             reference_starter_ids=None,
-            player_values=(),
+            profiles=(),
+            lineup_input_refs=(lineup_asset.id.value,),
         )
         for team_id, player_ids in lineup_player_ids_by_team.items()
     }
-    lineup_delta_value = {
-        team_id: {
-            "quality_status": delta.quality_status,
-            "dimension_deltas": delta.dimension_deltas,
-            "missing_fields": list(delta.missing_fields),
-        }
-        for team_id, delta in lineup_deltas.items()
-    }
     lineup_delta_source_ref = derived.write_snapshot_source(
         value=lineup_delta_value,
-        input_refs=(lineup_asset.id, RawAssetId(report_ingest.raw_asset_id)),
-        transform_version="lineup-delta-input/1",
+        input_refs=(lineup_asset.id,),
+        transform_version=LINEUP_DELTA_INPUT_TRANSFORM_V3,
         generated_at=observed_at,
+        known_at=lineup_known_at,
     )
     lineup_delta_feature = SnapshotFeature(
         name="lineup_delta",
@@ -406,7 +430,7 @@ def _run_offline_vertical_slice(
         snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
         as_of=lineup_known_at,
         scheduled_kickoff_used=second_fixture.kickoff_at,
-        feature_spec_version="prematch-features/1",
+        feature_spec_version="prematch-features/2",
         features=(
             baseline_feature,
             context_feature,
@@ -431,6 +455,7 @@ def _run_offline_vertical_slice(
         home_team_id=second_home.id.value,
         away_team_id=second_away.id.value,
         source_ref=lineup_delta_source_ref,
+        source_validator=derived,
     )
     lineups_composition = compose_expected_goals(
         lambda_home,
@@ -576,7 +601,7 @@ def _run_offline_vertical_slice(
         expected_goals=composition,
         calibration_versions=composition_calibration_versions,
     )
-    derived.write_prediction(prediction)
+    derived.write_prediction(prediction, snapshot=prediction_snapshot)
     evaluation = evaluate_prediction(
         prediction,
         MatchResult90(
@@ -599,6 +624,7 @@ def _run_offline_vertical_slice(
         season,
         canonical=canonical,
         source="fbref",
+        archive=archive,
     )
     first_lifecycle = assess_lifecycle(
         facts.availability(first_match_id, as_of=observed_at),
@@ -617,7 +643,7 @@ def _run_offline_vertical_slice(
         snapshot_validator=derived,
     )
     run_identity = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "offline-golden-replay",
         "observed_at": _timestamp(observed_at),
         "snapshot_ids": [t24_snapshot.id.value, lineups_snapshot.id.value],
@@ -634,7 +660,7 @@ def _run_offline_vertical_slice(
         started_at=observed_at,
         ended_at=observed_at,
         generated_at=observed_at,
-        transform_version="vertical-slice/3",
+        transform_version="vertical-slice/4",
         code_version=DERIVED_CODE_VERSION,
         input_refs=(
             schedule_ingest.raw_asset_id,
@@ -671,15 +697,28 @@ def _run_offline_vertical_slice(
         payload=run_identity,
     )
     run_id = run_manifest.run_id
+    coverage_payload = asdict(coverage)
+    coverage_payload["fixture_coverage"] = [item.to_payload() for item in coverage.fixture_coverage]
+    coverage_payload["schedule_complete"] = coverage.schedule_complete
+    coverage_payload["complete"] = coverage.complete
+    coverage_payload["attempt_coverage_complete"] = coverage.attempt_coverage_complete
+    coverage_payload["report_collection_complete"] = coverage.report_collection_complete
+    coverage_payload["fixture_status_counts"] = coverage.fixture_status_counts
+    coverage_payload["missing_fixture_ids"] = coverage.missing_fixture_ids
+    coverage_payload["pending_fixture_ids"] = coverage.pending_fixture_ids
+    coverage_payload["blocked_fixture_ids"] = coverage.blocked_fixture_ids
+    coverage_payload["failed_fixture_ids"] = coverage.failed_fixture_ids
+    coverage_payload["succeeded_fixture_ids"] = coverage.succeeded_fixture_ids
+    coverage_payload["attempted_fixture_ids"] = coverage.attempted_fixture_ids
+    coverage_payload["attempt_identity_mismatch_fixture_ids"] = (
+        coverage.attempt_identity_mismatch_fixture_ids
+    )
+    coverage_payload["report_contract_diagnostics"] = coverage.report_contract_diagnostics
     summary = {
         **run_identity,
         "run_id": run_id,
         "canonical_counts": canonical.counts(),
-        "coverage": {
-            **asdict(coverage),
-            "schedule_complete": coverage.schedule_complete,
-            "complete": coverage.complete,
-        },
+        "coverage": coverage_payload,
         "snapshots": [
             _snapshot_summary(t24_snapshot),
             _snapshot_summary(lineups_snapshot),
@@ -865,7 +904,7 @@ def _write_failed_run_manifest(
             started_at=observed_at,
             ended_at=observed_at,
             generated_at=observed_at,
-            transform_version="vertical-slice/3",
+            transform_version="vertical-slice/4",
             code_version=DERIVED_CODE_VERSION,
             input_refs=input_refs,
             output_refs=(),

@@ -12,12 +12,18 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
+
+from football_data_platform.features.lineup import LINEUP_DELTA_INPUT_TRANSFORM_V3
 
 EXPECTED_GOALS_COMPOSITION_VERSION = "expected-goals-composition/1"
 EXPECTED_GOALS_CONTRIBUTION_VERSION = "expected-goals-contribution/1"
 LINEUP_CALIBRATION_VERSION = "lineup-delta-calibration/1"
 CONTEXT_CALIBRATION_VERSION = "match-context-calibration/1"
+
+
+class LineupDeltaSourceValidator(Protocol):
+    def validate_snapshot_source(self, source_ref: str) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +140,7 @@ def lineup_delta_contributions(
     home_team_id: str,
     away_team_id: str,
     source_ref: str,
+    source_validator: LineupDeltaSourceValidator | None = None,
     coefficient: float = 0.05,
     version: str = LINEUP_CALIBRATION_VERSION,
 ) -> tuple[ExpectedGoalsContribution, ...]:
@@ -152,6 +159,22 @@ def lineup_delta_contributions(
         raise ValueError("lineup contribution requires distinct match teams")
     _require_version(version)
     _require_source(source_ref)
+    ready_payloads = tuple(
+        payload
+        for payload in deltas.values()
+        if isinstance(payload, Mapping) and payload.get("quality_status") == "ready"
+    )
+    if ready_payloads:
+        if source_validator is None:
+            raise ValueError("ready lineup delta requires a persisted source validator")
+        validation = source_validator.validate_snapshot_source(source_ref)
+        if (
+            validation.source_ref != source_ref
+            or validation.source_kind != "derived"
+            or validation.transform_version != LINEUP_DELTA_INPUT_TRANSFORM_V3
+            or validation.value != dict(deltas)
+        ):
+            raise ValueError("ready lineup delta does not match its validated source")
     contributions: list[ExpectedGoalsContribution] = []
     attack_dimensions = {"attack", "goals", "xg", "shots", "shots_on_target", "key_passes"}
     defense_dimensions = {

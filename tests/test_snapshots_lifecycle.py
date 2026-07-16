@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from football_data_platform.domain.ids import MatchId, SnapshotId, TeamId
+from football_data_platform.config import load_competition_registry
+from football_data_platform.domain import snapshots as snapshot_contract
+from football_data_platform.domain.ids import (
+    CompetitionId,
+    MatchId,
+    PlayerId,
+    SeasonId,
+    SnapshotId,
+    TeamId,
+)
 from football_data_platform.domain.lifecycle import (
     LifecycleState,
     MatchAvailability,
@@ -19,9 +28,14 @@ from football_data_platform.domain.models import MatchStatus
 from football_data_platform.domain.snapshots import (
     CaptureMode,
     SnapshotFeature,
+    SnapshotSourceValidation,
     SnapshotType,
     build_snapshot,
     verify_snapshot,
+)
+from football_data_platform.features.lineup import (
+    LINEUP_DELTA_INPUT_TRANSFORM_V3,
+    lineup_delta_input_payload,
 )
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
@@ -29,15 +43,57 @@ from football_data_platform.features.team_baseline import (
     expected_goals_from_baseline,
     team_baseline_payload,
 )
+from football_data_platform.sources.prematch import (
+    OfficialLineupDTO,
+    SourceDescriptor,
+    SourceKind,
+    SourceRegistry,
+)
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
+from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
-from football_data_platform.storage.raw import ChecksumMismatchError, RawArchive
+from football_data_platform.storage.raw import (
+    ArchiveConflictError,
+    ChecksumMismatchError,
+    RawArchive,
+)
 
 KICKOFF = datetime(2025, 8, 16, 14, 0, tzinfo=UTC)
 OBSERVED_AT = KICKOFF + timedelta(days=1)
 HOME = TeamId("team:home")
 AWAY = TeamId("team:away")
 MATCH = MatchId("match:test")
+ROOT = Path(__file__).parents[1]
+
+
+def _official_lineup_fact_store(canonical: CanonicalStore) -> CanonicalFactStore:
+    return CanonicalFactStore(
+        canonical,
+        source_registry=SourceRegistry(
+            (
+                SourceDescriptor(
+                    "official-lineup-test",
+                    SourceKind.OFFICIAL_LINEUP,
+                    "official-lineup-test",
+                    official=True,
+                ),
+            )
+        ),
+    )
+
+
+class _CompositeSnapshotValidator:
+    def __init__(
+        self,
+        derived: DerivedArchive,
+        overrides: dict[str, SnapshotSourceValidation],
+    ) -> None:
+        self.derived = derived
+        self.overrides = overrides
+
+    def validate_snapshot_source(self, source_ref: str) -> SnapshotSourceValidation:
+        return self.overrides.get(source_ref) or self.derived.validate_snapshot_source(source_ref)
 
 
 def _stores(tmp_path: Path, *, observed_at: datetime = OBSERVED_AT):
@@ -56,6 +112,115 @@ def _stores(tmp_path: Path, *, observed_at: datetime = OBSERVED_AT):
     return raw, DerivedArchive(layout), asset
 
 
+def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
+    layout = DataLayout(tmp_path / "strict-data")
+    observed_at = KICKOFF - timedelta(hours=1)
+    raw = RawArchive(layout)
+    asset = raw.archive(
+        b"official lineup evidence",
+        source="official-lineup-test",
+        source_id="official-lineup",
+        url="fixture://official-lineup",
+        observed_at=observed_at,
+        target_event_time=KICKOFF,
+        collector_version="test/1",
+        media_type="application/json",
+    )
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    canonical.initialize()
+    canonical.register_registry(
+        load_competition_registry(ROOT / "config" / "competitions.toml"),
+        registered_at=observed_at,
+    )
+    canonical.register_raw_asset(asset)
+    teams = tuple(
+        canonical.resolve_or_create_team(
+            source="fbref",
+            source_id=f"strict-team-{index}",
+            canonical_name=f"Strict Team {index}",
+            competition_id=CompetitionId("competition:eng.1"),
+            observed_at=observed_at,
+            raw_asset_id=asset.id,
+        )
+        for index in range(2)
+    )
+    match, version = canonical.resolve_or_create_match(
+        source="fbref-schedule",
+        source_id="strict-fixture",
+        competition_id=CompetitionId("competition:eng.1"),
+        season_id=SeasonId("season:eng.1.2025-26"),
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        kickoff_at=KICKOFF,
+        status=MatchStatus.SCHEDULED,
+        observed_at=observed_at,
+        raw_asset_id=asset.id,
+    )
+    players = tuple(
+        canonical.resolve_or_create_player(
+            source="official-lineup-test",
+            source_id=f"strict-player-{index}",
+            canonical_name=f"Strict Player {index}",
+            observed_at=observed_at,
+            raw_asset_id=asset.id,
+        ).id
+        for index in range(11)
+    )
+    facts = _official_lineup_fact_store(canonical)
+    facts.append_official_lineup(
+        OfficialLineupDTO(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[0].id,
+            player_ids=players,
+            source="official-lineup-test",
+            published_at=observed_at,
+            observed_at=observed_at,
+            raw_asset_id=asset.id,
+            url="fixture://official-lineup",
+        )
+    )
+    if fact_count < len(players):
+        with canonical.connect() as connection:
+            placeholders = ",".join("?" for _ in players[fact_count:])
+            connection.execute(
+                "DELETE FROM lineup_facts WHERE match_id = ? AND team_id = ? "
+                f"AND player_id IN ({placeholders})",
+                (
+                    match.id.value,
+                    teams[0].id.value,
+                    *(player_id.value for player_id in players[fact_count:]),
+                ),
+            )
+    return canonical, raw, DerivedArchive(layout), asset, teams, match, version, players
+
+
+def _ready_delta_item(
+    player_ids: tuple[PlayerId, ...],
+    raw_ref: str,
+    profile_ref: str,
+    reference_lineup_ref: str,
+) -> dict:
+    return {
+        "quality_status": "ready",
+        "dimension_deltas": {"attack": 0.0},
+        "missing_fields": [],
+        "input_refs": [profile_ref],
+        "not_applicable_fields": [],
+        "blocking_reasons": [],
+        "transform_version": "lineup-delta/2",
+        "role_contract_versions": ["lineup-role-metrics/1"],
+        "dimension_sample_sizes": {"attack": [11, 11]},
+        "starter_ids": [player_id.value for player_id in player_ids],
+        "reference_starter_ids": [player_id.value for player_id in player_ids],
+        "player_profile_refs": {player_id.value: profile_ref for player_id in player_ids},
+        "profile_window": "recent_form",
+        "profile_window_version": "recent/1",
+        "lineup_input_refs": [raw_ref],
+        "reference_lineup_ref": reference_lineup_ref,
+    }
+
+
 def _source(derived: DerivedArchive, asset, value, transform: str) -> str:
     return derived.write_snapshot_source(
         value=value,
@@ -63,6 +228,290 @@ def _source(derived: DerivedArchive, asset, value, transform: str) -> str:
         transform_version=transform,
         generated_at=asset.observed_at,
     )
+
+
+def test_official_lineup_v2_round_trips_exact_canonical_facts(tmp_path: Path) -> None:
+    _, _, derived, asset, teams, match, version, players = _strict_official_lineup_context(tmp_path)
+
+    source_ref = derived.write_official_lineup_source(
+        match_id=match.id,
+        match_version=version.version,
+        team_id=teams[0].id,
+        player_ids=players,
+        known_at=asset.observed_at,
+        observed_at=asset.observed_at,
+        raw_asset_id=asset.id,
+    )
+
+    validation = derived.validate_snapshot_source(source_ref)
+    assert validation.transform_version == "official-lineup-input/2"
+    assert validation.value == [player_id.value for player_id in players]
+    assert validation.source_context == {
+        "match_id": match.id.value,
+        "match_version": version.version,
+        "team_id": teams[0].id.value,
+        "player_ids": [player_id.value for player_id in players],
+        "known_at": asset.observed_at.isoformat().replace("+00:00", "Z"),
+        "observed_at": asset.observed_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("raw", "match", "version", "team", "players", "known_at", "observed_at"),
+)
+def test_official_lineup_v2_rejects_noncanonical_context(tmp_path: Path, mismatch: str) -> None:
+    canonical, raw, derived, asset, teams, match, version, players = (
+        _strict_official_lineup_context(tmp_path)
+    )
+    arguments = {
+        "match_id": match.id,
+        "match_version": version.version,
+        "team_id": teams[0].id,
+        "player_ids": players,
+        "known_at": asset.observed_at,
+        "observed_at": asset.observed_at,
+        "raw_asset_id": asset.id,
+    }
+    if mismatch == "raw":
+        unrelated = raw.archive(
+            b"unrelated report or news evidence",
+            source="news-test",
+            source_id="unrelated-report",
+            url="fixture://unrelated-report",
+            observed_at=asset.observed_at,
+            target_event_time=KICKOFF,
+            collector_version="test/1",
+            media_type="text/html",
+        )
+        canonical.register_raw_asset(unrelated)
+        arguments["raw_asset_id"] = unrelated.id
+    elif mismatch == "match":
+        arguments["match_id"] = MatchId("match:wrong")
+    elif mismatch == "version":
+        arguments["match_version"] = version.version + 1
+    elif mismatch == "team":
+        arguments["team_id"] = teams[1].id
+    elif mismatch == "players":
+        arguments["player_ids"] = (*players[:-1], PlayerId("player:wrong"))
+    elif mismatch == "known_at":
+        arguments["known_at"] = asset.observed_at - timedelta(minutes=1)
+    else:
+        arguments["observed_at"] = asset.observed_at + timedelta(minutes=1)
+
+    with pytest.raises(ArchiveConflictError, match="canonical lineup facts"):
+        derived.write_official_lineup_source(**arguments)
+
+
+def test_official_lineup_v2_rejects_missing_canonical_starter_fact(tmp_path: Path) -> None:
+    _, _, derived, asset, teams, match, version, players = _strict_official_lineup_context(
+        tmp_path, fact_count=10
+    )
+
+    with pytest.raises(ArchiveConflictError, match="canonical lineup facts"):
+        derived.write_official_lineup_source(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[0].id,
+            player_ids=players,
+            known_at=asset.observed_at,
+            observed_at=asset.observed_at,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_ready_lineup_snapshot_accepts_strict_official_sources_and_ready_delta(
+    tmp_path: Path,
+) -> None:
+    canonical, _, derived, asset, teams, match, version, home_players = (
+        _strict_official_lineup_context(tmp_path)
+    )
+    facts = _official_lineup_fact_store(canonical)
+    away_players = tuple(
+        canonical.resolve_or_create_player(
+            source="official-lineup-test",
+            source_id=f"strict-away-player-{index}",
+            canonical_name=f"Strict Away Player {index}",
+            observed_at=asset.observed_at,
+            raw_asset_id=asset.id,
+        ).id
+        for index in range(11)
+    )
+    facts.append_official_lineup(
+        OfficialLineupDTO(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[1].id,
+            player_ids=away_players,
+            source="official-lineup-test",
+            published_at=asset.observed_at,
+            observed_at=asset.observed_at,
+            raw_asset_id=asset.id,
+            url="fixture://official-lineup",
+        )
+    )
+    official_sources = {
+        team.id.value: derived.write_official_lineup_source(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=team.id,
+            player_ids=players,
+            known_at=asset.observed_at,
+            observed_at=asset.observed_at,
+            raw_asset_id=asset.id,
+        )
+        for team, players in zip(teams, (home_players, away_players), strict=True)
+    }
+    baseline_ref = "derived-source:" + "a" * 64
+    context_ref = "derived-source:" + "b" * 64
+    delta_ref = "derived-source:" + "c" * 64
+    baseline = {
+        "artifact_id": "team-baseline:" + "a" * 64,
+        "lambda_home": 1.5,
+        "lambda_away": 1.0,
+    }
+    context = {"days_since_previous_match": 6.0}
+    home_profile_ref = "player-profile:" + "d" * 64
+    away_profile_ref = "player-profile:" + "e" * 64
+    delta = {
+        teams[0].id.value: _ready_delta_item(
+            home_players,
+            asset.id.value,
+            home_profile_ref,
+            official_sources[teams[0].id.value],
+        ),
+        teams[1].id.value: _ready_delta_item(
+            away_players,
+            asset.id.value,
+            away_profile_ref,
+            official_sources[teams[1].id.value],
+        ),
+    }
+    overrides = {
+        baseline_ref: SnapshotSourceValidation(
+            baseline_ref,
+            "derived",
+            "team-baseline-input/2",
+            asset.observed_at,
+            baseline,
+            (asset.id.value,),
+        ),
+        context_ref: SnapshotSourceValidation(
+            context_ref,
+            "derived",
+            "match-context-input/1",
+            asset.observed_at,
+            context,
+            (asset.id.value,),
+        ),
+        delta_ref: SnapshotSourceValidation(
+            delta_ref,
+            "derived",
+            LINEUP_DELTA_INPUT_TRANSFORM_V3,
+            asset.observed_at,
+            delta,
+            tuple(sorted((asset.id.value, home_profile_ref, away_profile_ref))),
+            asset.observed_at,
+        ),
+    }
+    features = (
+        SnapshotFeature("team_baseline", baseline, asset.observed_at, baseline_ref, "baseline"),
+        SnapshotFeature("match_context", context, asset.observed_at, context_ref, "context"),
+        SnapshotFeature("lineup_delta", delta, asset.observed_at, delta_ref, "lineup-delta"),
+        *(
+            SnapshotFeature(
+                "official_lineup_confirmed",
+                [player_id.value for player_id in players],
+                asset.observed_at,
+                official_sources[team.id.value],
+                f"official-lineup:{team.id.value}",
+                team.id.value,
+            )
+            for team, players in zip(teams, (home_players, away_players), strict=True)
+        ),
+    )
+
+    snapshot = build_snapshot(
+        match_id=match.id,
+        match_version=version.version,
+        snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+        as_of=asset.observed_at,
+        scheduled_kickoff_used=KICKOFF,
+        feature_spec_version="prematch-features/2",
+        features=features,
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        source_validator=_CompositeSnapshotValidator(derived, overrides),
+    )
+
+    assert snapshot.quality_status == "ready"
+
+
+def test_ready_lineup_snapshot_rejects_legacy_official_sources(tmp_path: Path) -> None:
+    _, derived, asset = _stores(tmp_path)
+    as_of = KICKOFF - timedelta(hours=1)
+    home_players = tuple(PlayerId(f"player:home-{index}") for index in range(11))
+    away_players = tuple(PlayerId(f"player:away-{index}") for index in range(11))
+    home_reference_ref = "derived-source:" + "f" * 64
+    away_reference_ref = "derived-source:" + "9" * 64
+    official = tuple(
+        _lineup_feature(
+            derived,
+            asset,
+            team_id=team_id,
+            value=[player_id.value for player_id in players],
+            known_at=as_of,
+        )
+        for team_id, players in ((HOME, home_players), (AWAY, away_players))
+    )
+    delta_ref = "derived-source:" + "c" * 64
+    delta = {
+        HOME.value: _ready_delta_item(
+            home_players,
+            asset.id.value,
+            "player-profile:" + "d" * 64,
+            home_reference_ref,
+        ),
+        AWAY.value: _ready_delta_item(
+            away_players,
+            asset.id.value,
+            "player-profile:" + "e" * 64,
+            away_reference_ref,
+        ),
+    }
+    validation = SnapshotSourceValidation(
+        delta_ref,
+        "derived",
+        LINEUP_DELTA_INPUT_TRANSFORM_V3,
+        asset.observed_at,
+        delta,
+        (
+            asset.id.value,
+            home_reference_ref,
+            away_reference_ref,
+            "player-profile:" + "d" * 64,
+            "player-profile:" + "e" * 64,
+        ),
+        as_of,
+    )
+
+    with pytest.raises(ValueError, match="requires official-lineup-input/2"):
+        build_snapshot(
+            match_id=MATCH,
+            match_version=1,
+            snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+            as_of=as_of,
+            scheduled_kickoff_used=KICKOFF,
+            feature_spec_version="prematch-features/2",
+            features=(
+                *_t24_features(derived, asset),
+                SnapshotFeature("lineup_delta", delta, as_of, delta_ref, "lineup-delta"),
+                *official,
+            ),
+            home_team_id=HOME,
+            away_team_id=AWAY,
+            source_validator=_CompositeSnapshotValidator(derived, {delta_ref: validation}),
+        )
 
 
 def _t24_features(
@@ -259,6 +708,33 @@ def _lineup_feature(
     )
 
 
+def _v3_lineup_delta_feature(
+    derived: DerivedArchive,
+    asset,
+    *,
+    home_starters: tuple[str, ...],
+    away_starters: tuple[str, ...],
+    known_at: datetime,
+) -> SnapshotFeature:
+    value = {
+        team_id.value: lineup_delta_input_payload(
+            starter_ids=starters,
+            reference_starter_ids=None,
+            profiles=(),
+            lineup_input_refs=(asset.id.value,),
+        )
+        for team_id, starters in ((HOME, home_starters), (AWAY, away_starters))
+    }
+    source_ref = derived.write_snapshot_source(
+        value=value,
+        input_refs=(asset.id,),
+        transform_version=LINEUP_DELTA_INPUT_TRANSFORM_V3,
+        generated_at=asset.observed_at,
+        known_at=known_at,
+    )
+    return SnapshotFeature("lineup_delta", value, known_at, source_ref, "lineup-delta")
+
+
 def test_lineups_snapshot_requires_both_official_lineups(tmp_path: Path) -> None:
     _, derived, asset = _stores(tmp_path)
     as_of = KICKOFF - timedelta(hours=1)
@@ -277,7 +753,7 @@ def test_lineups_snapshot_requires_both_official_lineups(tmp_path: Path) -> None
             snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
             as_of=as_of,
             scheduled_kickoff_used=KICKOFF,
-            feature_spec_version="prematch-features/1",
+            feature_spec_version="prematch-features/2",
             features=(*_t24_features(derived, asset), home),
             home_team_id=HOME,
             away_team_id=AWAY,
@@ -301,7 +777,7 @@ def test_lineups_snapshot_rejects_null_or_invalid_player_ids(tmp_path: Path) -> 
         "snapshot_type": SnapshotType.LINEUPS_CONFIRMED,
         "as_of": as_of,
         "scheduled_kickoff_used": KICKOFF,
-        "feature_spec_version": "prematch-features/1",
+        "feature_spec_version": "prematch-features/2",
         "home_team_id": HOME,
         "away_team_id": AWAY,
         "source_validator": derived,
@@ -320,6 +796,199 @@ def test_lineups_snapshot_rejects_null_or_invalid_player_ids(tmp_path: Path) -> 
                 features=(*_t24_features(derived, asset), home, away),
                 **arguments,
             )
+
+
+def test_lineups_snapshot_rejects_delta_starters_different_from_official_xi(
+    tmp_path: Path,
+) -> None:
+    _, derived, asset = _stores(tmp_path)
+    as_of = KICKOFF - timedelta(hours=1)
+    home_players = tuple(f"player:home-{index}" for index in range(11))
+    away_players = tuple(f"player:away-{index}" for index in range(11))
+    delta_home = (*home_players[:-1], "player:home-replacement")
+    home = _lineup_feature(derived, asset, team_id=HOME, value=list(home_players), known_at=as_of)
+    away = _lineup_feature(derived, asset, team_id=AWAY, value=list(away_players), known_at=as_of)
+    delta = _v3_lineup_delta_feature(
+        derived,
+        asset,
+        home_starters=delta_home,
+        away_starters=away_players,
+        known_at=as_of,
+    )
+
+    with pytest.raises(ValueError, match="starter_ids do not match official lineup"):
+        build_snapshot(
+            match_id=MATCH,
+            match_version=1,
+            snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+            as_of=as_of,
+            scheduled_kickoff_used=KICKOFF,
+            feature_spec_version="prematch-features/2",
+            features=(*_t24_features(derived, asset), delta, home, away),
+            home_team_id=HOME,
+            away_team_id=AWAY,
+            source_validator=derived,
+        )
+
+
+def test_lineups_snapshot_rejects_delta_raw_different_from_official_lineup(
+    tmp_path: Path,
+) -> None:
+    raw, derived, official_asset = _stores(tmp_path)
+    delta_asset = raw.archive(
+        b"unrelated raw evidence",
+        source="test-source",
+        source_id="unrelated-evidence",
+        url="fixture://unrelated-evidence",
+        observed_at=official_asset.observed_at,
+        target_event_time=None,
+        collector_version="test-collector/1",
+        media_type="application/octet-stream",
+    )
+    as_of = KICKOFF - timedelta(hours=1)
+    home_players = tuple(f"player:home-{index}" for index in range(11))
+    away_players = tuple(f"player:away-{index}" for index in range(11))
+    home = _lineup_feature(
+        derived, official_asset, team_id=HOME, value=list(home_players), known_at=as_of
+    )
+    away = _lineup_feature(
+        derived, official_asset, team_id=AWAY, value=list(away_players), known_at=as_of
+    )
+    delta = _v3_lineup_delta_feature(
+        derived,
+        delta_asset,
+        home_starters=home_players,
+        away_starters=away_players,
+        known_at=as_of,
+    )
+
+    with pytest.raises(ValueError, match="lineup_input_refs do not match official lineup source"):
+        build_snapshot(
+            match_id=MATCH,
+            match_version=1,
+            snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+            as_of=as_of,
+            scheduled_kickoff_used=KICKOFF,
+            feature_spec_version="prematch-features/2",
+            features=(*_t24_features(derived, official_asset), delta, home, away),
+            home_team_id=HOME,
+            away_team_id=AWAY,
+            source_validator=derived,
+        )
+
+
+def test_lineups_snapshot_rejects_ready_delta_without_dimensions(tmp_path: Path) -> None:
+    _, derived, asset = _stores(tmp_path)
+    as_of = KICKOFF - timedelta(hours=1)
+    home = _lineup_feature(
+        derived,
+        asset,
+        team_id=HOME,
+        value=[f"player:home-{index}" for index in range(11)],
+        known_at=as_of,
+    )
+    away = _lineup_feature(
+        derived,
+        asset,
+        team_id=AWAY,
+        value=[f"player:away-{index}" for index in range(11)],
+        known_at=as_of,
+    )
+    empty_ready = {
+        team_id.value: {
+            "quality_status": "ready",
+            "dimension_deltas": {},
+            "missing_fields": [],
+            "not_applicable_fields": [],
+            "blocking_reasons": [],
+            "input_refs": [f"player-profile:{team_id.value}"],
+            "transform_version": "lineup-delta/2",
+            "role_contract_versions": ["lineup-role-metrics/1"],
+            "dimension_sample_sizes": {},
+        }
+        for team_id in (HOME, AWAY)
+    }
+    delta = SnapshotFeature(
+        "lineup_delta",
+        empty_ready,
+        as_of,
+        _source(derived, asset, empty_ready, "lineup-delta-input/1"),
+        "lineup-delta",
+    )
+
+    with pytest.raises(ValueError, match="requires dimensions"):
+        build_snapshot(
+            match_id=MATCH,
+            match_version=1,
+            snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+            as_of=as_of,
+            scheduled_kickoff_used=KICKOFF,
+            feature_spec_version="prematch-features/2",
+            features=(*_t24_features(derived, asset), delta, home, away),
+            home_team_id=HOME,
+            away_team_id=AWAY,
+            source_validator=derived,
+        )
+
+
+def test_legacy_lineup_payload_is_v1_read_only_but_remains_verifiable(tmp_path: Path) -> None:
+    _, derived, asset = _stores(tmp_path)
+    as_of = KICKOFF - timedelta(hours=1)
+    home = _lineup_feature(
+        derived,
+        asset,
+        team_id=HOME,
+        value=[f"player:home-{index}" for index in range(11)],
+        known_at=as_of,
+    )
+    away = _lineup_feature(
+        derived,
+        asset,
+        team_id=AWAY,
+        value=[f"player:away-{index}" for index in range(11)],
+        known_at=as_of,
+    )
+    legacy_value = {
+        team_id.value: {
+            "quality_status": "preview",
+            "dimension_deltas": {},
+            "missing_fields": ["reference_lineup"],
+        }
+        for team_id in (HOME, AWAY)
+    }
+    delta = SnapshotFeature(
+        "lineup_delta",
+        legacy_value,
+        as_of,
+        _source(derived, asset, legacy_value, "lineup-delta-input/1"),
+        "lineup-delta",
+    )
+    features = (*_t24_features(derived, asset), delta, home, away)
+
+    missing = snapshot_contract._assess_readiness(
+        "prematch-features/1",
+        SnapshotType.LINEUPS_CONFIRMED,
+        features,
+        HOME,
+        AWAY,
+    )
+    assert missing == (
+        f"{AWAY.value}:reference_lineup",
+        f"{HOME.value}:reference_lineup",
+    )
+    with pytest.raises(ValueError, match="read-only legacy"):
+        build_snapshot(
+            match_id=MATCH,
+            match_version=1,
+            snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
+            as_of=as_of,
+            scheduled_kickoff_used=KICKOFF,
+            feature_spec_version="prematch-features/1",
+            features=features,
+            home_team_id=HOME,
+            away_team_id=AWAY,
+            source_validator=derived,
+        )
 
 
 def test_snapshot_is_content_identified_and_idempotently_archived(tmp_path: Path) -> None:
@@ -549,6 +1218,123 @@ def test_empty_player_observations_do_not_pass_player_profile_readiness() -> Non
         code.startswith("missing_player_role_or_minutes:") for code in player_profile.reason_codes
     )
     assert any(code.startswith("missing_player_metrics:") for code in player_profile.reason_codes)
+
+
+@pytest.mark.parametrize(
+    ("metric_fields", "known_at", "expected_reason"),
+    (
+        (frozenset({"key_passes"}), OBSERVED_AT, "missing_player_metric:"),
+        (frozenset({"shots"}), None, "missing_player_known_at:"),
+    ),
+)
+def test_player_profile_readiness_requires_role_metrics_and_known_time(
+    metric_fields: frozenset[str],
+    known_at: datetime | None,
+    expected_reason: str,
+) -> None:
+    starters = {
+        HOME.value: frozenset(f"player:home-{index}" for index in range(11)),
+        AWAY.value: frozenset(f"player:away-{index}" for index in range(11)),
+    }
+    details = {
+        player_id: PlayerObservationAvailability(
+            team_id=team_id,
+            role="FW",
+            minutes=90,
+            metric_fields=frozenset({"shots"}),
+            known_at=OBSERVED_AT,
+        )
+        for team_id, player_ids in starters.items()
+        for player_id in player_ids
+    }
+    first_player = sorted(details)[0]
+    details[first_player] = replace(
+        details[first_player], metric_fields=metric_fields, known_at=known_at
+    )
+    assessment = assess_lifecycle(
+        MatchAvailability(
+            match_status=MatchStatus.FINISHED,
+            team_ids=(HOME.value, AWAY.value),
+            snapshots=(),
+            result_90_present=True,
+            team_stat_fields={
+                HOME.value: frozenset({"goals", "xg", "shots", "shots_on_target"}),
+                AWAY.value: frozenset({"goals", "xg", "shots", "shots_on_target"}),
+            },
+            starters=starters,
+            player_observation_ids=frozenset(details),
+            player_observations=details,
+        ),
+        evaluated_at=OBSERVED_AT,
+    )
+    player_profile = next(
+        result
+        for result in assessment.qualifications
+        if result.qualification is Qualification.PLAYER_PROFILE
+    )
+
+    assert not player_profile.passed
+    assert any(
+        code.startswith(expected_reason) and first_player in code
+        for code in player_profile.reason_codes
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "minutes", "expected_reason"),
+    (
+        ("", 90, "missing_player_role:"),
+        ("FW", 0, "missing_player_minutes:"),
+        ("unknown", 90, "missing_player_role_contract:"),
+    ),
+)
+def test_player_profile_readiness_rejects_missing_or_unsupported_role_contract(
+    role: str, minutes: float, expected_reason: str
+) -> None:
+    starters = {
+        HOME.value: frozenset(f"player:home-{index}" for index in range(11)),
+        AWAY.value: frozenset(f"player:away-{index}" for index in range(11)),
+    }
+    details = {
+        player_id: PlayerObservationAvailability(
+            team_id=team_id,
+            role="FW",
+            minutes=90,
+            metric_fields=frozenset({"shots"}),
+            known_at=OBSERVED_AT,
+        )
+        for team_id, player_ids in starters.items()
+        for player_id in player_ids
+    }
+    first_player = sorted(details)[0]
+    details[first_player] = replace(details[first_player], role=role, minutes=minutes)
+    assessment = assess_lifecycle(
+        MatchAvailability(
+            match_status=MatchStatus.FINISHED,
+            team_ids=(HOME.value, AWAY.value),
+            snapshots=(),
+            result_90_present=True,
+            team_stat_fields={
+                HOME.value: frozenset({"goals", "xg", "shots", "shots_on_target"}),
+                AWAY.value: frozenset({"goals", "xg", "shots", "shots_on_target"}),
+            },
+            starters=starters,
+            player_observation_ids=frozenset(details),
+            player_observations=details,
+        ),
+        evaluated_at=OBSERVED_AT,
+    )
+    player_profile = next(
+        result
+        for result in assessment.qualifications
+        if result.qualification is Qualification.PLAYER_PROFILE
+    )
+
+    assert not player_profile.passed
+    assert any(
+        code.startswith(expected_reason) and first_player in code
+        for code in player_profile.reason_codes
+    )
 
 
 def test_unknown_readiness_ruleset_fails_closed() -> None:

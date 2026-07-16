@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
+from football_data_platform.features import player_profiles as profile_contract
 from football_data_platform.features.contributions import (
     ExpectedGoalsContribution,
     apply_expected_goals_contributions,
@@ -18,6 +20,7 @@ from football_data_platform.features.player_profiles import (
     ProfileWindowSpec,
     RoleMetricContract,
     build_player_profiles,
+    validate_player_profile,
 )
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
@@ -213,6 +216,110 @@ def test_empty_metrics_and_insufficient_samples_are_not_profile_ready(
     assert result.profiles[0].quality_status == expected_status
 
 
+def test_optional_only_role_with_no_observed_dimension_is_not_profile_ready() -> None:
+    contract = RoleMetricContract(
+        role="specialist",
+        version="specialist-metrics/1",
+        required_metrics=(),
+        optional_metrics=("progressive_passes",),
+        not_applicable_metrics=(),
+        minimum_minutes=0,
+        minimum_matches=1,
+    )
+    observation = PlayerMatchObservation(
+        "player-specialist",
+        "team-a",
+        "match-1",
+        "specialist",
+        90,
+        AS_OF - timedelta(days=1),
+        {},
+        "canonical:specialist-1",
+        played_at=AS_OF - timedelta(days=1),
+    )
+
+    result = build_player_profiles(
+        (observation,),
+        as_of=AS_OF,
+        minimum_minutes=0,
+        role_contracts=(contract,),
+    )
+
+    profile = result.profiles[0]
+    assert profile.quality_status == "missing-applicable-metrics"
+    assert profile.long_term_ability.reasons == ("applicable_metrics:all-missing",)
+
+
+def test_optional_only_ready_profile_requires_a_ready_metric_in_each_window() -> None:
+    contract = RoleMetricContract(
+        role="specialist",
+        version="specialist-metrics/1",
+        required_metrics=(),
+        optional_metrics=("progressive_passes",),
+        not_applicable_metrics=(),
+        minimum_minutes=0,
+        minimum_matches=1,
+    )
+    observation = PlayerMatchObservation(
+        "player-specialist",
+        "team-a",
+        "match-1",
+        "specialist",
+        90,
+        AS_OF - timedelta(days=1),
+        {"progressive_passes": 4.0},
+        "canonical:specialist-ready",
+        played_at=AS_OF - timedelta(days=1),
+    )
+    profile = build_player_profiles(
+        (observation,),
+        as_of=AS_OF,
+        minimum_minutes=0,
+        role_contracts=(contract,),
+    ).profiles[0]
+    metric = replace(
+        profile.recent_form.metrics[0],
+        total=None,
+        per90=None,
+        sample_minutes=0,
+        sample_matches=0,
+        role_percentile=None,
+        cohort_size=0,
+        quality_status="missing",
+    )
+    recent = replace(
+        profile.recent_form,
+        metrics=(metric,),
+        quality_status="ready",
+        reasons=(),
+    )
+    tampered = replace(profile, artifact_id="", recent_form=recent)
+    tampered = replace(tampered, artifact_id=profile_contract._artifact_id(tampered))
+
+    with pytest.raises(ValueError, match="ready applicable metric"):
+        validate_player_profile(tampered)
+
+
+def test_profile_artifact_validator_rejects_tampered_ready_identity() -> None:
+    observation = PlayerMatchObservation(
+        "player-a",
+        "team-a",
+        "match-1",
+        "forward",
+        90,
+        AS_OF - timedelta(days=1),
+        {"shots": 2.0},
+        "canonical:player-a-1",
+        played_at=AS_OF - timedelta(days=1),
+    )
+    profile = build_player_profiles((observation,), as_of=AS_OF, minimum_minutes=0).profiles[0]
+    validate_player_profile(profile)
+
+    tampered = replace(profile, role_contract_version=None)
+    with pytest.raises(ValueError, match="artifact identity"):
+        validate_player_profile(tampered)
+
+
 def test_missing_window_time_keeps_load_and_profile_not_ready() -> None:
     observation = PlayerMatchObservation(
         "player-a",
@@ -346,20 +453,30 @@ def test_composition_consumes_context_and_ready_lineup_once() -> None:
     context = context_contribution(
         {"days_since_previous_match": 8.0}, source_ref="derived-source:context"
     )
-    lineup = lineup_delta_contributions(
-        {
-            "team-home": {
-                "quality_status": "ready",
-                "dimension_deltas": {"attack": 2.0},
-            },
-            "team-away": {
-                "quality_status": "preview",
-                "dimension_deltas": {},
-            },
+    deltas = {
+        "team-home": {
+            "quality_status": "ready",
+            "dimension_deltas": {"attack": 2.0},
         },
+        "team-away": {
+            "quality_status": "preview",
+            "dimension_deltas": {},
+        },
+    }
+    validator = SimpleNamespace(
+        validate_snapshot_source=lambda source_ref: SimpleNamespace(
+            source_ref=source_ref,
+            source_kind="derived",
+            transform_version="lineup-delta-input/3",
+            value=deltas,
+        )
+    )
+    lineup = lineup_delta_contributions(
+        deltas,
         home_team_id="team-home",
         away_team_id="team-away",
         source_ref="derived-source:lineup",
+        source_validator=validator,
     )
 
     composed = compose_expected_goals(1.5, 1.0, (context, *lineup))
@@ -398,3 +515,18 @@ def test_preview_lineup_is_not_silently_converted_to_neutral_contribution() -> N
     assert composed.lambda_home == pytest.approx(1.5)
     assert composed.lambda_away == pytest.approx(1.0)
     assert composed.contribution_keys == ()
+
+
+def test_unverified_ready_lineup_cannot_modify_expected_goals() -> None:
+    with pytest.raises(ValueError, match="persisted source validator"):
+        lineup_delta_contributions(
+            {
+                "team-home": {
+                    "quality_status": "ready",
+                    "dimension_deltas": {"attack": 100.0},
+                }
+            },
+            home_team_id="team-home",
+            away_team_id="team-away",
+            source_ref="derived-source:unverified",
+        )
