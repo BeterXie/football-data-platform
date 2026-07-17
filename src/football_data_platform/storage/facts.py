@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -922,30 +923,16 @@ def load_verified_match_result(
     *,
     archive: RawArchive,
     canonical: CanonicalStore,
+    _connection: sqlite3.Connection | None = None,
 ) -> MatchResult90:
     """Verify result identity, exact evidence binding, and registered raw bytes/timestamp."""
 
     _require_text(source_ref, "source_ref")
-    with canonical.connect() as connection:
-        row = connection.execute(
-            "SELECT record_id, match_id, match_version, home_goals, away_goals, "
-            "known_at, observed_at, raw_asset_id FROM match_results_90 "
-            "WHERE record_id = ?",
-            (source_ref,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("result source_ref does not identify a canonical fact")
-        raw_row = connection.execute(
-            "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
-            "collector_version, media_type, size_bytes FROM raw_assets "
-            "WHERE raw_asset_id = ?",
-            (row["raw_asset_id"],),
-        ).fetchone()
-        evidence_row = connection.execute(
-            "SELECT 1 FROM fact_evidence WHERE record_id = ? AND raw_asset_id = ? "
-            "AND observed_at = ?",
-            (source_ref, row["raw_asset_id"], row["observed_at"]),
-        ).fetchone()
+    if _connection is None:
+        with canonical.connect() as connection:
+            row, raw_row, evidence_row = _match_result_rows(source_ref, connection)
+    else:
+        row, raw_row, evidence_row = _match_result_rows(source_ref, _connection)
 
     if any(
         not isinstance(row[field], str)
@@ -1028,6 +1015,31 @@ def load_verified_match_result(
         known_at=_parse_timestamp(payload["known_at"]),
         source_ref=source_ref,
     )
+
+
+def _match_result_rows(
+    source_ref: str,
+    connection: sqlite3.Connection,
+) -> tuple[sqlite3.Row, sqlite3.Row | None, sqlite3.Row | None]:
+    row = connection.execute(
+        "SELECT record_id, match_id, match_version, home_goals, away_goals, "
+        "known_at, observed_at, raw_asset_id FROM match_results_90 "
+        "WHERE record_id = ?",
+        (source_ref,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("result source_ref does not identify a canonical fact")
+    raw_row = connection.execute(
+        "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
+        "collector_version, media_type, size_bytes FROM raw_assets "
+        "WHERE raw_asset_id = ?",
+        (row["raw_asset_id"],),
+    ).fetchone()
+    evidence_row = connection.execute(
+        "SELECT 1 FROM fact_evidence WHERE record_id = ? AND raw_asset_id = ? AND observed_at = ?",
+        (source_ref, row["raw_asset_id"], row["observed_at"]),
+    ).fetchone()
+    return row, raw_row, evidence_row
 
 
 def verify_official_lineup_contract(

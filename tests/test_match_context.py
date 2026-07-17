@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,10 @@ from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
-from football_data_platform.storage.match_context import MatchContextReplayError
+from football_data_platform.storage.match_context import (
+    MatchContextReplayError,
+    replay_match_context,
+)
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
 ROOT = Path(__file__).parents[1]
@@ -251,6 +255,38 @@ def _write_standard_context(world: _World) -> tuple[str, object]:
         as_of=as_of,
     )
     return source_ref, world.derived.validate_snapshot_source(source_ref)
+
+
+def test_single_replay_reuses_one_read_only_canonical_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _standard_world(tmp_path)
+    original_connect = world.canonical.connect
+    connect_calls = 0
+    query_only_states: list[int] = []
+
+    @contextmanager
+    def counting_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        with original_connect() as connection:
+            yield connection
+            query_only_states.append(int(connection.execute("PRAGMA query_only").fetchone()[0]))
+
+    monkeypatch.setattr(world.canonical, "connect", counting_connect)
+
+    replay = replay_match_context(
+        match_id=world.match_ids["contexttarget"],
+        match_version=1,
+        as_of=world.kickoffs["contexttarget"] - timedelta(hours=24),
+        archive=world.raw,
+        canonical=world.canonical,
+    )
+
+    assert replay.value["quality_status"] == "ready"
+    assert connect_calls == 1
+    assert query_only_states == [1]
 
 
 def test_formal_context_recomputes_different_per_team_rest_and_own_side_effect(

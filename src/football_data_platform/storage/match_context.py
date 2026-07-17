@@ -15,7 +15,7 @@ from football_data_platform.config import (
     SourceSeasonReference,
 )
 from football_data_platform.domain.ids import CompetitionId, MatchId, RawAssetId, SeasonId, TeamId
-from football_data_platform.domain.models import MatchStatus, RawAsset, require_utc
+from football_data_platform.domain.models import MatchStatus, MatchVersion, RawAsset, require_utc
 from football_data_platform.sources.fbref import COLLECTOR_VERSION, parse_schedule
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.facts import load_verified_match_result
@@ -81,39 +81,44 @@ def replay_match_context(
         raise ValueError("match_version must be a positive integer")
     require_utc(as_of, "as_of")
 
-    try:
-        target = _replay_schedule_version(
-            match_id=match_id,
-            match_version=match_version,
-            as_of=as_of,
-            archive=archive,
-            canonical=canonical,
-        )
-    except _ScheduleNotKnown as error:
-        raise MatchContextReplayError("target match schedule was not known at as_of") from error
-    if as_of >= target.kickoff_at:
-        raise MatchContextReplayError("match context as_of must precede target kickoff")
-
-    teams: dict[str, dict[str, Any]] = {}
-    input_refs = {target.raw_asset_id.value}
-    known_times = [target.schedule_known_at]
-    observed_times = [target.raw_observed_at]
-    if not target.season_schedule_coverage_complete:
-        for team_id in (target.home_team_id, target.away_team_id):
-            teams[team_id.value] = _missing_team(team_id, "season_schedule_coverage_incomplete")[0]
-    else:
-        for team_id in (target.home_team_id, target.away_team_id):
-            item, item_refs, item_known, item_observed = _previous_match_context(
-                team_id=team_id,
-                target=target,
+    with canonical.connect() as connection:
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            target = _replay_schedule_version(
+                match_id=match_id,
+                match_version=match_version,
                 as_of=as_of,
                 archive=archive,
-                canonical=canonical,
+                connection=connection,
             )
-            teams[team_id.value] = item
-            input_refs.update(item_refs)
-            known_times.extend(item_known)
-            observed_times.extend(item_observed)
+        except _ScheduleNotKnown as error:
+            raise MatchContextReplayError("target match schedule was not known at as_of") from error
+        if as_of >= target.kickoff_at:
+            raise MatchContextReplayError("match context as_of must precede target kickoff")
+
+        teams: dict[str, dict[str, Any]] = {}
+        input_refs = {target.raw_asset_id.value}
+        known_times = [target.schedule_known_at]
+        observed_times = [target.raw_observed_at]
+        if not target.season_schedule_coverage_complete:
+            for team_id in (target.home_team_id, target.away_team_id):
+                teams[team_id.value] = _missing_team(
+                    team_id, "season_schedule_coverage_incomplete"
+                )[0]
+        else:
+            for team_id in (target.home_team_id, target.away_team_id):
+                item, item_refs, item_known, item_observed = _previous_match_context(
+                    team_id=team_id,
+                    target=target,
+                    as_of=as_of,
+                    archive=archive,
+                    canonical=canonical,
+                    connection=connection,
+                )
+                teams[team_id.value] = item
+                input_refs.update(item_refs)
+                known_times.extend(item_known)
+                observed_times.extend(item_observed)
 
     quality_status = (
         "ready" if all(item["status"] == "available" for item in teams.values()) else "missing"
@@ -157,16 +162,17 @@ def _previous_match_context(
     as_of: datetime,
     archive: RawArchive,
     canonical: CanonicalStore,
+    connection: sqlite3.Connection,
 ) -> tuple[dict[str, Any], set[str], list[datetime], list[datetime]]:
     candidate_ids = _candidate_match_ids(
-        canonical,
+        connection,
         team_id=team_id,
         target_match_id=target.match_id,
     )
     candidates: list[_ScheduleEvidence] = []
     invalid_prior_kickoffs: list[datetime] = []
     for candidate_id in candidate_ids:
-        versions = canonical.match_versions(candidate_id)
+        versions = _match_versions(connection, candidate_id)
         eligible: list[_ScheduleEvidence] = []
         for version in versions:
             if version.kickoff_at is None or version.kickoff_at >= target.kickoff_at:
@@ -177,7 +183,7 @@ def _previous_match_context(
                     match_version=version.version,
                     as_of=as_of,
                     archive=archive,
-                    canonical=canonical,
+                    connection=connection,
                 )
             except _ScheduleNotKnown:
                 continue
@@ -211,6 +217,7 @@ def _previous_match_context(
         as_of=as_of,
         archive=archive,
         canonical=canonical,
+        connection=connection,
     )
     if result is None:
         reason = (
@@ -262,13 +269,13 @@ def _result_as_of(
     as_of: datetime,
     archive: RawArchive,
     canonical: CanonicalStore,
+    connection: sqlite3.Connection,
 ) -> _ResultEvidence | None:
-    with canonical.connect() as connection:
-        rows = connection.execute(
-            "SELECT record_id, known_at, observed_at FROM match_results_90 "
-            "WHERE match_id = ? AND match_version = ? ORDER BY observation_version DESC",
-            (schedule.match_id.value, schedule.match_version),
-        ).fetchall()
+    rows = connection.execute(
+        "SELECT record_id, known_at, observed_at FROM match_results_90 "
+        "WHERE match_id = ? AND match_version = ? ORDER BY observation_version DESC",
+        (schedule.match_id.value, schedule.match_version),
+    ).fetchall()
     for row in rows:
         known_at = _parse_timestamp(row["known_at"], "result known_at")
         if known_at > as_of:
@@ -277,6 +284,7 @@ def _result_as_of(
             str(row["record_id"]),
             archive=archive,
             canonical=canonical,
+            _connection=connection,
         )
         if result.match_id != schedule.match_id or result.known_at != known_at:
             raise MatchContextReplayError("typed result does not match its previous match")
@@ -289,18 +297,43 @@ def _result_as_of(
 
 
 def _candidate_match_ids(
-    canonical: CanonicalStore,
+    connection: sqlite3.Connection,
     *,
     team_id: TeamId,
     target_match_id: MatchId,
 ) -> tuple[MatchId, ...]:
-    with canonical.connect() as connection:
-        rows = connection.execute(
-            "SELECT match_id FROM matches WHERE match_id <> ? "
-            "AND (home_team_id = ? OR away_team_id = ?) ORDER BY match_id",
-            (target_match_id.value, team_id.value, team_id.value),
-        ).fetchall()
+    rows = connection.execute(
+        "SELECT match_id FROM matches WHERE match_id <> ? "
+        "AND (home_team_id = ? OR away_team_id = ?) ORDER BY match_id",
+        (target_match_id.value, team_id.value, team_id.value),
+    ).fetchall()
     return tuple(MatchId(str(row["match_id"])) for row in rows)
+
+
+def _match_versions(
+    connection: sqlite3.Connection,
+    match_id: MatchId,
+) -> tuple[MatchVersion, ...]:
+    rows = connection.execute(
+        "SELECT match_id, version, round_name, kickoff_at, status, observed_at "
+        "FROM match_versions WHERE match_id = ? ORDER BY version",
+        (match_id.value,),
+    ).fetchall()
+    return tuple(
+        MatchVersion(
+            match_id=MatchId(str(row["match_id"])),
+            version=int(row["version"]),
+            round_name=row["round_name"],
+            kickoff_at=(
+                _parse_timestamp(row["kickoff_at"], "match kickoff")
+                if row["kickoff_at"] is not None
+                else None
+            ),
+            status=MatchStatus(str(row["status"])),
+            observed_at=_parse_timestamp(row["observed_at"], "match observed_at"),
+        )
+        for row in rows
+    )
 
 
 def _replay_schedule_version(
@@ -309,41 +342,40 @@ def _replay_schedule_version(
     match_version: int,
     as_of: datetime,
     archive: RawArchive,
-    canonical: CanonicalStore,
+    connection: sqlite3.Connection,
 ) -> _ScheduleEvidence:
-    with canonical.connect() as connection:
-        row = connection.execute(
-            "SELECT m.competition_id, m.season_id, m.home_team_id, m.away_team_id, "
-            "mv.round_name, mv.kickoff_at, mv.status, mv.observed_at, mv.raw_asset_id "
-            "FROM matches AS m JOIN match_versions AS mv ON mv.match_id = m.match_id "
-            "WHERE m.match_id = ? AND mv.version = ?",
-            (match_id.value, match_version),
-        ).fetchone()
-        if row is None:
-            raise MatchContextReplayError("canonical match version does not exist")
-        source_rows = connection.execute(
-            "SELECT source_id FROM source_mappings WHERE source = 'fbref-schedule' "
-            "AND entity_type = 'match' AND entity_id = ? AND valid_to IS NULL",
-            (match_id.value,),
+    row = connection.execute(
+        "SELECT m.competition_id, m.season_id, m.home_team_id, m.away_team_id, "
+        "mv.round_name, mv.kickoff_at, mv.status, mv.observed_at, mv.raw_asset_id "
+        "FROM matches AS m JOIN match_versions AS mv ON mv.match_id = m.match_id "
+        "WHERE m.match_id = ? AND mv.version = ?",
+        (match_id.value, match_version),
+    ).fetchone()
+    if row is None:
+        raise MatchContextReplayError("canonical match version does not exist")
+    source_rows = connection.execute(
+        "SELECT source_id FROM source_mappings WHERE source = 'fbref-schedule' "
+        "AND entity_type = 'match' AND entity_id = ? AND valid_to IS NULL",
+        (match_id.value,),
+    ).fetchall()
+    team_sources = {
+        str(team_row["entity_id"]): str(team_row["source_id"])
+        for team_row in connection.execute(
+            "SELECT entity_id, source_id FROM source_mappings WHERE source = 'fbref' "
+            "AND entity_type = 'team' AND entity_id IN (?, ?) AND valid_to IS NULL",
+            (row["home_team_id"], row["away_team_id"]),
         ).fetchall()
-        team_sources = {
-            str(team_row["entity_id"]): str(team_row["source_id"])
-            for team_row in connection.execute(
-                "SELECT entity_id, source_id FROM source_mappings WHERE source = 'fbref' "
-                "AND entity_type = 'team' AND entity_id IN (?, ?) AND valid_to IS NULL",
-                (row["home_team_id"], row["away_team_id"]),
-            ).fetchall()
-        }
-        competition, season, registered_team_source_ids = _schedule_registration(
-            connection,
-            competition_id=str(row["competition_id"]),
-            season_id=str(row["season_id"]),
-        )
-        raw_row = connection.execute(
-            "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
-            "collector_version, media_type, size_bytes FROM raw_assets WHERE raw_asset_id = ?",
-            (row["raw_asset_id"],),
-        ).fetchone()
+    }
+    competition, season, registered_team_source_ids = _schedule_registration(
+        connection,
+        competition_id=str(row["competition_id"]),
+        season_id=str(row["season_id"]),
+    )
+    raw_row = connection.execute(
+        "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
+        "collector_version, media_type, size_bytes FROM raw_assets WHERE raw_asset_id = ?",
+        (row["raw_asset_id"],),
+    ).fetchone()
 
     if len(source_rows) != 1 or len(team_sources) != 2 or raw_row is None:
         raise MatchContextReplayError("schedule canonical lineage is incomplete")
