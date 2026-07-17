@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,11 @@ from football_data_platform.domain.predictions import (
     result_probabilities,
 )
 from football_data_platform.domain.snapshots import CaptureMode
-from football_data_platform.domain.training import ModelRunStatus
+from football_data_platform.domain.training import (
+    ModelRunArtifact,
+    ModelRunStatus,
+    TrainingSample,
+)
 from football_data_platform.evaluation.governance import (
     EVALUATION_COMPARISON_SCHEMA_VERSION,
     EVALUATION_COMPARISON_TYPE,
@@ -318,26 +322,26 @@ class GovernanceArtifactStore:
         if not comparison.cohort_ref.startswith("training-dataset:"):
             raise GovernanceArtifactConflict("cohort_ref must reference a training dataset")
         try:
-            dataset = self.training.load_dataset(comparison.cohort_ref)
+            dataset = self.training.load_formal_dataset(comparison.cohort_ref)
             challenger = self.training.load_model_run(comparison.model_run_ref)
             champion = self.training.load_model_run(comparison.champion_model_ref)
+            challenger_dataset = self.training.load_formal_dataset(challenger.dataset_id)
+            champion_dataset = self.training.load_formal_dataset(champion.dataset_id)
         except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise GovernanceArtifactConflict(
                 "evaluation comparison model cohort is unavailable or invalid"
             ) from error
 
-        by_id = {sample.sample_id: sample for sample in dataset.samples}
-        if set(comparison.sample_refs) != set(challenger.evaluation_cohort) or set(
-            comparison.sample_refs
-        ) != set(champion.evaluation_cohort):
+        if dataset.generated_at > comparison.generated_at:
             raise GovernanceArtifactConflict(
-                "evaluation comparison samples do not match both model cohorts"
+                "evaluation comparison predates its formal evaluation cohort"
             )
-        for name, artifact in (("challenger", challenger), ("champion", champion)):
-            if artifact.dataset_id != comparison.cohort_ref:
-                raise GovernanceArtifactConflict(
-                    f"{name} model run dataset does not match comparison cohort"
-                )
+        by_id = {sample.sample_id: sample for sample in dataset.samples}
+        eligible_refs = {sample.sample_id for sample in dataset.included_samples}
+        if set(comparison.sample_refs) != eligible_refs:
+            raise GovernanceArtifactConflict(
+                "evaluation comparison samples do not exactly match the formal cohort"
+            )
         missing = sorted(set(comparison.sample_refs) - set(by_id))
         if missing:
             raise GovernanceArtifactConflict(
@@ -346,14 +350,19 @@ class GovernanceArtifactStore:
         samples = {sample_ref: by_id[sample_ref] for sample_ref in comparison.sample_refs}
         if any(not sample.eligible for sample in samples.values()):
             raise GovernanceArtifactConflict("evaluation comparison contains excluded samples")
-        if any(
-            sample.capture_mode is not challenger.evaluation_capture_mode
-            or sample.capture_mode is not champion.evaluation_capture_mode
-            for sample in samples.values()
-        ):
+        if any(sample.split == "train" for sample in samples.values()):
             raise GovernanceArtifactConflict(
-                "evaluation comparison capture mode does not match model cohorts"
+                "formal evaluation cohorts cannot contain training samples"
             )
+        comparison_samples = tuple(samples.values())
+        _verify_independent_comparison_samples(
+            comparison_samples,
+            (*challenger_dataset.samples, *champion_dataset.samples),
+        )
+        _verify_comparison_model_timing(
+            (("challenger", challenger), ("champion", champion)),
+            comparison_samples,
+        )
 
         pairs: list[PairedEvaluation] = []
         prospective_timing = True
@@ -371,6 +380,13 @@ class GovernanceArtifactStore:
                 sample=sample,
                 expected_model_ref=comparison.champion_model_ref,
             )
+            if any(
+                generated_at >= sample.label_known_at
+                for generated_at in (challenger_generated_at, champion_generated_at)
+            ):
+                raise GovernanceArtifactConflict(
+                    "evaluation prediction must predate its typed result label"
+                )
             prospective_timing = prospective_timing and all(
                 generated_at < sample.label_known_at <= record.evaluated_at
                 for generated_at, record in (
@@ -733,6 +749,56 @@ class GovernanceArtifactStore:
         if not isinstance(payload, dict):
             raise GovernanceArtifactConflict(f"{kind} must be an object: {path}")
         return payload
+
+
+def _verify_independent_comparison_samples(
+    comparison_samples: Sequence[TrainingSample],
+    model_samples: Sequence[TrainingSample],
+) -> None:
+    model_sample_ids = {sample.sample_id for sample in model_samples}
+    model_matches = {
+        (sample.match_id, sample.match_version)
+        for sample in model_samples
+        if sample.match_id is not None and sample.match_version is not None
+    }
+    model_snapshot_refs = {
+        sample.snapshot_ref for sample in model_samples if sample.snapshot_ref is not None
+    }
+    model_label_refs = {sample.label_ref for sample in model_samples}
+    model_qualification_refs = {
+        sample.qualification_ref for sample in model_samples if sample.qualification_ref is not None
+    }
+
+    for sample in comparison_samples:
+        reused: list[str] = []
+        if sample.sample_id in model_sample_ids:
+            reused.append("sample_id")
+        if (sample.match_id, sample.match_version) in model_matches:
+            reused.append("match_id+match_version")
+        if sample.snapshot_ref is not None and sample.snapshot_ref in model_snapshot_refs:
+            reused.append("snapshot_ref")
+        if sample.label_ref in model_label_refs:
+            reused.append("label_ref")
+        if (
+            sample.qualification_ref is not None
+            and sample.qualification_ref in model_qualification_refs
+        ):
+            reused.append("qualification_ref")
+        if reused:
+            raise GovernanceArtifactConflict(
+                "formal evaluation cohort reuses model dataset provenance: " + ", ".join(reused)
+            )
+
+
+def _verify_comparison_model_timing(
+    model_runs: Sequence[tuple[str, ModelRunArtifact]],
+    comparison_samples: Sequence[TrainingSample],
+) -> None:
+    for role, model_run in model_runs:
+        if any(model_run.ended_at > sample.as_of for sample in comparison_samples):
+            raise GovernanceArtifactConflict(
+                f"{role} model run completed after formal evaluation sample as_of"
+            )
 
 
 def parse_evaluation_comparison_payload(

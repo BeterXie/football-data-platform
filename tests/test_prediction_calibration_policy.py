@@ -22,7 +22,14 @@ from football_data_platform.features.contributions import (
     ExpectedGoalsContribution,
     compose_expected_goals,
     context_contribution,
+    context_contributions,
     lineup_delta_contributions,
+)
+from football_data_platform.features.team_baseline import (
+    TeamMatchProcess,
+    build_team_baseline,
+    expected_goals_from_baseline,
+    team_baseline_payload,
 )
 
 AS_OF = datetime(2025, 8, 22, 14, 0, tzinfo=UTC)
@@ -69,12 +76,50 @@ def _source(
 
 def _snapshot():
     match_id = MatchId("match:calibration-policy")
+    baseline_artifact = build_team_baseline(
+        (
+            TeamMatchProcess(
+                match_id="match:calibration-history",
+                home_team_id=HOME.value,
+                away_team_id=AWAY.value,
+                kickoff_at=AS_OF - timedelta(days=2),
+                known_at=AS_OF - timedelta(days=1),
+                home_xg=1.7,
+                away_xg=0.8,
+                source_ref=RAW_REF,
+            ),
+        ),
+        as_of=AS_OF,
+        half_life_days=90.0,
+        iterations=2,
+    ).artifact
+    lambda_home, lambda_away = expected_goals_from_baseline(
+        baseline_artifact,
+        home_team_id=HOME.value,
+        away_team_id=AWAY.value,
+    )
     baseline = {
-        "artifact_id": "team-baseline:" + "9" * 64,
-        "lambda_home": 1.7,
-        "lambda_away": 0.8,
+        "artifact_id": baseline_artifact.artifact_id,
+        "artifact": team_baseline_payload(baseline_artifact),
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
     }
-    context = {"days_since_previous_match": 6.0}
+    context = {
+        "schema_version": 2,
+        "rule_version": "previous-completed-match-rest/1",
+        "match_id": match_id.value,
+        "match_version": 1,
+        "as_of": AS_OF.isoformat().replace("+00:00", "Z"),
+        "scheduled_kickoff": KICKOFF.isoformat().replace("+00:00", "Z"),
+        "home_team_id": HOME.value,
+        "away_team_id": AWAY.value,
+        "quality_status": "ready",
+        "target_schedule": {},
+        "teams": {
+            HOME.value: {"team_id": HOME.value, "status": "available", "rest_days": 6.0},
+            AWAY.value: {"team_id": AWAY.value, "status": "available", "rest_days": 7.0},
+        },
+    }
     home_players = [f"player:calibration-home-{index}" for index in range(11)]
     away_players = [f"player:calibration-away-{index}" for index in range(11)]
     lineup = {
@@ -107,8 +152,39 @@ def _snapshot():
     }
     validator = _SourceValidator(
         {
-            BASELINE_REF: _source(BASELINE_REF, "team-baseline-input/2", baseline),
-            CONTEXT_REF: _source(CONTEXT_REF, "match-context-input/1", context),
+            BASELINE_REF: _source(
+                BASELINE_REF,
+                "team-baseline-input/3",
+                baseline,
+                source_context={
+                    "rule_version": "expected-goals-from-team-baseline/1",
+                    "transform_version": "team-baseline-input/3",
+                    "match_id": match_id.value,
+                    "match_version": 1,
+                    "home_team_id": HOME.value,
+                    "away_team_id": AWAY.value,
+                    "scheduled_kickoff": KICKOFF.isoformat().replace("+00:00", "Z"),
+                    "as_of": AS_OF.isoformat().replace("+00:00", "Z"),
+                    "baseline_artifact_id": baseline_artifact.artifact_id,
+                    "baseline_as_of": AS_OF.isoformat().replace("+00:00", "Z"),
+                    "baseline_transform_version": baseline_artifact.transform_version,
+                },
+            ),
+            CONTEXT_REF: _source(
+                CONTEXT_REF,
+                "match-context-input/2",
+                context,
+                source_context={
+                    "rule_version": "previous-completed-match-rest/1",
+                    "match_id": match_id.value,
+                    "match_version": 1,
+                    "as_of": AS_OF.isoformat().replace("+00:00", "Z"),
+                    "scheduled_kickoff": KICKOFF.isoformat().replace("+00:00", "Z"),
+                    "home_team_id": HOME.value,
+                    "away_team_id": AWAY.value,
+                    "quality_status": "ready",
+                },
+            ),
             LINEUP_REF: _source(LINEUP_REF, "lineup-delta-input/3", lineup),
             HOME_LINEUP_REF: _source(
                 HOME_LINEUP_REF,
@@ -142,7 +218,7 @@ def _snapshot():
         snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
         as_of=AS_OF,
         scheduled_kickoff_used=KICKOFF,
-        feature_spec_version="prematch-features/2",
+        feature_spec_version="prematch-features/3",
         features=(
             SnapshotFeature("team_baseline", baseline, AS_OF, BASELINE_REF, "baseline"),
             SnapshotFeature("match_context", context, AS_OF, CONTEXT_REF, "context"),
@@ -175,7 +251,13 @@ def _valid_contributions(snapshot, validator):
     context = next(feature for feature in snapshot.features if feature.name == "match_context")
     lineup = next(feature for feature in snapshot.features if feature.name == "lineup_delta")
     return (
-        context_contribution(context.value, source_ref=context.source_ref),
+        *context_contributions(
+            context.value,
+            home_team_id=HOME.value,
+            away_team_id=AWAY.value,
+            source_ref=context.source_ref,
+            source_validator=validator,
+        ),
         *lineup_delta_contributions(
             lineup.value,
             home_team_id=HOME.value,
@@ -295,7 +377,9 @@ def test_formal_prediction_rejects_missing_ready_lineup_dimension() -> None:
 def test_policy_rejects_forged_lineup_contribution_key() -> None:
     snapshot, validator = _snapshot()
     contributions = _valid_contributions(snapshot, validator)
-    valid_lineup = contributions[1]
+    valid_lineup = next(
+        item for item in contributions if item.contribution_key.startswith("lineup:")
+    )
 
     with pytest.raises(ValueError, match="calibration policy"):
         replace(valid_lineup, contribution_key="lineup:extra:forged/1")
@@ -304,7 +388,9 @@ def test_policy_rejects_forged_lineup_contribution_key() -> None:
 def test_formal_prediction_rejects_policy_valid_extra_lineup_dimension() -> None:
     snapshot, validator = _snapshot()
     contributions = _valid_contributions(snapshot, validator)
-    valid_lineup = contributions[1]
+    valid_lineup = next(
+        item for item in contributions if item.contribution_key.startswith("lineup:")
+    )
     calibration = replace(
         valid_lineup.calibration,
         source_path=(AWAY.value, "dimension_deltas", "shots"),

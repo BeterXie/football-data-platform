@@ -18,7 +18,9 @@ from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, Tea
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.predictions import (
     SCORE_GRID_COMPOSITION_SCHEMA_VERSION,
+    MarketSnapshotValidator,
     ModelRunValidator,
+    PersistedPredictionContextValidator,
     ScorePrediction,
     prediction_payload,
     score_grid_composition_artifact_id,
@@ -30,6 +32,7 @@ from football_data_platform.domain.snapshots import (
     PreMatchSnapshot,
     SnapshotSourceValidation,
     snapshot_payload,
+    verify_current_snapshot,
     verify_snapshot,
 )
 from football_data_platform.features.lineup import (
@@ -43,7 +46,9 @@ from football_data_platform.features.player_profiles import (
     validate_player_profile,
 )
 from football_data_platform.features.team_baseline import (
+    TEAM_BASELINE_INPUT_TRANSFORM_V3,
     TeamBaselineArtifact,
+    expected_goals_from_baseline,
     parse_team_baseline_payload,
     team_baseline_payload,
 )
@@ -53,6 +58,10 @@ from football_data_platform.storage.facts import (
     verify_official_lineup_contract,
 )
 from football_data_platform.storage.layout import DataLayout
+from football_data_platform.storage.match_context import (
+    MATCH_CONTEXT_INPUT_TRANSFORM_V2,
+    replay_match_context,
+)
 from football_data_platform.storage.match_report_contracts import verify_match_report_contract
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
@@ -92,6 +101,7 @@ _DIGEST_REFERENCE_NAMESPACES = frozenset(
         "snapshot",
         "team-baseline",
         "training-dataset",
+        "training-qualification",
         "vertical-slice-report",
         "vertical-slice-summary",
     }
@@ -118,6 +128,7 @@ _TRAINING_REFERENCE_NAMESPACES = frozenset(
         "snapshot",
         "team-baseline",
         "training-dataset",
+        "training-qualification",
     }
 )
 
@@ -548,9 +559,13 @@ class DerivedArchive:
         layout: DataLayout,
         *,
         model_run_validator: ModelRunValidator | None = None,
+        market_snapshot_validator: MarketSnapshotValidator | None = None,
+        prediction_context_validator: PersistedPredictionContextValidator | None = None,
     ) -> None:
         self.layout = layout.ensure()
         self.model_run_validator = model_run_validator
+        self.market_snapshot_validator = market_snapshot_validator
+        self.prediction_context_validator = prediction_context_validator
 
     def write_artifact_manifest(self, manifest: DerivedArtifactManifest) -> Path:
         """Write one immutable derived artifact manifest and recheck its identity."""
@@ -629,7 +644,7 @@ class DerivedArchive:
     load_run = load_run_manifest
 
     def write_snapshot(self, snapshot: PreMatchSnapshot) -> Path:
-        verify_snapshot(snapshot, source_validator=self)
+        verify_current_snapshot(snapshot, source_validator=self)
         path = self.snapshot_path(snapshot)
         payload = (
             json.dumps(
@@ -684,22 +699,28 @@ class DerivedArchive:
         """Persist a complete, content-addressed team baseline artifact."""
 
         payload = team_baseline_payload(artifact)
-        path = self._write_json(self.team_baseline_path(artifact.artifact_id), payload)
+        manifest_generated_at = artifact.as_of if generated_at is None else generated_at
+        require_utc(manifest_generated_at, "team baseline generated_at")
+        if manifest_generated_at < artifact.as_of:
+            raise ValueError("team baseline generated_at cannot precede as_of")
         status = "succeeded" if artifact.quality_status == "ready" else "partial"
-        self.write_artifact_manifest(
-            DerivedArtifactManifest.create(
-                artifact_type="team-baseline",
-                schema_version=artifact.schema_version,
-                payload=payload,
-                generated_at=generated_at or artifact.as_of,
-                transform_version=artifact.transform_version,
-                code_version=code_version,
-                input_refs=artifact.input_refs,
-                output_refs=(artifact.artifact_id,),
-                status=status,
-                quality=artifact.quality_status,
-            )
+        manifest = DerivedArtifactManifest.create(
+            artifact_type="team-baseline",
+            schema_version=artifact.schema_version,
+            payload=payload,
+            generated_at=manifest_generated_at,
+            transform_version=artifact.transform_version,
+            code_version=code_version,
+            input_refs=artifact.input_refs,
+            output_refs=(artifact.artifact_id,),
+            status=status,
+            quality=artifact.quality_status,
         )
+        existing = self._load_artifact_manifests_for_output_ref(artifact.artifact_id)
+        if existing and (len(existing) != 1 or existing[0].artifact_id != manifest.artifact_id):
+            raise ArchiveConflictError("team baseline artifact already has another manifest")
+        path = self._write_json(self.team_baseline_path(artifact.artifact_id), payload)
+        self.write_artifact_manifest(manifest)
         return path
 
     def load_team_baseline(self, artifact_id: str) -> TeamBaselineArtifact:
@@ -710,6 +731,83 @@ class DerivedArchive:
         if artifact.artifact_id != artifact_id:
             raise ArchiveConflictError("team baseline path and artifact ID disagree")
         return artifact
+
+    def write_team_baseline_source(
+        self,
+        *,
+        match_id: MatchId,
+        match_version: int,
+        as_of: datetime,
+        baseline_artifact_id: str,
+    ) -> str:
+        """Persist a canonical team-baseline contribution for one fixture.
+
+        The caller supplies only the fixture identity, cutoff, and the ID of an
+        already persisted baseline.  Fixture direction, kickoff, baseline
+        lambdas, lineage, and source timestamps are all reconstructed here.
+        This keeps a caller from reusing a valid baseline with an arbitrary
+        match or lambda pair.
+        """
+
+        if not isinstance(match_id, MatchId):
+            raise TypeError("match_id must be a MatchId")
+        if (
+            not isinstance(match_version, int)
+            or isinstance(match_version, bool)
+            or match_version < 1
+        ):
+            raise ValueError("match_version must be a positive integer")
+        require_utc(as_of, "as_of")
+        if not isinstance(baseline_artifact_id, str) or not baseline_artifact_id.startswith(
+            "team-baseline:"
+        ):
+            raise ValueError("baseline_artifact_id must be a team-baseline reference")
+
+        baseline = self.load_team_baseline(baseline_artifact_id)
+        self._load_verified_team_baseline_manifest(baseline)
+        match, version = self._load_exact_match_version(match_id, match_version)
+        kickoff = version.kickoff_at
+        if kickoff is None:
+            raise ValueError("team-baseline-input/3 requires a scheduled kickoff")
+        if as_of >= kickoff:
+            raise ValueError("team-baseline-input/3 as_of must precede kickoff")
+        self._validate_team_baseline_temporal_inputs(baseline, as_of)
+        lambda_home, lambda_away = expected_goals_from_baseline(
+            baseline,
+            home_team_id=match.home_team_id.value,
+            away_team_id=match.away_team_id.value,
+        )
+        value = {
+            "artifact_id": baseline.artifact_id,
+            "artifact": team_baseline_payload(baseline),
+            "lambda_home": lambda_home,
+            "lambda_away": lambda_away,
+        }
+        source_context = self._team_baseline_source_context(
+            match_id=match.id,
+            match_version=version.version,
+            home_team_id=match.home_team_id,
+            away_team_id=match.away_team_id,
+            kickoff=kickoff,
+            as_of=as_of,
+            baseline=baseline,
+        )
+        input_refs = tuple(sorted(set(baseline.input_refs)))
+        input_observed_at = [
+            self._validate_snapshot_source_input_ref(reference) for reference in input_refs
+        ]
+        generated_at = max((version.observed_at, *input_observed_at))
+        known_at = baseline.as_of
+        if known_at > generated_at:
+            raise ValueError("team-baseline-input/3 baseline as_of follows generated_at")
+        return self._write_snapshot_source(
+            value=value,
+            input_refs=input_refs,
+            transform_version=TEAM_BASELINE_INPUT_TRANSFORM_V3,
+            generated_at=generated_at,
+            known_at=known_at,
+            source_context=source_context,
+        )
 
     def write_snapshot_source(
         self,
@@ -722,6 +820,16 @@ class DerivedArchive:
     ) -> str:
         """Archive one content-addressed feature value and its verified lineage."""
 
+        if transform_version == "match-context-input/1":
+            raise ValueError("match-context-input/1 is audit-only and cannot be newly written")
+        if transform_version == MATCH_CONTEXT_INPUT_TRANSFORM_V2:
+            raise ValueError("use write_match_context_source for match-context-input/2")
+        if transform_version in {
+            "team-baseline-input/1",
+            "team-baseline-input/2",
+            TEAM_BASELINE_INPUT_TRANSFORM_V3,
+        }:
+            raise ValueError("use write_team_baseline_source for team baseline inputs")
         if transform_version == "official-lineup-input/2":
             raise ValueError("use write_official_lineup_source for official-lineup-input/2")
         return self._write_snapshot_source(
@@ -731,6 +839,31 @@ class DerivedArchive:
             generated_at=generated_at,
             known_at=known_at,
             source_context=None,
+        )
+
+    def write_match_context_source(
+        self,
+        *,
+        match_id: MatchId,
+        match_version: int,
+        as_of: datetime,
+    ) -> str:
+        """Persist per-team rest only after replaying canonical schedule and results."""
+
+        replay = replay_match_context(
+            match_id=match_id,
+            match_version=match_version,
+            as_of=as_of,
+            archive=RawArchive(self.layout),
+            canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+        )
+        return self._write_snapshot_source(
+            value=replay.value,
+            input_refs=replay.input_refs,
+            transform_version=MATCH_CONTEXT_INPUT_TRANSFORM_V2,
+            generated_at=replay.observed_at,
+            known_at=replay.known_at,
+            source_context=replay.source_context,
         )
 
     def write_official_lineup_source(
@@ -828,6 +961,26 @@ class DerivedArchive:
                 generated_at=generated_at,
                 known_at=known_at,
             )
+        if transform_version == MATCH_CONTEXT_INPUT_TRANSFORM_V2:
+            if known_at is None or source_context is None:
+                raise ValueError("match-context-input/2 requires canonical source context")
+            self._validate_match_context_source(
+                value,
+                normalized_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
+            )
+        if transform_version == TEAM_BASELINE_INPUT_TRANSFORM_V3:
+            if known_at is None or source_context is None:
+                raise ValueError("team-baseline-input/3 requires canonical source context")
+            self._validate_team_baseline_source_v3(
+                value,
+                normalized_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
+            )
         if transform_version == "official-lineup-input/2":
             if known_at is None or source_context is None:
                 raise ValueError("official-lineup-input/2 requires canonical source context")
@@ -891,6 +1044,18 @@ class DerivedArchive:
         value = payload["value"]
         if transform_version in {"team-baseline-input/1", "team-baseline-input/2"}:
             self._validate_team_baseline_source(value, input_refs)
+        if transform_version == TEAM_BASELINE_INPUT_TRANSFORM_V3:
+            if known_at is None or source_context is None:
+                raise ArchiveConflictError(
+                    "team-baseline-input/3 source is missing canonical context"
+                )
+            self._validate_team_baseline_source_v3(
+                value,
+                input_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
+            )
         if transform_version == LINEUP_DELTA_INPUT_TRANSFORM_V3:
             if known_at is None:
                 raise ArchiveConflictError("lineup-delta-input/3 source is missing known_at")
@@ -899,6 +1064,18 @@ class DerivedArchive:
                 input_refs,
                 generated_at=generated_at,
                 known_at=known_at,
+            )
+        if transform_version == MATCH_CONTEXT_INPUT_TRANSFORM_V2:
+            if known_at is None or source_context is None:
+                raise ArchiveConflictError(
+                    "match-context-input/2 source is missing canonical context"
+                )
+            self._validate_match_context_source(
+                value,
+                input_refs,
+                generated_at=generated_at,
+                known_at=known_at,
+                source_context=source_context,
             )
         if transform_version == "official-lineup-input/2":
             if known_at is None or source_context is None:
@@ -931,6 +1108,7 @@ class DerivedArchive:
     ) -> Path:
         """Persist a prediction together with its immutable score-grid provenance."""
 
+        verify_current_snapshot(snapshot, source_validator=self)
         verify_prediction_snapshot(
             prediction,
             snapshot=snapshot,
@@ -1322,6 +1500,22 @@ class DerivedArchive:
         separate and lets the manifest remain fully content-addressed.
         """
 
+        matches = self._load_artifact_manifests_for_output_ref(output_ref)
+        if not matches:
+            raise ArchiveConflictError(f"no derived manifest exposes output ref {output_ref}")
+        if len(matches) > 1:
+            semantic_identities = {_artifact_output_semantic_identity(item) for item in matches}
+            if len(semantic_identities) > 1:
+                raise ArchiveConflictError(
+                    f"output ref {output_ref} resolves to conflicting manifests"
+                )
+        return min(matches, key=lambda item: item.artifact_id)
+
+    def _load_artifact_manifests_for_output_ref(
+        self, output_ref: str
+    ) -> list[DerivedArtifactManifest]:
+        """Load every valid manifest file that claims one logical output ref."""
+
         matches: list[DerivedArtifactManifest] = []
         for path in (self.layout.derived / "manifests" / "artifacts").rglob("*.json"):
             try:
@@ -1339,15 +1533,7 @@ class DerivedArchive:
                 continue
             manifest = _parse_artifact_manifest(payload)
             matches.append(self.load_artifact_manifest(manifest.artifact_id))
-        if not matches:
-            raise ArchiveConflictError(f"no derived manifest exposes output ref {output_ref}")
-        if len(matches) > 1:
-            semantic_identities = {_artifact_output_semantic_identity(item) for item in matches}
-            if len(semantic_identities) > 1:
-                raise ArchiveConflictError(
-                    f"output ref {output_ref} resolves to conflicting manifests"
-                )
-        return min(matches, key=lambda item: item.artifact_id)
+        return matches
 
     def run_manifest_path(self, run_id: str) -> Path:
         digest = _manifest_digest(run_id, "run")
@@ -1377,6 +1563,25 @@ class DerivedArchive:
             return raw.load(asset_id).observed_at
         if reference.startswith("official-lineup-contract:"):
             return self._replay_official_lineup_contract(reference).observed_at
+        if reference.startswith("fact:match_results_90:"):
+            canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+            load_verified_match_result(
+                reference,
+                archive=RawArchive(self.layout),
+                canonical=canonical,
+            )
+            with canonical.connect() as connection:
+                row = connection.execute(
+                    "SELECT observed_at FROM match_results_90 WHERE record_id = ?",
+                    (reference,),
+                ).fetchone()
+            if row is None:
+                raise ArchiveConflictError("canonical result reference is unavailable")
+            return _parse_manifest_datetime(row["observed_at"], "result observed_at")
+        if reference.startswith("team-baseline:"):
+            baseline = self.load_team_baseline(reference)
+            self._load_verified_team_baseline_manifest(baseline)
+            return baseline.as_of
         try:
             if reference.startswith("player-profile:"):
                 _, manifest = self._load_player_profile_with_manifest(reference)
@@ -1388,6 +1593,50 @@ class DerivedArchive:
                 f"snapshot source input reference is unavailable or invalid: {reference}"
             ) from error
         raise ArchiveConflictError(f"unsupported snapshot source input reference: {reference}")
+
+    def _validate_match_context_source(
+        self,
+        value: Any,
+        input_refs: tuple[str, ...],
+        *,
+        generated_at: datetime,
+        known_at: datetime,
+        source_context: dict[str, Any],
+    ) -> None:
+        expected_fields = {
+            "rule_version",
+            "match_id",
+            "match_version",
+            "as_of",
+            "scheduled_kickoff",
+            "home_team_id",
+            "away_team_id",
+            "quality_status",
+        }
+        if set(source_context) != expected_fields:
+            raise ArchiveConflictError("match-context-input/2 source context is invalid")
+        try:
+            replay = replay_match_context(
+                match_id=MatchId(str(source_context["match_id"])),
+                match_version=source_context["match_version"],
+                as_of=_parse_manifest_datetime(source_context["as_of"], "context as_of"),
+                archive=RawArchive(self.layout),
+                canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+            )
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ArchiveConflictError(
+                "match-context-input/2 canonical replay is unavailable or invalid"
+            ) from error
+        if (
+            _canonical_json(value) != _canonical_json(replay.value)
+            or input_refs != replay.input_refs
+            or generated_at != replay.observed_at
+            or known_at != replay.known_at
+            or source_context != replay.source_context
+        ):
+            raise ArchiveConflictError(
+                "match-context-input/2 does not match recomputed canonical context"
+            )
 
     def _validate_official_lineup_source(
         self,
@@ -1625,6 +1874,267 @@ class DerivedArchive:
         if nested_profile_refs | nested_lineup_refs | nested_reference_refs != set(input_refs):
             raise ArchiveConflictError("lineup delta nested refs do not match source input_refs")
 
+    def _load_exact_match_version(self, match_id: MatchId, match_version: int):
+        """Load one immutable canonical match/version pair."""
+
+        try:
+            match = CanonicalStore(self.layout.canonical / "platform.sqlite3").match(match_id)
+            versions = CanonicalStore(self.layout.canonical / "platform.sqlite3").match_versions(
+                match_id
+            )
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ArchiveConflictError("canonical match version is unavailable") from error
+        for version in versions:
+            if version.version == match_version:
+                return match, version
+        raise ArchiveConflictError("canonical match version does not exist")
+
+    def _load_verified_team_baseline_manifest(
+        self, baseline: TeamBaselineArtifact
+    ) -> DerivedArtifactManifest:
+        """Require exactly one manifest matching the baseline writer contract."""
+
+        try:
+            matches = self._load_artifact_manifests_for_output_ref(baseline.artifact_id)
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ArchiveConflictError("team baseline artifact manifest is unavailable") from error
+        if len(matches) != 1:
+            raise ArchiveConflictError("team baseline artifact requires exactly one manifest")
+        manifest = matches[0]
+        expected_status = "succeeded" if baseline.quality_status == "ready" else "partial"
+        if (
+            manifest.artifact_type != "team-baseline"
+            or manifest.schema_version != baseline.schema_version
+            or manifest.transform_version != baseline.transform_version
+            or manifest.input_refs != tuple(sorted(set(baseline.input_refs)))
+            or manifest.output_refs != (baseline.artifact_id,)
+            or manifest.status != expected_status
+            or manifest.quality != baseline.quality_status
+            or manifest.error is not None
+            or manifest.payload != team_baseline_payload(baseline)
+        ):
+            raise ArchiveConflictError("team baseline artifact manifest does not match payload")
+        if not (
+            manifest.started_at == manifest.generated_at == manifest.ended_at
+            and manifest.generated_at >= baseline.as_of
+        ):
+            raise ArchiveConflictError("team baseline artifact manifest times are invalid")
+        return manifest
+
+    def _validate_team_baseline_temporal_inputs(
+        self, baseline: TeamBaselineArtifact, as_of: datetime
+    ) -> None:
+        """Ensure baseline semantics and known input evidence do not follow the cutoff.
+
+        Historical reconstructed evidence may have been collected after the
+        historical cutoff.  In that case a raw asset's explicit target event
+        time (or a typed fact/source ``known_at``) remains the semantic clock;
+        an unknown target event time is not silently interpreted as a future
+        fact.
+        """
+
+        if baseline.as_of > as_of:
+            raise ArchiveConflictError("team baseline as_of follows feature cutoff")
+        for reference in baseline.input_refs:
+            self._validate_team_baseline_input_available(reference, as_of)
+
+    def _validate_team_baseline_input_available(self, reference: str, as_of: datetime) -> None:
+        if reference.startswith("raw-asset:"):
+            raw = RawArchive(self.layout)
+            asset = raw.load(RawAssetId(reference))
+            raw.verify(asset)
+            if asset.target_event_time is None:
+                raise ArchiveConflictError(
+                    "team baseline raw input lacks a semantic known_at timestamp"
+                )
+            if asset.target_event_time > as_of:
+                raise ArchiveConflictError(
+                    f"team baseline input follows feature cutoff: {reference}"
+                )
+            return
+        if reference.startswith("fact:match_results_90:"):
+            canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+            result = load_verified_match_result(
+                reference,
+                archive=RawArchive(self.layout),
+                canonical=canonical,
+            )
+            if result.known_at > as_of:
+                raise ArchiveConflictError(
+                    f"team baseline input known after feature cutoff: {reference}"
+                )
+            return
+        if reference.startswith("derived-source:"):
+            validation = self.validate_snapshot_source(reference)
+            semantic_time = validation.known_at or validation.observed_at
+            if semantic_time > as_of:
+                raise ArchiveConflictError(
+                    f"team baseline input known after feature cutoff: {reference}"
+                )
+            return
+        if reference.startswith("team-baseline:"):
+            nested = self.load_team_baseline(reference)
+            if nested.as_of > as_of:
+                raise ArchiveConflictError(
+                    f"nested team baseline follows feature cutoff: {reference}"
+                )
+            return
+        # Let the normal source resolver provide the typed-reference error.
+        self._validate_snapshot_source_input_ref(reference)
+
+    def _team_baseline_source_context(
+        self,
+        *,
+        match_id: MatchId,
+        match_version: int,
+        home_team_id: TeamId,
+        away_team_id: TeamId,
+        kickoff: datetime,
+        as_of: datetime,
+        baseline: TeamBaselineArtifact,
+    ) -> dict[str, Any]:
+        return {
+            "rule_version": "expected-goals-from-team-baseline/1",
+            "transform_version": TEAM_BASELINE_INPUT_TRANSFORM_V3,
+            "match_id": match_id.value,
+            "match_version": match_version,
+            "home_team_id": home_team_id.value,
+            "away_team_id": away_team_id.value,
+            "scheduled_kickoff": _timestamp(kickoff),
+            "as_of": _timestamp(as_of),
+            "baseline_artifact_id": baseline.artifact_id,
+            "baseline_as_of": _timestamp(baseline.as_of),
+            "baseline_transform_version": baseline.transform_version,
+        }
+
+    def _validate_team_baseline_source_v3(
+        self,
+        value: Any,
+        input_refs: tuple[str, ...],
+        *,
+        generated_at: datetime,
+        known_at: datetime,
+        source_context: dict[str, Any],
+    ) -> TeamBaselineArtifact:
+        """Replay and validate the formal baseline contribution contract."""
+
+        expected_context_fields = {
+            "rule_version",
+            "transform_version",
+            "match_id",
+            "match_version",
+            "home_team_id",
+            "away_team_id",
+            "scheduled_kickoff",
+            "as_of",
+            "baseline_artifact_id",
+            "baseline_as_of",
+            "baseline_transform_version",
+        }
+        if set(source_context) != expected_context_fields:
+            raise ArchiveConflictError("team-baseline-input/3 source context is invalid")
+        if source_context.get("rule_version") != "expected-goals-from-team-baseline/1":
+            raise ArchiveConflictError("team-baseline-input/3 rule version is invalid")
+        if source_context.get("transform_version") != TEAM_BASELINE_INPUT_TRANSFORM_V3:
+            raise ArchiveConflictError("team-baseline-input/3 transform context is invalid")
+        if not isinstance(value, dict) or set(value) != {
+            "artifact_id",
+            "artifact",
+            "lambda_home",
+            "lambda_away",
+        }:
+            raise ArchiveConflictError("team-baseline-input/3 value is not canonical")
+        try:
+            match_id = MatchId(str(source_context["match_id"]))
+            match_version = source_context["match_version"]
+            home_team_id = TeamId(str(source_context["home_team_id"]))
+            away_team_id = TeamId(str(source_context["away_team_id"]))
+            as_of = _parse_manifest_datetime(source_context["as_of"], "baseline as_of")
+            kickoff = _parse_manifest_datetime(
+                source_context["scheduled_kickoff"], "scheduled kickoff"
+            )
+            baseline_as_of = _parse_manifest_datetime(
+                source_context["baseline_as_of"], "baseline artifact as_of"
+            )
+        except (TypeError, ValueError, ArchiveConflictError) as error:
+            raise ArchiveConflictError(
+                "team-baseline-input/3 source context has invalid IDs"
+            ) from error
+        if (
+            not isinstance(match_version, int)
+            or isinstance(match_version, bool)
+            or match_version < 1
+            or home_team_id == away_team_id
+        ):
+            raise ArchiveConflictError("team-baseline-input/3 match identity is invalid")
+        if known_at != baseline_as_of or as_of >= kickoff or baseline_as_of > as_of:
+            raise ArchiveConflictError("team-baseline-input/3 temporal context is invalid")
+        try:
+            baseline = self.load_team_baseline(str(source_context["baseline_artifact_id"]))
+            self._load_verified_team_baseline_manifest(baseline)
+            nested = parse_team_baseline_payload(value["artifact"])
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ArchiveConflictError(
+                "team-baseline-input/3 baseline artifact is unavailable"
+            ) from error
+        if (
+            value["artifact_id"] != baseline.artifact_id
+            or source_context["baseline_artifact_id"] != baseline.artifact_id
+            or nested != baseline
+            or source_context["baseline_transform_version"] != baseline.transform_version
+            or source_context["baseline_as_of"] != _timestamp(baseline.as_of)
+        ):
+            raise ArchiveConflictError("team-baseline-input/3 baseline identity is inconsistent")
+        expected_refs = tuple(sorted(set(baseline.input_refs)))
+        if input_refs != expected_refs:
+            raise ArchiveConflictError("team-baseline-input/3 input_refs do not match baseline")
+        self._validate_team_baseline_temporal_inputs(baseline, as_of)
+        match, version = self._load_exact_match_version(match_id, match_version)
+        if (
+            match.home_team_id != home_team_id
+            or match.away_team_id != away_team_id
+            or version.kickoff_at != kickoff
+        ):
+            raise ArchiveConflictError(
+                "team-baseline-input/3 match context does not match canonical"
+            )
+        expected_context = self._team_baseline_source_context(
+            match_id=match.id,
+            match_version=version.version,
+            home_team_id=match.home_team_id,
+            away_team_id=match.away_team_id,
+            kickoff=kickoff,
+            as_of=as_of,
+            baseline=baseline,
+        )
+        if source_context != expected_context:
+            raise ArchiveConflictError("team-baseline-input/3 source context is not canonical")
+        expected_home, expected_away = expected_goals_from_baseline(
+            baseline,
+            home_team_id=home_team_id.value,
+            away_team_id=away_team_id.value,
+        )
+        if (
+            type(value["lambda_home"]) not in {int, float}
+            or type(value["lambda_away"]) not in {int, float}
+            or not math.isfinite(float(value["lambda_home"]))
+            or not math.isfinite(float(value["lambda_away"]))
+            or value["lambda_home"] <= 0
+            or value["lambda_away"] <= 0
+            or value["lambda_home"] != expected_home
+            or value["lambda_away"] != expected_away
+        ):
+            raise ArchiveConflictError("team-baseline-input/3 lambdas do not match baseline replay")
+        expected_generated_at = max(
+            (
+                version.observed_at,
+                *(self._validate_snapshot_source_input_ref(reference) for reference in input_refs),
+            )
+        )
+        if generated_at != expected_generated_at:
+            raise ArchiveConflictError("team-baseline-input/3 generated_at is not canonical")
+        return baseline
+
     def _validate_team_baseline_source(
         self, value: Any, input_refs: tuple[str, ...]
     ) -> TeamBaselineArtifact:
@@ -1803,7 +2313,11 @@ class _ManifestReferenceResolver:
         if namespace == "paper-bet-entry":
             from football_data_platform.storage.ledger import PaperBetLedger
 
-            PaperBetLedger(self.archive.layout).load(reference)
+            PaperBetLedger(
+                self.archive.layout,
+                market_snapshot_validator=self.archive.market_snapshot_validator,
+                prediction_context_validator=self.archive.prediction_context_validator,
+            ).load(reference)
             return
         if namespace in {"challenger-evidence", "promotion-decision", "promotion-policy"}:
             from football_data_platform.storage.governance import GovernanceArtifactStore
@@ -1817,6 +2331,17 @@ class _ManifestReferenceResolver:
         raise ArchiveConflictError(f"manifest reference has no resolver: {reference}")
 
     def _resolve_training_reference(self, reference: str) -> None:
+        if reference.startswith("model-run:") and self.archive.model_run_validator is not None:
+            self.archive.model_run_validator.load_model_run(reference)
+            return
+        if reference.startswith("score-grid-composition:"):
+            manifest = self.archive._load_artifact_manifest_for_output_ref(reference)
+            if manifest.artifact_type != "score-grid-composition":
+                raise ArchiveConflictError(
+                    "score-grid-composition reference resolves to the wrong artifact type"
+                )
+            self.archive.load_score_grid_composition_payload(reference)
+            return
         from football_data_platform.storage.training import TrainingArtifactStore
 
         store = TrainingArtifactStore(self.archive.layout)
@@ -2125,6 +2650,7 @@ def _artifact_output_semantic_identity(manifest: DerivedArtifactManifest) -> byt
             "started_at": _timestamp(manifest.started_at),
             "ended_at": _timestamp(manifest.ended_at),
             "transform_version": manifest.transform_version,
+            "code_version": manifest.code_version,
             "input_refs": list(manifest.input_refs),
             "output_refs": list(manifest.output_refs),
             "status": manifest.status,

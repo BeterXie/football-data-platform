@@ -6,6 +6,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _formal_context import (
+    registered_target_identity,
+    seed_formal_context,
+    seed_legacy_snapshot_source,
+)
 
 from football_data_platform.config import load_competition_registry
 from football_data_platform.domain import snapshots as snapshot_contract
@@ -66,9 +71,7 @@ from football_data_platform.storage.raw import (
 
 KICKOFF = datetime(2025, 8, 16, 14, 0, tzinfo=UTC)
 OBSERVED_AT = KICKOFF + timedelta(days=1)
-HOME = TeamId("team:home")
-AWAY = TeamId("team:away")
-MATCH = MatchId("match:test")
+MATCH, HOME, AWAY = registered_target_identity()
 ROOT = Path(__file__).parents[1]
 
 
@@ -94,7 +97,7 @@ def _stores(tmp_path: Path, *, observed_at: datetime = OBSERVED_AT):
         source_id="fixture-evidence",
         url="fixture://evidence",
         observed_at=observed_at,
-        target_event_time=None,
+        target_event_time=KICKOFF - timedelta(days=3),
         collector_version="test-collector/1",
         media_type="application/octet-stream",
     )
@@ -249,6 +252,18 @@ def _ready_delta_item(
 
 
 def _source(derived: DerivedArchive, asset, value, transform: str) -> str:
+    if transform in {
+        "match-context-input/1",
+        "team-baseline-input/1",
+        "team-baseline-input/2",
+    }:
+        return seed_legacy_snapshot_source(
+            derived,
+            value=value,
+            input_refs=(asset.id,),
+            transform_version=transform,
+            generated_at=asset.observed_at,
+        )
     return derived.write_snapshot_source(
         value=value,
         input_refs=(asset.id,),
@@ -602,6 +617,55 @@ def _snapshot_arguments(derived: DerivedArchive) -> dict:
     }
 
 
+def _current_t24_snapshot(
+    derived: DerivedArchive,
+    asset,
+    *,
+    context_observed_at: datetime | None = None,
+):
+    baseline, _ = _t24_features(derived, asset)
+    as_of = KICKOFF - timedelta(hours=24)
+    formal = seed_formal_context(
+        derived.layout,
+        as_of=as_of,
+        kickoff=KICKOFF,
+        key="snapshot-lifecycle-current",
+        observed_at=context_observed_at,
+    )
+    baseline_ref = derived.write_team_baseline_source(
+        match_id=formal.match_id,
+        match_version=formal.match_version,
+        as_of=as_of,
+        baseline_artifact_id=baseline.value["artifact_id"],
+    )
+    baseline_validation = derived.validate_snapshot_source(baseline_ref)
+    baseline = replace(
+        baseline,
+        value=baseline_validation.value,
+        known_at=baseline_validation.known_at,
+        source_ref=baseline_ref,
+    )
+    context = SnapshotFeature(
+        "match_context",
+        formal.context_value,
+        formal.context_known_at,
+        formal.context_ref,
+        "match-context",
+    )
+    return build_snapshot(
+        match_id=formal.match_id,
+        match_version=formal.match_version,
+        snapshot_type=SnapshotType.T24H,
+        as_of=as_of,
+        scheduled_kickoff_used=KICKOFF,
+        feature_spec_version="prematch-features/3",
+        features=(baseline, context),
+        home_team_id=formal.home_team_id,
+        away_team_id=formal.away_team_id,
+        source_validator=derived,
+    )
+
+
 def test_t24_snapshot_rejects_future_information(tmp_path: Path) -> None:
     _, derived, asset = _stores(tmp_path)
     as_of = KICKOFF - timedelta(hours=24)
@@ -639,7 +703,8 @@ def test_team_baseline_source_rejects_fake_artifact_identity(tmp_path: Path) -> 
         "lambda_home": 1.5,
         "lambda_away": 1.0,
     }
-    source_ref = derived.write_snapshot_source(
+    source_ref = seed_legacy_snapshot_source(
+        derived,
         value=payload,
         input_refs=(asset.id,),
         transform_version="team-baseline-input/2",
@@ -991,9 +1056,13 @@ def test_legacy_lineup_payload_is_v1_read_only_but_remains_verifiable(tmp_path: 
         HOME,
         AWAY,
     )
-    assert missing == (
-        f"{AWAY.value}:reference_lineup",
-        f"{HOME.value}:reference_lineup",
+    assert missing == tuple(
+        sorted(
+            (
+                f"{AWAY.value}:reference_lineup",
+                f"{HOME.value}:reference_lineup",
+            )
+        )
     )
     with pytest.raises(ValueError, match="read-only legacy"):
         build_snapshot(
@@ -1012,10 +1081,7 @@ def test_legacy_lineup_payload_is_v1_read_only_but_remains_verifiable(tmp_path: 
 
 def test_snapshot_is_content_identified_and_idempotently_archived(tmp_path: Path) -> None:
     _, derived, asset = _stores(tmp_path)
-    snapshot = build_snapshot(
-        features=_t24_features(derived, asset),
-        **_snapshot_arguments(derived),
-    )
+    snapshot = _current_t24_snapshot(derived, asset)
 
     assert derived.write_snapshot(snapshot) == derived.write_snapshot(snapshot)
     assert derived.load_snapshot_payload(snapshot)["capture_mode"] == "reconstructed"
@@ -1023,10 +1089,7 @@ def test_snapshot_is_content_identified_and_idempotently_archived(tmp_path: Path
 
 def test_persisted_snapshot_payload_round_trips_strictly(tmp_path: Path) -> None:
     _, derived, asset = _stores(tmp_path)
-    snapshot = build_snapshot(
-        features=_t24_features(derived, asset),
-        **_snapshot_arguments(derived),
-    )
+    snapshot = _current_t24_snapshot(derived, asset)
     derived.write_snapshot(snapshot)
     payload = derived.load_snapshot_payload(snapshot)
 
@@ -1037,6 +1100,17 @@ def test_persisted_snapshot_payload_round_trips_strictly(tmp_path: Path) -> None
             {**payload, "unexpected": "forged"},
             source_validator=derived,
         )
+
+
+def test_legacy_snapshot_cannot_be_newly_archived(tmp_path: Path) -> None:
+    _, derived, asset = _stores(tmp_path)
+    snapshot = build_snapshot(
+        features=_t24_features(derived, asset),
+        **_snapshot_arguments(derived),
+    )
+
+    with pytest.raises(ValueError, match="audit-only"):
+        derived.write_snapshot(snapshot)
 
 
 def test_snapshot_identity_is_independent_of_feature_input_order(tmp_path: Path) -> None:
@@ -1101,7 +1175,7 @@ def test_qualifications_are_independent_but_cannot_skip_incomplete_archive() -> 
     assert "unverified_snapshot_evidence" in by_name[Qualification.SCORE_MODEL].reason_codes
     assert not by_name[Qualification.TEAM_BASELINE].passed
     assert by_name[Qualification.PLAYER_PROFILE].passed
-    assert "missing_team_stat:team:away:xg" in by_name[Qualification.TEAM_BASELINE].reason_codes
+    assert f"missing_team_stat:{AWAY.value}:xg" in by_name[Qualification.TEAM_BASELINE].reason_codes
 
 
 def test_finished_but_incomplete_archive_is_pending() -> None:
@@ -1180,21 +1254,24 @@ def test_persisted_verified_snapshot_advances_only_after_it_was_observed(
 ) -> None:
     snapshot_time = KICKOFF - timedelta(hours=24)
     _, derived, asset = _stores(tmp_path, observed_at=snapshot_time)
-    snapshot = build_snapshot(
-        features=_t24_features(derived, asset),
-        **_snapshot_arguments(derived),
+    snapshot = _current_t24_snapshot(
+        derived,
+        asset,
+        context_observed_at=snapshot_time,
     )
     derived.write_snapshot(snapshot)
+    assert snapshot.home_team_id is not None
+    assert snapshot.away_team_id is not None
     availability = MatchAvailability(
         match_status=MatchStatus.SCHEDULED,
-        team_ids=(HOME.value, AWAY.value),
+        team_ids=(snapshot.home_team_id.value, snapshot.away_team_id.value),
         snapshots=(SnapshotAvailability.from_snapshot(snapshot),),
         result_90_present=False,
         team_stat_fields={},
         starters={},
         player_observation_ids=frozenset(),
-        match_id=MATCH.value,
-        match_version=1,
+        match_id=snapshot.match_id.value,
+        match_version=snapshot.match_version,
     )
 
     before = assess_lifecycle(

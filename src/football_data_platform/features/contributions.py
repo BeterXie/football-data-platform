@@ -20,6 +20,7 @@ from football_data_platform.domain.contributions import (
     LINEUP_DEFENSE_DIMENSIONS,
     LINEUP_DELTA_CALIBRATION_VERSION,
     MATCH_CONTEXT_CALIBRATION_VERSION,
+    MATCH_CONTEXT_CALIBRATION_VERSION_V2,
     ContributionCalibration,
     calibrated_multipliers,
     validate_contribution_calibration_policy,
@@ -30,6 +31,7 @@ from football_data_platform.features.lineup import LINEUP_DELTA_INPUT_TRANSFORM_
 EXPECTED_GOALS_CONTRIBUTION_VERSION = "expected-goals-contribution/2"
 LINEUP_CALIBRATION_VERSION = LINEUP_DELTA_CALIBRATION_VERSION
 CONTEXT_CALIBRATION_VERSION = MATCH_CONTEXT_CALIBRATION_VERSION
+CONTEXT_CALIBRATION_VERSION_V2 = MATCH_CONTEXT_CALIBRATION_VERSION_V2
 
 
 class LineupDeltaSourceValidator(Protocol):
@@ -315,6 +317,81 @@ def context_contribution(
         calibration=calibration,
         version=version,
     )
+
+
+def context_contributions(
+    context: Mapping[str, Any],
+    *,
+    home_team_id: str,
+    away_team_id: str,
+    source_ref: str,
+    source_validator: LineupDeltaSourceValidator,
+    coefficient: float = 0.02,
+    reference_rest_days: float = 5.0,
+    version: str = CONTEXT_CALIBRATION_VERSION_V2,
+) -> tuple[ExpectedGoalsContribution, ExpectedGoalsContribution]:
+    """Build one replayable rest contribution for each side's own lambda."""
+
+    _require_version(version)
+    _require_source(source_ref)
+    if not home_team_id or not away_team_id or home_team_id == away_team_id:
+        raise ValueError("context contributions require distinct match teams")
+    if not math.isfinite(coefficient) or coefficient <= 0:
+        raise ValueError("coefficient must be finite and positive")
+    if not math.isfinite(reference_rest_days) or reference_rest_days < 0:
+        raise ValueError("reference_rest_days must be finite and non-negative")
+    policy = validate_generator_calibration_policy(
+        version,
+        source_feature_name="match_context",
+        reference_value=reference_rest_days,
+        coefficient=coefficient,
+    )
+    validation = source_validator.validate_snapshot_source(source_ref)
+    if validation.transform_version != "match-context-input/2" or validation.value != context:
+        raise ValueError("context source does not match its formal replay artifact")
+    teams = context.get("teams")
+    if not isinstance(teams, Mapping) or set(teams) != {home_team_id, away_team_id}:
+        raise ValueError("formal context must be keyed by the canonical match teams")
+
+    contributions: list[ExpectedGoalsContribution] = []
+    for team_id, home_coefficient, away_coefficient in (
+        (home_team_id, coefficient, 0.0),
+        (away_team_id, 0.0, coefficient),
+    ):
+        item = teams[team_id]
+        raw_days = item.get("rest_days") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(item, Mapping)
+            or item.get("status") != "available"
+            or not isinstance(raw_days, (int, float))
+            or isinstance(raw_days, bool)
+            or not math.isfinite(float(raw_days))
+            or raw_days <= 0
+        ):
+            raise ValueError(f"context rest is unavailable for {team_id}")
+        calibration = ContributionCalibration(
+            source_feature_name="match_context",
+            source_path=("teams", team_id, "rest_days"),
+            source_value=float(raw_days),
+            reference_value=reference_rest_days,
+            lambda_home_coefficient=home_coefficient,
+            lambda_away_coefficient=away_coefficient,
+            minimum_log_multiplier=policy.minimum_log_multiplier,
+            maximum_log_multiplier=policy.maximum_log_multiplier,
+            formula_version=policy.formula_version,
+        )
+        home_multiplier, away_multiplier = calibrated_multipliers(calibration)
+        contributions.append(
+            ExpectedGoalsContribution(
+                contribution_key=f"context:rest-days:{team_id}:{version}",
+                lambda_home_multiplier=home_multiplier,
+                lambda_away_multiplier=away_multiplier,
+                source_ref=source_ref,
+                calibration=calibration,
+                version=version,
+            )
+        )
+    return contributions[0], contributions[1]
 
 
 def _require_version(value: str) -> None:

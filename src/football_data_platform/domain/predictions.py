@@ -32,12 +32,16 @@ from football_data_platform.domain.snapshots import (
     CaptureMode,
     PreMatchSnapshot,
     SnapshotSourceValidator,
+    verify_current_snapshot,
     verify_snapshot,
 )
 from football_data_platform.domain.training import (
     ModelRunArtifact,
     ModelRunStatus,
     verify_model_run_artifact,
+)
+from football_data_platform.domain.training_qualification import (
+    CURRENT_SCORE_FEATURE_PROJECTION_VERSION,
 )
 from football_data_platform.models.score_grid import DixonColesGrid
 
@@ -46,6 +50,10 @@ SCORE_GRID_COMPOSITION_SCHEMA_VERSION = 2
 SCORE_GRID_COMPOSITION_ARTIFACT_TYPE = "score-grid-composition"
 SCORE_GRID_COMPOSITION_CODE_VERSION = "football-data-platform/0.1.0"
 LEGACY_COMPOSITION_VERSION = "legacy-inline/1"
+MARKET_SNAPSHOT_SCHEMA_VERSION = 2
+LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION = 1
+MARKET_PERIOD_90_MINUTES = "90m"
+MAX_ABSOLUTE_MARKET_LINE = 100.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +196,14 @@ class MarketSourceValidator(Protocol):
     def verify(self, asset: RawAsset | RawAssetId) -> None: ...
 
 
+class PersistedPredictionContextValidator(Protocol):
+    """Authority that replays a formal prediction with its exact snapshot."""
+
+    def load_verified_prediction_context(
+        self, reference: str
+    ) -> tuple[ScorePrediction, PreMatchSnapshot]: ...
+
+
 class ModelRunValidator(Protocol):
     def load_model_run(self, model_run_id: str) -> ModelRunArtifact: ...
 
@@ -219,9 +235,16 @@ class MarketSnapshot:
     observed_at: datetime
     quotes: tuple[MarketQuote, ...]
     raw_asset_ref: str
+    period: str | None = None
+    line: float | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version
+            not in {LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION, MARKET_SNAPSHOT_SCHEMA_VERSION}
+        ):
             raise ValueError(f"unsupported market snapshot schema_version {self.schema_version!r}")
         _require_text(self.source, "source")
         _require_text(self.market_type, "market_type")
@@ -236,6 +259,24 @@ class MarketSnapshot:
         outcomes = [quote.outcome for quote in self.quotes]
         if len(outcomes) != len(set(outcomes)):
             raise ValueError("market snapshot contains duplicate outcomes")
+        if self.schema_version == LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION:
+            if self.period is not None or self.line is not None:
+                raise ValueError("legacy market snapshots cannot contain period or line")
+            return
+        if self.period != MARKET_PERIOD_90_MINUTES:
+            raise ValueError("formal market snapshots require period='90m'")
+        _validate_market_snapshot_line(self.market_type, self.line)
+
+
+class MarketSnapshotValidator(Protocol):
+    """Authority that loads a fully verified persisted market snapshot.
+
+    Implementations must validate the complete semantic snapshot, including
+    its raw lineage, before returning it.  Callers still compare the returned
+    object with their candidate so an ID cannot authorize different content.
+    """
+
+    def load_verified_market_snapshot(self, snapshot_id: str) -> MarketSnapshot: ...
 
 
 def build_market_snapshot(
@@ -246,6 +287,8 @@ def build_market_snapshot(
     data_kind: MarketDataKind,
     quotes: tuple[MarketQuote, ...],
     raw_asset: RawAsset,
+    period: str = MARKET_PERIOD_90_MINUTES,
+    line: float | None = None,
 ) -> MarketSnapshot:
     """Build an immutable market document whose metadata cites one raw observation."""
 
@@ -260,12 +303,17 @@ def build_market_snapshot(
         "observed_at": raw_asset.observed_at,
         "quotes": quotes,
         "raw_asset_ref": raw_asset.id.value,
+        "period": period,
+        "line": line,
     }
-    identity = _market_snapshot_identity(**fields)
+    identity = _market_snapshot_identity(
+        schema_version=MARKET_SNAPSHOT_SCHEMA_VERSION,
+        **fields,
+    )
     digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
     return MarketSnapshot(
         id=MarketSnapshotId(f"market-snapshot:{digest}"),
-        schema_version=1,
+        schema_version=MARKET_SNAPSHOT_SCHEMA_VERSION,
         **fields,
     )
 
@@ -290,6 +338,7 @@ def verify_market_snapshot(
     ):
         raise ValueError("market snapshot source metadata does not match raw evidence")
     identity = _market_snapshot_identity(
+        schema_version=snapshot.schema_version,
         match_id=snapshot.match_id,
         source=snapshot.source,
         market_type=snapshot.market_type,
@@ -298,10 +347,37 @@ def verify_market_snapshot(
         observed_at=snapshot.observed_at,
         quotes=snapshot.quotes,
         raw_asset_ref=snapshot.raw_asset_ref,
+        period=snapshot.period,
+        line=snapshot.line,
     )
     digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
     if snapshot.id != MarketSnapshotId(f"market-snapshot:{digest}"):
         raise ValueError("market snapshot identity does not match its canonical content")
+
+
+def verify_authoritative_market_snapshot(
+    snapshot: MarketSnapshot,
+    *,
+    validator: MarketSnapshotValidator,
+) -> None:
+    """Require an exact snapshot returned by an authoritative semantic store."""
+
+    if not isinstance(snapshot, MarketSnapshot):
+        raise TypeError("snapshot must be a MarketSnapshot")
+    try:
+        load_verified = validator.load_verified_market_snapshot
+    except AttributeError as error:
+        raise ValueError(
+            "market snapshot validator does not provide authoritative semantic lookup"
+        ) from error
+    try:
+        stored = load_verified(snapshot.id.value)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("authoritative market snapshot is unavailable or invalid") from error
+    if not isinstance(stored, MarketSnapshot):
+        raise ValueError("authoritative market snapshot validator returned an invalid record")
+    if stored != snapshot:
+        raise ValueError("market snapshot does not match its authoritative record")
 
 
 def build_score_prediction(
@@ -330,13 +406,59 @@ def build_score_prediction(
     bytes; they cannot be used to create a new formal prediction.
     """
 
-    verify_snapshot(snapshot, source_validator=snapshot_validator)
+    return _build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=snapshot_validator,
+        model_run_id=model_run_id,
+        model_version=model_version,
+        generated_at=generated_at,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
+        rho=rho,
+        max_goals=max_goals,
+        input_refs=input_refs,
+        model_run_validator=model_run_validator,
+        expected_goals=expected_goals,
+        composition=composition,
+        composition_artifact_ref=composition_artifact_ref,
+        calibration_versions=calibration_versions,
+        enforce_current=True,
+    )
+
+
+def _build_score_prediction(
+    *,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
+    model_run_id: ModelRunId,
+    model_version: str,
+    generated_at: datetime,
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    max_goals: int,
+    input_refs: tuple[str, ...],
+    model_run_validator: ModelRunValidator | None,
+    expected_goals: Any | None,
+    composition: Any | None,
+    composition_artifact_ref: str | None,
+    calibration_versions: tuple[str, ...] | None,
+    enforce_current: bool,
+) -> ScorePrediction:
+    if enforce_current:
+        verify_current_snapshot(snapshot, source_validator=snapshot_validator)
+    else:
+        verify_snapshot(snapshot, source_validator=snapshot_validator)
     require_utc(generated_at, "generated_at")
     _require_text(model_version, "model_version")
     if snapshot.quality_status != "ready":
         raise ValueError("formal score predictions require a ready snapshot")
     if generated_at < snapshot.as_of:
         raise ValueError("prediction generated_at cannot precede snapshot as_of")
+    if enforce_current and generated_at >= snapshot.scheduled_kickoff_used:
+        raise ValueError(
+            "formal prediction generated_at must precede snapshot scheduled_kickoff_used"
+        )
     if expected_goals is not None and composition is not None:
         raise ValueError("pass only one of expected_goals or composition")
     expected_goals = expected_goals if expected_goals is not None else composition
@@ -458,6 +580,8 @@ def build_score_prediction(
         composition_artifact_ref=composition_artifact_ref,
     )
     verify_score_prediction(prediction, model_run_validator=model_run_validator)
+    if enforce_current and model_run_validator is not None:
+        _verify_current_score_projection(prediction, model_run_validator)
     return prediction
 
 
@@ -540,6 +664,8 @@ def verify_prediction_snapshot(
 
     verify_snapshot(snapshot, source_validator=snapshot_validator)
     verify_score_prediction(prediction, model_run_validator=model_run_validator)
+    if model_run_validator is not None:
+        _verify_current_score_projection(prediction, model_run_validator)
     if prediction.snapshot_id != snapshot.id:
         raise ValueError("prediction snapshot_id does not match the validated snapshot")
     if prediction.match_id != snapshot.match_id:
@@ -550,6 +676,10 @@ def verify_prediction_snapshot(
         raise ValueError("prediction capture_mode does not match the validated snapshot")
     if prediction.snapshot_quality_status != snapshot.quality_status:
         raise ValueError("prediction quality does not match the validated snapshot")
+    if prediction.generated_at >= snapshot.scheduled_kickoff_used:
+        raise ValueError(
+            "formal prediction generated_at must precede snapshot scheduled_kickoff_used"
+        )
     _verify_prediction_composition_sources(
         snapshot,
         baseline_lambda_home=prediction.baseline_lambda_home,
@@ -634,7 +764,7 @@ def parse_prediction_payload(
             contributions=contributions,
             calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
         )
-        prediction = build_score_prediction(
+        prediction = _build_score_prediction(
             snapshot=snapshot,
             snapshot_validator=snapshot_validator,
             model_run_id=ModelRunId(str(payload["model_run_id"])),
@@ -649,8 +779,10 @@ def parse_prediction_payload(
             input_refs=tuple(str(item) for item in payload["input_refs"]),
             model_run_validator=model_run_validator,
             expected_goals=expected_goals,
+            composition=None,
             composition_artifact_ref=str(payload["composition_artifact_ref"]),
             calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
+            enforce_current=False,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid prediction schema: {error}") from error
@@ -967,6 +1099,18 @@ def _verify_prediction_model_run(
         raise ValueError("prediction cannot precede its model run completion")
 
 
+def _verify_current_score_projection(
+    prediction: ScorePrediction,
+    validator: ModelRunValidator,
+) -> None:
+    try:
+        artifact = validator.load_model_run(prediction.model_run_id.value)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("prediction model run is unavailable or invalid") from error
+    if artifact.feature_version != CURRENT_SCORE_FEATURE_PROJECTION_VERSION:
+        raise ValueError("formal prediction requires the current score feature projection")
+
+
 def verify_match_result_source(
     result: MatchResult90,
     validator: MatchResultValidator,
@@ -1020,6 +1164,7 @@ def _market_payload(market: MarketView) -> dict[str, Any]:
 
 def _market_snapshot_identity(
     *,
+    schema_version: int,
     match_id: MatchId,
     source: str,
     market_type: str,
@@ -1028,9 +1173,11 @@ def _market_snapshot_identity(
     observed_at: datetime,
     quotes: tuple[MarketQuote, ...],
     raw_asset_ref: str,
+    period: str | None,
+    line: float | None,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
+    payload = {
+        "schema_version": schema_version,
         "match_id": match_id.value,
         "source": source,
         "market_type": market_type,
@@ -1042,6 +1189,31 @@ def _market_snapshot_identity(
         ],
         "raw_asset_ref": raw_asset_ref,
     }
+    if schema_version == MARKET_SNAPSHOT_SCHEMA_VERSION:
+        payload["period"] = period
+        payload["line"] = line
+    return payload
+
+
+def _validate_market_snapshot_line(market_type: str, line: float | None) -> None:
+    result_markets = {"result_90", "result", "1x2"}
+    total_markets = {"total_goals", "totals"}
+    handicap_markets = {"asian_handicap", "handicap", "home_handicap_3way"}
+    if market_type in result_markets:
+        if line is not None:
+            raise ValueError("result_90 market snapshots cannot contain a line")
+        return
+    if market_type not in total_markets | handicap_markets:
+        raise ValueError(f"unsupported formal market_type {market_type!r}")
+    if (
+        not isinstance(line, (int, float))
+        or isinstance(line, bool)
+        or not math.isfinite(line)
+        or abs(line) > MAX_ABSOLUTE_MARKET_LINE
+    ):
+        raise ValueError("line markets require a finite, reasonable line")
+    if market_type in total_markets and line <= 0:
+        raise ValueError("total-goals market lines must be positive")
 
 
 def _score_cell_payload(cell: ScoreCell) -> dict[str, int | float]:

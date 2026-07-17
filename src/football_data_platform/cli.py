@@ -910,7 +910,7 @@ def _register_training_dataset(
         "training-dataset-registered",
         error=dataset.error,
         input_refs=dataset.input_refs,
-        output_refs=(dataset.dataset_id,),
+        output_refs=(_file_content_ref(path),),
     )
 
 
@@ -976,7 +976,7 @@ def _register_model_run(
             *artifact.model_artifact_refs,
             *artifact.evaluation_cohort,
         ),
-        output_refs=(artifact.model_run_id, *artifact.output_refs),
+        output_refs=(_file_content_ref(path),),
     )
 
 

@@ -13,6 +13,7 @@ from football_data_platform.domain.models import require_utc
 
 TEAM_BASELINE_SCHEMA_VERSION = 2
 TEAM_BASELINE_COORDINATE_VERSION = "away-mean-neutral/1"
+TEAM_BASELINE_INPUT_TRANSFORM_V3 = "team-baseline-input/3"
 
 
 @dataclass(frozen=True, slots=True)

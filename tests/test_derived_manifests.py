@@ -279,7 +279,7 @@ def test_output_reference_lookup_deep_parses_only_matching_manifests(
     assert parsed_output_refs == [(target,), (target,)]
 
 
-def test_output_reference_lookup_allows_only_code_version_to_differ(
+def test_output_reference_lookup_rejects_code_version_difference(
     tmp_path: Path,
 ) -> None:
     layout = DataLayout(tmp_path / "data")
@@ -308,12 +308,11 @@ def test_output_reference_lookup_allows_only_code_version_to_differ(
     archive.write_artifact_manifest(first)
     archive.write_artifact_manifest(second)
 
-    resolved = archive._load_artifact_manifest_for_output_ref(output_ref)
-    assert resolved.artifact_id == min(first.artifact_id, second.artifact_id)
-    assert resolved.payload == common["payload"]
+    with pytest.raises(ArchiveConflictError, match="conflicting manifests"):
+        archive._load_artifact_manifest_for_output_ref(output_ref)
 
 
-def test_evaluation_output_lookup_accepts_replay_with_only_code_version_changed(
+def test_evaluation_output_lookup_rejects_replay_from_different_code_version(
     tmp_path: Path,
 ) -> None:
     layout = DataLayout(tmp_path / "data")
@@ -350,11 +349,9 @@ def test_evaluation_output_lookup_accepts_replay_with_only_code_version_changed(
     )
     output_ref = archive.load_artifact_manifest(manifest_ids[0]).output_refs[0]
 
-    resolved = archive._load_artifact_manifest_for_output_ref(output_ref)
-
     assert first_path != second_path
-    assert resolved.artifact_id == manifest_ids[0]
-    assert resolved.payload["prediction_id"] == evaluation.prediction_id
+    with pytest.raises(ArchiveConflictError, match="conflicting manifests"):
+        archive._load_artifact_manifest_for_output_ref(output_ref)
 
 
 @pytest.mark.parametrize(
@@ -408,7 +405,7 @@ def test_output_reference_lookup_rejects_non_code_version_differences(
             generated_at + timedelta(seconds=1) if difference == "ended_at" else generated_at
         ),
         transform_version="evaluation/2",
-        code_version="git:second",
+        code_version=first.code_version,
         input_refs=((second_evidence.id.value,) if difference == "lineage" else first.input_refs),
         output_refs=(output_ref,),
         quality="preview" if difference == "quality" else "ready",

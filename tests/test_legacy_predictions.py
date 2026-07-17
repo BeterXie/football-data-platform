@@ -9,21 +9,33 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _formal_context import seed_legacy_snapshot_source
 from _training_refs import seed_training_references
 
-from football_data_platform.domain.ids import MatchId, RawAssetId, TeamId
-from football_data_platform.domain.predictions import ScorePrediction, parse_prediction_payload
+from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId, TeamId
+from football_data_platform.domain.predictions import (
+    ScorePrediction,
+    _build_score_prediction,
+    parse_prediction_payload,
+    prediction_payload,
+    score_grid_composition_payload,
+)
 from football_data_platform.domain.snapshots import (
     CaptureMode,
     SnapshotFeature,
     SnapshotType,
     build_snapshot,
+    snapshot_payload,
 )
 from football_data_platform.domain.training import (
     MODEL_OUTPUT_REF_PREFIX,
     ModelRunArtifact,
     TrainingDatasetManifest,
     TrainingSample,
+)
+from football_data_platform.features.contributions import (
+    compose_expected_goals,
+    context_contribution,
 )
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
@@ -42,7 +54,10 @@ from football_data_platform.storage.legacy_predictions import (
     load_legacy_prediction_v3_for_audit,
 )
 from football_data_platform.storage.raw import RawArchive
-from football_data_platform.storage.training import TrainingArtifactStore
+from football_data_platform.storage.training import (
+    TrainingArtifactConflict,
+    TrainingArtifactStore,
+)
 
 SNAPSHOT_AS_OF = datetime(2025, 8, 22, 14, 0, tzinfo=UTC)
 GENERATED_AT = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
@@ -131,8 +146,89 @@ def test_v3_audit_view_cannot_enter_current_prediction_contract(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="unsupported prediction schema_version 3"):
         parse_prediction_payload(payload, snapshot=None, snapshot_validator=None)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="prediction must be a ScorePrediction"):
+    with pytest.raises(ValueError, match="audit-only"):
         DerivedArchive(fixture.layout).write_prediction(legacy, snapshot=fixture.snapshot)  # type: ignore[arg-type]
+
+
+def test_v4_with_legacy_snapshot_is_audit_readable_but_not_formal(tmp_path: Path) -> None:
+    fixture = _legacy_fixture(tmp_path, composition_version="expected-goals-composition/1")
+    derived = DerivedArchive(fixture.layout)
+    baseline = next(
+        feature for feature in fixture.snapshot.features if feature.name == "team_baseline"
+    )
+    context = next(
+        feature for feature in fixture.snapshot.features if feature.name == "match_context"
+    )
+    composition = compose_expected_goals(
+        baseline.value["lambda_home"],
+        baseline.value["lambda_away"],
+        (context_contribution(context.value, source_ref=context.source_ref),),
+    )
+    legacy_v3_payload = _read_json(fixture.prediction_path)
+    prediction = _build_score_prediction(
+        snapshot=fixture.snapshot,
+        snapshot_validator=derived,
+        model_run_id=ModelRunId(legacy_v3_payload["model_run_id"]),
+        model_version=legacy_v3_payload["model_version"],
+        generated_at=GENERATED_AT,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
+        rho=-0.1,
+        max_goals=11,
+        input_refs=(),
+        model_run_validator=None,
+        expected_goals=composition,
+        composition=None,
+        composition_artifact_ref=None,
+        calibration_versions=None,
+        enforce_current=False,
+    )
+    composition_document = score_grid_composition_payload(prediction)
+    _write_json(
+        derived.score_grid_composition_path(prediction.composition_artifact_ref),
+        {"id": prediction.composition_artifact_ref, **composition_document},
+    )
+    composition_manifest = DerivedArtifactManifest.create(
+        artifact_type="score-grid-composition",
+        schema_version=composition_document["schema_version"],
+        payload=composition_document,
+        generated_at=prediction.generated_at,
+        transform_version=prediction.composition_version,
+        code_version="football-data-platform/0.1.0",
+        input_refs=prediction.input_refs,
+        output_refs=(prediction.composition_artifact_ref,),
+        status="succeeded",
+        quality=prediction.snapshot_quality_status,
+    )
+    _write_json(
+        derived.artifact_manifest_path(composition_manifest.id),
+        composition_manifest.to_payload(),
+    )
+    document = prediction_payload(prediction)
+    _write_json(_content_path(fixture.layout.derived, "predictions", prediction.id.value), document)
+    prediction_manifest = DerivedArtifactManifest.create(
+        artifact_type="prediction",
+        schema_version=prediction.schema_version,
+        payload=document,
+        generated_at=prediction.generated_at,
+        transform_version=prediction.model_version,
+        code_version="football-data-platform/0.1.0",
+        input_refs=(*prediction.input_refs, prediction.composition_artifact_ref),
+        output_refs=(prediction.id.value,),
+        status="succeeded",
+        quality=prediction.snapshot_quality_status,
+    )
+    _write_json(
+        derived.artifact_manifest_path(prediction_manifest.id),
+        prediction_manifest.to_payload(),
+    )
+    store = TrainingArtifactStore(fixture.layout)
+
+    assert store.load_prediction_for_audit(prediction.id.value) == prediction
+    with pytest.raises(TrainingArtifactConflict, match="audit-only"):
+        store.load_verified_prediction(prediction.id.value)
+    with pytest.raises(ValueError, match="audit-only"):
+        derived.write_prediction(prediction, snapshot=fixture.snapshot)
 
 
 def test_v3_loader_rejects_tampered_prediction_grid(tmp_path: Path) -> None:
@@ -337,14 +433,16 @@ def _legacy_fixture(
         "lambda_home": baseline_home,
         "lambda_away": baseline_away,
     }
-    baseline_source = derived.write_snapshot_source(
+    baseline_source = seed_legacy_snapshot_source(
+        derived,
         value=baseline_value,
         input_refs=(asset.id,),
         transform_version="team-baseline-input/2",
         generated_at=GENERATED_AT,
     )
     context_value = {"days_since_previous_match": 7.0}
-    context_source = derived.write_snapshot_source(
+    context_source = seed_legacy_snapshot_source(
+        derived,
         value=context_value,
         input_refs=(asset.id,),
         transform_version="match-context-input/1",
@@ -377,8 +475,23 @@ def _legacy_fixture(
         away_team_id=AWAY_TEAM_ID,
         source_validator=derived,
     )
-    derived.write_snapshot(snapshot)
-    snapshot_manifest = derived._load_artifact_manifest_for_output_ref(snapshot.id.value)
+    snapshot_document = snapshot_payload(snapshot, source_validator=derived)
+    _write_json(derived.snapshot_path(snapshot), snapshot_document)
+    snapshot_manifest = DerivedArtifactManifest.create(
+        artifact_type="prematch-snapshot",
+        schema_version=snapshot.schema_version,
+        payload=snapshot_document,
+        generated_at=snapshot.observed_at,
+        started_at=snapshot.observed_at,
+        ended_at=snapshot.observed_at,
+        transform_version=snapshot.feature_spec_version,
+        code_version="football-data-platform/0.1.0",
+        input_refs=snapshot.input_refs,
+        output_refs=(snapshot.id.value,),
+        status="succeeded",
+        quality=snapshot.quality_status,
+    )
+    derived.write_artifact_manifest(snapshot_manifest)
     snapshot_manifest_path = derived.artifact_manifest_path(snapshot_manifest.id)
     (
         model_run,
@@ -644,7 +757,7 @@ def _write_model_run(
         and model_run.evaluation_cohort == (holdout.sample_id,)
         and model_run.dataset_id == dataset.dataset_id
     ):
-        store.write_model_run(model_run)
+        store.write_model_run_for_audit(model_run)
         manifest = store.derived._load_artifact_manifest_for_output_ref(model_run.model_run_id)
     else:
         _write_json(store.model_run_path(model_run.model_run_id), model_run.to_payload())

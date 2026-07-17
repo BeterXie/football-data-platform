@@ -33,11 +33,13 @@ from football_data_platform.domain.predictions import (
     MarketDataKind,
     MarketQuote,
     MarketSnapshot,
-    MarketSourceValidator,
+    MarketSnapshotValidator,
     MarketStatus,
     MatchResult90,
+    PersistedPredictionContextValidator,
     ScorePrediction,
 )
+from football_data_platform.domain.snapshots import PreMatchSnapshot
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
@@ -86,13 +88,14 @@ class PaperBetLedger:
         self,
         layout: DataLayout,
         *,
-        market_source_validator: MarketSourceValidator | None = None,
+        market_snapshot_validator: MarketSnapshotValidator | None = None,
+        prediction_context_validator: PersistedPredictionContextValidator | None = None,
         result_validator: MatchResultValidator | None = None,
         model_run_validator: ModelRunValidator | None = None,
         derived_archive: DerivedArchive | None = None,
     ) -> None:
         self.layout = layout.ensure()
-        self.market_source_validator = market_source_validator or RawArchive(self.layout)
+        self.market_snapshot_validator = market_snapshot_validator
         if result_validator is None:
             canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
             canonical.initialize()
@@ -102,8 +105,30 @@ class PaperBetLedger:
             )
         self.result_validator = result_validator
         self.persisted_model_runs = TrainingArtifactStore(self.layout)
+        self.prediction_context_validator = (
+            prediction_context_validator or self.persisted_model_runs
+        )
         self.model_run_validator = model_run_validator or self.persisted_model_runs
-        self.derived = derived_archive or DerivedArchive(self.layout)
+        if (
+            derived_archive is not None
+            and derived_archive.market_snapshot_validator is not market_snapshot_validator
+        ):
+            raise ValueError(
+                "derived archive and paper ledger must use the same market snapshot validator"
+            )
+        if (
+            derived_archive is not None
+            and derived_archive.prediction_context_validator
+            is not self.prediction_context_validator
+        ):
+            raise ValueError(
+                "derived archive and paper ledger must use the same prediction context validator"
+            )
+        self.derived = derived_archive or DerivedArchive(
+            self.layout,
+            market_snapshot_validator=market_snapshot_validator,
+            prediction_context_validator=self.prediction_context_validator,
+        )
         self.root = self.layout.paper_ledger / "entries"
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -113,7 +138,7 @@ class PaperBetLedger:
         self._verify_persisted_prediction_entry(entry)
         verify_paper_bet_entry(
             entry,
-            market_source_validator=self.market_source_validator,
+            market_snapshot_validator=self.market_snapshot_validator,
             result_validator=self.result_validator,
             model_run_validator=self.model_run_validator,
         )
@@ -163,13 +188,18 @@ class PaperBetLedger:
         """
 
         try:
-            self._verify_persisted_prediction(prediction)
+            snapshot = self._verify_persisted_prediction(prediction)
+            self._validate_pre_kickoff(
+                prediction=prediction,
+                snapshot=snapshot,
+                placed_at=placed_at,
+            )
             if market_snapshot is None or settlement_rules is None or selection is None:
                 raise ValueError("market snapshot, selection, and settlement rules are required")
             entry = PaperBetEntry.accepted(
                 prediction=prediction,
                 market_snapshot=market_snapshot,
-                market_source_validator=self._require_market_validator(),
+                market_snapshot_validator=self._require_market_validator(),
                 model_run_validator=self.model_run_validator,
                 selection=selection,
                 risk_config=risk_config,
@@ -202,7 +232,7 @@ class PaperBetLedger:
         self._verify_persisted_prediction_entry(entry)
         verify_paper_bet_entry(
             entry,
-            market_source_validator=self.market_source_validator,
+            market_snapshot_validator=self.market_snapshot_validator,
             result_validator=self.result_validator,
             model_run_validator=self.model_run_validator,
         )
@@ -215,7 +245,7 @@ class PaperBetLedger:
             self._verify_persisted_prediction_entry(entry)
             verify_paper_bet_entry(
                 entry,
-                market_source_validator=self.market_source_validator,
+                market_snapshot_validator=self.market_snapshot_validator,
                 result_validator=self.result_validator,
                 model_run_validator=self.model_run_validator,
             )
@@ -387,28 +417,44 @@ class PaperBetLedger:
             raise ValueError("invalid paper betting entry ID")
         return self.root / digest[:2] / f"{digest}.json"
 
-    def _require_market_validator(self) -> MarketSourceValidator:
-        return self.market_source_validator
+    def _require_market_validator(self) -> MarketSnapshotValidator:
+        if self.market_snapshot_validator is None:
+            raise ValueError("accepted entry requires an authoritative market snapshot validator")
+        return self.market_snapshot_validator
 
-    def _verify_persisted_prediction(self, prediction: ScorePrediction) -> None:
+    def _load_verified_prediction_context(
+        self,
+        reference: str,
+    ) -> tuple[ScorePrediction, PreMatchSnapshot]:
         try:
-            stored = self.persisted_model_runs.load_verified_prediction(prediction.id.value)
-        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
-            raise ValueError(
-                "paper ledger prediction artifact is unavailable or invalid"
-            ) from error
-        if stored != prediction:
-            raise ValueError("paper ledger prediction does not match its persisted artifact")
-
-    def _verify_persisted_prediction_entry(self, entry: PaperBetEntry) -> None:
-        try:
-            prediction = self.persisted_model_runs.load_verified_prediction(
-                entry.prediction_id.value
+            stored, snapshot = self.prediction_context_validator.load_verified_prediction_context(
+                reference
             )
         except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise ValueError(
                 "paper ledger prediction artifact is unavailable or invalid"
             ) from error
+        if not isinstance(stored, ScorePrediction) or not isinstance(snapshot, PreMatchSnapshot):
+            raise ValueError("prediction context validator returned invalid records")
+        if stored.id.value != reference:
+            raise ValueError("prediction context validator returned a different prediction")
+        if stored.snapshot_id != snapshot.id or stored.match_id != snapshot.match_id:
+            raise ValueError("prediction context validator returned a mismatched snapshot")
+        if stored.snapshot_as_of != snapshot.as_of:
+            raise ValueError("prediction context validator returned a mismatched snapshot cutoff")
+        return stored, snapshot
+
+    def _verify_persisted_prediction(
+        self,
+        prediction: ScorePrediction,
+    ) -> PreMatchSnapshot:
+        stored, snapshot = self._load_verified_prediction_context(prediction.id.value)
+        if stored != prediction:
+            raise ValueError("paper ledger prediction does not match its persisted artifact")
+        return snapshot
+
+    def _verify_persisted_prediction_entry(self, entry: PaperBetEntry) -> None:
+        prediction, snapshot = self._load_verified_prediction_context(entry.prediction_id.value)
         if (
             prediction.match_id != entry.match_id
             or prediction.model_run_id != entry.model_run_id
@@ -416,6 +462,25 @@ class PaperBetLedger:
             or prediction.snapshot_as_of != entry.prediction_snapshot_as_of
         ):
             raise ValueError("paper ledger entry does not match its prediction artifact")
+        if entry.decision is CandidateDecision.ACCEPTED:
+            self._validate_pre_kickoff(
+                prediction=prediction,
+                snapshot=snapshot,
+                placed_at=entry.placed_at,
+            )
+
+    @staticmethod
+    def _validate_pre_kickoff(
+        *,
+        prediction: ScorePrediction,
+        snapshot: PreMatchSnapshot,
+        placed_at: datetime,
+    ) -> None:
+        kickoff = snapshot.scheduled_kickoff_used
+        if prediction.generated_at >= kickoff:
+            raise ValueError("paper ledger prediction must be generated before kickoff")
+        if placed_at >= kickoff:
+            raise ValueError("paper ledger accepted entry must be placed before kickoff")
 
     def _validate_revision_parent(self, entry: PaperBetEntry) -> None:
         assert entry.prior_entry_id is not None
@@ -564,9 +629,13 @@ def _parse_market_snapshot(payload: Any) -> MarketSnapshot | None:
         return None
     if not isinstance(payload, dict):
         raise ValueError("market_snapshot must be an object")
+    schema_version = _strict_int(payload["schema_version"], "schema_version")
+    period = payload.get("period")
+    if period is not None and not isinstance(period, str):
+        raise ValueError("market period must be text")
     return MarketSnapshot(
         id=MarketSnapshotId(str(payload["id"])),
-        schema_version=_strict_int(payload["schema_version"], "schema_version"),
+        schema_version=schema_version,
         match_id=MatchId(str(payload["match_id"])),
         source=str(payload["source"]),
         market_type=str(payload["market_type"]),
@@ -578,6 +647,8 @@ def _parse_market_snapshot(payload: Any) -> MarketSnapshot | None:
             for item in payload["quotes"]
         ),
         raw_asset_ref=str(payload["raw_asset_ref"]),
+        period=period,
+        line=_optional_float(payload.get("line"), "market line"),
     )
 
 
@@ -656,6 +727,17 @@ def _strict_bool(value: Any, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{field_name} must be a boolean")
     return value
+
+
+def _optional_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite")
+    return parsed
 
 
 def _parse_datetime(value: Any, field_name: str) -> datetime:

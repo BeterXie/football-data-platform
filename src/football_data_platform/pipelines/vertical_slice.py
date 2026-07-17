@@ -10,15 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId
+from football_data_platform.domain.ids import MatchId, RawAssetId
 from football_data_platform.domain.lifecycle import (
+    Qualification,
     SnapshotAvailability,
     assess_lifecycle,
-)
-from football_data_platform.domain.predictions import (
-    MatchResult90,
-    build_score_prediction,
-    prediction_payload,
 )
 from football_data_platform.domain.snapshots import (
     CaptureMode,
@@ -28,13 +24,12 @@ from football_data_platform.domain.snapshots import (
 )
 from football_data_platform.domain.training import (
     ModelRunArtifact,
+    ModelRunStatus,
     TrainingDatasetManifest,
-    TrainingSample,
 )
-from football_data_platform.evaluation.metrics import evaluate_prediction
 from football_data_platform.features.contributions import (
     compose_expected_goals,
-    context_contribution,
+    context_contributions,
     lineup_delta_contributions,
 )
 from football_data_platform.features.lineup import (
@@ -49,7 +44,6 @@ from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
     build_team_baseline,
     expected_goals_from_baseline,
-    team_baseline_payload,
 )
 from football_data_platform.pipelines.match_report import ingest_fbref_match_report
 from football_data_platform.pipelines.official_lineup import (
@@ -90,7 +84,7 @@ class VerticalSliceResult:
     report_path: Path
     t24_snapshot_id: str
     lineups_snapshot_id: str
-    prediction_id: str
+    prediction_id: str | None
     canonical_counts: dict[str, int]
 
 
@@ -335,42 +329,34 @@ def _run_offline_vertical_slice(
     t24_as_of = second_fixture.kickoff_at - timedelta(hours=24)
     derived.write_team_baseline(baseline, generated_at=observed_at)
     profile_manifest_path = derived.write_player_profiles(profiles, generated_at=observed_at)
-    baseline_value = {
-        "artifact_id": baseline.artifact_id,
-        "artifact": team_baseline_payload(baseline),
-        "lambda_home": lambda_home,
-        "lambda_away": lambda_away,
-    }
+    baseline_source_ref = derived.write_team_baseline_source(
+        match_id=second_match_id,
+        match_version=1,
+        as_of=t24_as_of,
+        baseline_artifact_id=baseline.artifact_id,
+    )
+    baseline_validation = derived.validate_snapshot_source(baseline_source_ref)
+    baseline_value = baseline_validation.value
     baseline_feature = SnapshotFeature(
         name="team_baseline",
         value=baseline_value,
-        known_at=first_report_known_at,
-        source_ref=derived.write_snapshot_source(
-            value=baseline_value,
-            input_refs=(RawAssetId(report_ingest.raw_asset_id),),
-            transform_version="team-baseline-input/2",
-            generated_at=observed_at,
-        ),
+        known_at=baseline_validation.known_at,
+        source_ref=baseline_source_ref,
         contribution_key="team-baseline",
     )
-    context_value = {
-        "days_since_previous_match": (
-            second_fixture.kickoff_at - first_fixture.kickoff_at
-        ).total_seconds()
-        / 86_400
-    }
-    context_source_ref = derived.write_snapshot_source(
-        value=context_value,
-        input_refs=(RawAssetId(schedule_ingest.raw_asset_id),),
-        transform_version="match-context-input/1",
-        generated_at=observed_at,
+    context_source_ref = derived.write_match_context_source(
+        match_id=second_match_id,
+        match_version=1,
+        as_of=t24_as_of,
     )
+    context_validation = derived.validate_snapshot_source(context_source_ref)
+    context_value = context_validation.value
     context_feature = SnapshotFeature(
         name="match_context",
         value=context_value,
-        known_at=max(schedule_known_at, first_report_known_at),
+        known_at=context_validation.known_at,
         source_ref=context_source_ref,
-        contribution_key="context:rest-days",
+        contribution_key="match-context",
     )
     t24_snapshot = build_snapshot(
         match_id=second_match_id,
@@ -378,7 +364,7 @@ def _run_offline_vertical_slice(
         snapshot_type=SnapshotType.T24H,
         as_of=t24_as_of,
         scheduled_kickoff_used=second_fixture.kickoff_at,
-        feature_spec_version="prematch-features/2",
+        feature_spec_version="prematch-features/3",
         features=(baseline_feature, context_feature),
         home_team_id=second_home.id,
         away_team_id=second_away.id,
@@ -407,16 +393,43 @@ def _run_offline_vertical_slice(
         source_ref=lineup_delta_source_ref,
         contribution_key="lineup-delta",
     )
+    lineup_context_source_ref = derived.write_match_context_source(
+        match_id=second_match_id,
+        match_version=1,
+        as_of=lineup_known_at,
+    )
+    lineup_context_validation = derived.validate_snapshot_source(lineup_context_source_ref)
+    lineup_context_feature = SnapshotFeature(
+        name="match_context",
+        value=lineup_context_validation.value,
+        known_at=lineup_context_validation.known_at,
+        source_ref=lineup_context_source_ref,
+        contribution_key="match-context",
+    )
+    lineup_baseline_source_ref = derived.write_team_baseline_source(
+        match_id=second_match_id,
+        match_version=1,
+        as_of=lineup_known_at,
+        baseline_artifact_id=baseline.artifact_id,
+    )
+    lineup_baseline_validation = derived.validate_snapshot_source(lineup_baseline_source_ref)
+    lineup_baseline_feature = SnapshotFeature(
+        name="team_baseline",
+        value=lineup_baseline_validation.value,
+        known_at=lineup_baseline_validation.known_at,
+        source_ref=lineup_baseline_source_ref,
+        contribution_key="team-baseline",
+    )
     lineups_snapshot = build_snapshot(
         match_id=second_match_id,
         match_version=1,
         snapshot_type=SnapshotType.LINEUPS_CONFIRMED,
         as_of=lineup_known_at,
         scheduled_kickoff_used=second_fixture.kickoff_at,
-        feature_spec_version="prematch-features/2",
+        feature_spec_version="prematch-features/3",
         features=(
-            baseline_feature,
-            context_feature,
+            lineup_baseline_feature,
+            lineup_context_feature,
             lineup_delta_feature,
             *lineup_features,
         ),
@@ -427,180 +440,126 @@ def _run_offline_vertical_slice(
     derived.write_snapshot(t24_snapshot)
     derived.write_snapshot(lineups_snapshot)
 
-    context_effect = context_contribution(context_value, source_ref=context_source_ref)
-    t24_composition = compose_expected_goals(
-        lambda_home,
-        lambda_away,
-        (context_effect,),
-    )
-    lineup_effects = lineup_delta_contributions(
-        lineup_delta_value,
-        home_team_id=second_home.id.value,
-        away_team_id=second_away.id.value,
-        source_ref=lineup_delta_source_ref,
-        source_validator=derived,
-    )
-    lineups_composition = compose_expected_goals(
-        lambda_home,
-        lambda_away,
-        (context_effect, *lineup_effects),
-    )
+    t24_composition = None
+    if t24_snapshot.quality_status == "ready":
+        context_effects = context_contributions(
+            context_value,
+            home_team_id=second_home.id.value,
+            away_team_id=second_away.id.value,
+            source_ref=context_source_ref,
+            source_validator=derived,
+        )
+        t24_composition = compose_expected_goals(
+            lambda_home,
+            lambda_away,
+            context_effects,
+        )
+    lineups_composition = None
+    if lineups_snapshot.quality_status == "ready":
+        lineup_effects = lineup_delta_contributions(
+            lineup_delta_value,
+            home_team_id=second_home.id.value,
+            away_team_id=second_away.id.value,
+            source_ref=lineup_delta_source_ref,
+            source_validator=derived,
+        )
+        lineups_composition = compose_expected_goals(
+            lambda_home,
+            lambda_away,
+            (
+                *context_contributions(
+                    lineup_context_validation.value,
+                    home_team_id=second_home.id.value,
+                    away_team_id=second_away.id.value,
+                    source_ref=lineup_context_source_ref,
+                    source_validator=derived,
+                ),
+                *lineup_effects,
+            ),
+        )
     prediction_snapshot = (
         lineups_snapshot if lineups_snapshot.quality_status == "ready" else t24_snapshot
     )
     composition = (
         lineups_composition if prediction_snapshot is lineups_snapshot else t24_composition
     )
-    composition_calibration_versions = tuple(
-        sorted({item.version for item in composition.contributions})
+    composition_calibration_versions = (
+        ()
+        if composition is None
+        else tuple(sorted({item.version for item in composition.contributions}))
     )
     model_store = TrainingArtifactStore(layout)
-    train_as_of = first_report_known_at - timedelta(hours=1)
-    holdout_as_of = prediction_snapshot.as_of
-    training_sample = TrainingSample(
-        sample_id=f"sample:{first_match_id.value}:score-model",
-        as_of=train_as_of,
-        feature_known_at=first_report_known_at - timedelta(hours=2),
-        label_known_at=first_report_known_at,
-        capture_mode=CaptureMode.RECONSTRUCTED,
-        qualification="score-model-ready",
-        qualification_passed=True,
-        feature_version="score-features/vertical-slice-1",
-        label_version="result-90/1",
-        feature_refs=(report_ingest.raw_asset_id,),
-        label_ref=first_result_fact.record_id,
-        features={
-            "lambda_home": lambda_home,
-            "lambda_away": lambda_away,
-            "rho": -0.1,
-        },
-        label={
-            "home_goals": first_fixture.home_goals,
-            "away_goals": first_fixture.away_goals,
-        },
-        split="train",
+    first_qualification = model_store.create_training_qualification(
+        match_id=first_match_id,
+        match_version=1,
+        qualification=Qualification.SCORE_MODEL,
+        ruleset_version="readiness/1",
+        evaluated_at=observed_at,
+        snapshot_ref=None,
+        result_ref=first_result_fact.record_id,
     )
-    holdout_sample = TrainingSample(
+    second_qualification = model_store.create_training_qualification(
+        match_id=second_match_id,
+        match_version=1,
+        qualification=Qualification.SCORE_MODEL,
+        ruleset_version="readiness/1",
+        evaluated_at=observed_at,
+        snapshot_ref=prediction_snapshot.id.value,
+        result_ref=result_fact.record_id,
+    )
+    training_sample = model_store.build_formal_score_sample(
+        sample_id=f"sample:{first_match_id.value}:score-model",
+        qualification_ref=first_qualification.qualification_id,
+        feature_version="snapshot-score-features/1",
+        split="train",
+        as_of=first_fixture.kickoff_at - timedelta(hours=24),
+    )
+    holdout_sample = model_store.build_formal_score_sample(
         sample_id=f"sample:{second_match_id.value}:score-model",
-        as_of=holdout_as_of,
-        feature_known_at=holdout_as_of,
-        label_known_at=second_result_known_at,
-        capture_mode=CaptureMode.RECONSTRUCTED,
-        qualification="score-model-ready",
-        qualification_passed=True,
-        feature_version="score-features/vertical-slice-1",
-        label_version="result-90/1",
-        feature_refs=tuple(
-            sorted({baseline.artifact_id, prediction_snapshot.id.value, *composition.input_refs})
-        ),
-        label_ref=result_fact.record_id,
-        features={
-            "lambda_home": composition.lambda_home,
-            "lambda_away": composition.lambda_away,
-            "rho": -0.1,
-        },
-        label={
-            "home_goals": second_fixture.home_goals,
-            "away_goals": second_fixture.away_goals,
-        },
+        qualification_ref=second_qualification.qualification_id,
+        feature_version="snapshot-score-features/1",
         split="holdout",
     )
-    training_dataset = TrainingDatasetManifest.create(
-        dataset_version="score-dataset/vertical-slice-1",
+    training_dataset = TrainingDatasetManifest.create_formal(
+        dataset_version="score-dataset/vertical-slice-2",
         task="score-model",
         qualification="score-model-ready",
         qualification_ruleset_version="readiness/1",
-        feature_version="score-features/vertical-slice-1",
+        feature_version="snapshot-score-features/1",
         label_version="result-90/1",
-        as_of=holdout_as_of,
+        as_of=prediction_snapshot.as_of,
         split_strategy="forward-chaining/1",
         samples=(training_sample, holdout_sample),
         generated_at=observed_at,
-        transform_version="training-dataset/vertical-slice-1",
+        transform_version="training-dataset/2",
         code_version=DERIVED_CODE_VERSION,
     )
-    model_store.write_dataset(training_dataset)
-    model_ref = model_store.write_model_artifact(
-        json.dumps(
-            {
-                "algorithm": "dixon-coles",
-                "model_version": "dixon-coles-composed/1",
-                "rho": -0.1,
-                "max_goals": 11,
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    output_ref = model_store.write_model_output(
-        json.dumps(
-            {
-                "evaluation_cohort": [holdout_sample.sample_id],
-                "capture_mode": CaptureMode.RECONSTRUCTED.value,
-                "status": "shadow-replay",
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
+    model_store.write_formal_dataset(training_dataset)
     model_run = ModelRunArtifact.create(
-        model_version="dixon-coles-composed/1",
+        model_version="dixon-coles/unavailable-no-eligible-train/1",
         run_role="shadow",
         task="score-model",
         dataset_id=training_dataset.dataset_id,
         feature_version=training_dataset.feature_version,
         label_version=training_dataset.label_version,
         algorithm="dixon-coles",
-        parameters={"rho": -0.1, "max_goals": 11},
+        parameters={"gate": "no_eligible_train_split"},
         code_version=DERIVED_CODE_VERSION,
         environment_version="python-runtime:locked",
         started_at=observed_at,
         ended_at=observed_at,
-        random_seed=0,
-        model_artifact_refs=(model_ref,),
-        evaluation_cohort=(holdout_sample.sample_id,),
+        random_seed=None,
+        model_artifact_refs=(),
+        evaluation_cohort=(),
         evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
-        output_refs=(output_ref,),
-        output_hashes=(output_ref.removeprefix("model-output:"),),
+        output_refs=(),
+        output_hashes=(),
+        status=ModelRunStatus.FAILED,
+        error="no_eligible_train_split",
     )
     model_store.write_model_run(model_run)
-    derived.model_run_validator = model_store
-    prediction = build_score_prediction(
-        snapshot=prediction_snapshot,
-        snapshot_validator=derived,
-        model_run_id=ModelRunId(model_run.model_run_id),
-        model_version="dixon-coles-composed/1",
-        generated_at=observed_at,
-        lambda_home=composition.lambda_home,
-        lambda_away=composition.lambda_away,
-        rho=-0.1,
-        max_goals=11,
-        input_refs=(
-            baseline.artifact_id,
-            *composition.input_refs,
-        ),
-        expected_goals=composition,
-        calibration_versions=composition_calibration_versions,
-    )
-    derived.write_prediction(prediction, snapshot=prediction_snapshot)
-    evaluation = evaluate_prediction(
-        prediction,
-        MatchResult90(
-            second_match_id,
-            second_fixture.home_goals,
-            second_fixture.away_goals,
-            second_result_known_at,
-            result_fact.record_id,
-        ),
-        evaluated_at=observed_at,
-        result_validator=facts,
-    )
-    evaluation_manifest_path = derived.write_evaluation(evaluation, generated_at=observed_at)
     baseline_manifest_id = _manifest_id_for_output_ref(derived, baseline.artifact_id)
     profile_manifest_id = _manifest_id_from_path(profile_manifest_path)
-    evaluation_manifest_id = _manifest_id_from_path(evaluation_manifest_path)
 
     coverage = assess_season_coverage(
         schedule_ingest.parsed,
@@ -626,13 +585,14 @@ def _run_offline_vertical_slice(
         snapshot_validator=derived,
     )
     run_identity = {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": "offline-golden-replay",
         "observed_at": _timestamp(observed_at),
         "snapshot_ids": [t24_snapshot.id.value, lineups_snapshot.id.value],
-        "prediction_id": prediction.id.value,
+        "prediction_id": None,
         "training_dataset_id": training_dataset.dataset_id,
         "model_run_id": model_run.model_run_id,
+        "model_gate": "failed:no_eligible_train_split",
         "result_fact_id": result_fact.record_id,
     }
     semantic_digest = hashlib.sha256(_canonical_json(run_identity)).hexdigest()
@@ -650,27 +610,22 @@ def _run_offline_vertical_slice(
             report_ingest.raw_asset_id,
             lineup_asset_id.value,
             training_dataset.dataset_id,
-            model_ref,
-            output_ref,
         ),
         output_refs=(
             baseline_manifest_id,
             profile_manifest_id,
-            evaluation_manifest_id,
             t24_snapshot.id.value,
             lineups_snapshot.id.value,
-            prediction.id.value,
-            prediction.composition_artifact_ref,
+            first_qualification.qualification_id,
+            second_qualification.qualification_id,
             training_dataset.dataset_id,
             model_run.model_run_id,
-            model_ref,
-            output_ref,
             summary_logical_ref,
             report_logical_ref,
         ),
         status="succeeded",
         error=None,
-        quality="partial" if lineups_snapshot.quality_status != "ready" else "ready",
+        quality="partial",
         parameters={
             "mode": "offline-golden-replay",
             "observed_at": _timestamp(observed_at),
@@ -697,6 +652,45 @@ def _run_offline_vertical_slice(
         coverage.attempt_identity_mismatch_fixture_ids
     )
     coverage_payload["report_contract_diagnostics"] = coverage.report_contract_diagnostics
+    if composition is None:
+        lambda_composition_summary = {
+            "available": False,
+            "reason": "prediction_snapshot_not_ready",
+            "baseline_lambda_home": lambda_home,
+            "baseline_lambda_away": lambda_away,
+            "composition_artifact_ref": None,
+            "prediction_snapshot": prediction_snapshot.snapshot_type.value,
+            "missing_fields": list(prediction_snapshot.missing_fields),
+            "status": "unavailable",
+        }
+        prediction_unavailable_reason = "snapshot_not_ready:expected_goals_unavailable"
+    else:
+        lambda_composition_summary = {
+            "available": True,
+            "version": composition.composition_version,
+            "baseline_lambda_home": composition.baseline_lambda_home,
+            "baseline_lambda_away": composition.baseline_lambda_away,
+            "lambda_home": composition.lambda_home,
+            "lambda_away": composition.lambda_away,
+            "contribution_keys": list(composition.contribution_keys),
+            "input_refs": list(composition.input_refs),
+            "calibration_versions": list(composition_calibration_versions),
+            "contribution_multipliers": [
+                {
+                    "contribution_key": item.contribution_key,
+                    "lambda_home_multiplier": item.lambda_home_multiplier,
+                    "lambda_away_multiplier": item.lambda_away_multiplier,
+                    "source_ref": item.source_ref,
+                    "version": item.version,
+                }
+                for item in composition.contributions
+            ],
+            "composition_artifact_ref": None,
+            "prediction_snapshot": prediction_snapshot.snapshot_type.value,
+            "status": "candidate-features-only",
+        }
+        prediction_unavailable_reason = "model_run_failed:no_eligible_train_split"
+
     summary = {
         **run_identity,
         "run_id": run_id,
@@ -712,28 +706,7 @@ def _run_offline_vertical_slice(
             "lambda_home": lambda_home,
             "lambda_away": lambda_away,
         },
-        "lambda_composition": {
-            "version": composition.composition_version,
-            "baseline_lambda_home": composition.baseline_lambda_home,
-            "baseline_lambda_away": composition.baseline_lambda_away,
-            "lambda_home": composition.lambda_home,
-            "lambda_away": composition.lambda_away,
-            "contribution_keys": list(composition.contribution_keys),
-            "input_refs": list(composition.input_refs),
-            "calibration_versions": list(prediction.calibration_versions),
-            "contribution_multipliers": [
-                {
-                    "contribution_key": item.contribution_key,
-                    "lambda_home_multiplier": item.lambda_home_multiplier,
-                    "lambda_away_multiplier": item.lambda_away_multiplier,
-                    "source_ref": item.source_ref,
-                    "version": item.version,
-                }
-                for item in prediction.contribution_multipliers
-            ],
-            "composition_artifact_ref": prediction.composition_artifact_ref,
-            "prediction_snapshot": prediction_snapshot.snapshot_type.value,
-        },
+        "lambda_composition": lambda_composition_summary,
         "player_profiles": {
             "count": len(profiles.profiles),
             "ready": sum(profile.quality_status == "ready" for profile in profiles.profiles),
@@ -741,14 +714,55 @@ def _run_offline_vertical_slice(
         "derived_artifacts": {
             "team_baseline": baseline_manifest_id,
             "player_profiles": profile_manifest_id,
-            "evaluation": evaluation_manifest_id,
+            "evaluation": None,
             "training_dataset": training_dataset.dataset_id,
             "model_run": model_run.model_run_id,
-            "model_artifact": model_ref,
-            "model_output": output_ref,
+            "model_artifact": None,
+            "model_output": None,
+            "training_qualifications": [
+                first_qualification.qualification_id,
+                second_qualification.qualification_id,
+            ],
         },
-        "prediction": prediction_payload(prediction),
-        "evaluation": _evaluation_summary(evaluation),
+        "training": {
+            "schema_version": training_dataset.schema_version,
+            "status": training_dataset.status.value,
+            "eligible_train_samples": [
+                sample.sample_id
+                for sample in training_dataset.included_samples
+                if sample.split == "train"
+            ],
+            "eligible_holdout_samples": [
+                sample.sample_id
+                for sample in training_dataset.included_samples
+                if sample.split == "holdout"
+            ],
+            "excluded_samples": [
+                {
+                    "sample_id": sample.sample_id,
+                    "reason_codes": list(sample.exclusion_reasons),
+                }
+                for sample in training_dataset.excluded_samples
+            ],
+            "model_gate": {
+                "passed": False,
+                "reason": model_run.error,
+                "model_run_id": model_run.model_run_id,
+            },
+        },
+        "prediction": {
+            "available": False,
+            "reason": prediction_unavailable_reason,
+        },
+        "evaluation": {
+            "available": False,
+            "reason": "prediction_unavailable",
+            "capture_mode": CaptureMode.RECONSTRUCTED.value,
+            "market_benchmark": {
+                "available": False,
+                "reason": "no real timestamped market snapshot",
+            },
+        },
         "lifecycle": {
             first_match_id.value: _lifecycle_summary(first_lifecycle),
             second_match_id.value: _lifecycle_summary(second_lifecycle),
@@ -757,6 +771,7 @@ def _run_offline_vertical_slice(
             "historical_snapshots_are_reconstructed",
             "lineups_snapshot_is_preview_when_player_profiles_are_missing",
             "market_benchmark_unavailable_without_real_market_snapshot",
+            "formal_model_unavailable_without_an_eligible_training_split",
         ],
     }
     digest = run_id.removeprefix("run:")
@@ -785,7 +800,7 @@ def _run_offline_vertical_slice(
         report_path,
         t24_snapshot.id.value,
         lineups_snapshot.id.value,
-        prediction.id.value,
+        None,
         canonical.counts(),
     )
 
@@ -943,23 +958,6 @@ def _lifecycle_summary(assessment) -> dict[str, Any]:
             }
             for item in assessment.qualifications
         ],
-    }
-
-
-def _evaluation_summary(evaluation) -> dict[str, Any]:
-    return {
-        "prediction_id": evaluation.prediction_id,
-        "capture_mode": evaluation.capture_mode.value,
-        "actual_outcome": evaluation.actual_outcome,
-        "actual_score": evaluation.actual_score,
-        "result_brier": evaluation.result_brier,
-        "result_log_loss": evaluation.result_log_loss,
-        "score_log_loss": evaluation.score_log_loss,
-        "market_benchmark": {
-            "available": evaluation.market_benchmark.available,
-            "reason": evaluation.market_benchmark.reason,
-        },
-        "input_refs": list(evaluation.input_refs),
     }
 
 

@@ -5,6 +5,7 @@ import json
 import math
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime
 from typing import Any
 
 from football_data_platform.models.score_grid import DixonColesGrid
@@ -29,6 +30,9 @@ def forge_persisted_prediction(
 
     mutate(payload)
     _rebuild_prediction_grid(payload)
+    forged_generated_at = datetime.fromisoformat(
+        str(payload["generated_at"]).replace("Z", "+00:00")
+    )
     composition_payload = _composition_payload(payload)
     composition_ref = (
         "score-grid-composition:" + hashlib.sha256(_canonical_json(composition_payload)).hexdigest()
@@ -48,9 +52,9 @@ def forge_persisted_prediction(
             artifact_type="score-grid-composition",
             schema_version=composition_manifest.schema_version,
             payload=composition_payload,
-            generated_at=composition_manifest.generated_at,
-            started_at=composition_manifest.started_at,
-            ended_at=composition_manifest.ended_at,
+            generated_at=forged_generated_at,
+            started_at=forged_generated_at,
+            ended_at=forged_generated_at,
             transform_version=composition_manifest.transform_version,
             code_version=composition_manifest.code_version,
             input_refs=tuple(payload["input_refs"]),
@@ -70,9 +74,9 @@ def forge_persisted_prediction(
             artifact_type="prediction",
             schema_version=prediction_manifest.schema_version,
             payload=payload,
-            generated_at=prediction_manifest.generated_at,
-            started_at=prediction_manifest.started_at,
-            ended_at=prediction_manifest.ended_at,
+            generated_at=forged_generated_at,
+            started_at=forged_generated_at,
+            ended_at=forged_generated_at,
             transform_version=prediction_manifest.transform_version,
             code_version=prediction_manifest.code_version,
             input_refs=tuple(

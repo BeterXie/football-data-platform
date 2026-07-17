@@ -20,7 +20,8 @@ from typing import Any
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.snapshots import CaptureMode
 
-TRAINING_DATASET_SCHEMA_VERSION = 1
+LEGACY_TRAINING_DATASET_SCHEMA_VERSION = 1
+TRAINING_DATASET_SCHEMA_VERSION = 2
 MODEL_RUN_ARTIFACT_SCHEMA_VERSION = 1
 _DATASET_PREFIX = "training-dataset:"
 _MODEL_RUN_PREFIX = "model-run:"
@@ -91,6 +92,10 @@ class TrainingSample:
     split: str = "train"
     capture_evidence_ref: str | None = None
     capture_observed_at: datetime | None = None
+    match_id: str | None = None
+    match_version: int | None = None
+    snapshot_ref: str | None = None
+    qualification_ref: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.sample_id, "sample_id")
@@ -137,6 +142,30 @@ class TrainingSample:
                 raise ValueError("capture_observed_at cannot follow sample as_of")
         elif self.capture_evidence_ref is not None or self.capture_observed_at is not None:
             raise ValueError("reconstructed samples cannot carry captured evidence metadata")
+        has_formal_binding = any(
+            value is not None
+            for value in (
+                self.match_id,
+                self.match_version,
+                self.snapshot_ref,
+                self.qualification_ref,
+            )
+        )
+        if has_formal_binding:
+            _require_text(self.match_id, "match_id")
+            if (
+                not isinstance(self.match_version, int)
+                or isinstance(self.match_version, bool)
+                or self.match_version < 1
+            ):
+                raise ValueError("match_version must be a positive integer")
+            _validate_digest_id(
+                self.qualification_ref,
+                "training-qualification:",
+                "qualification_ref",
+            )
+            if self.snapshot_ref is not None:
+                _validate_digest_id(self.snapshot_ref, "snapshot:", "snapshot_ref")
         _ensure_json(self.features, "features")
         validate_training_label(self.label_version, self.label)
 
@@ -161,7 +190,19 @@ class TrainingSample:
         refs = set(self.feature_refs) | {self.label_ref}
         if self.capture_evidence_ref is not None:
             refs.add(self.capture_evidence_ref)
+        if self.snapshot_ref is not None:
+            refs.add(self.snapshot_ref)
+        if self.qualification_ref is not None:
+            refs.add(self.qualification_ref)
         return tuple(sorted(refs))
+
+    @property
+    def formally_bound(self) -> bool:
+        return (
+            self.match_id is not None
+            and self.match_version is not None
+            and self.qualification_ref is not None
+        )
 
     @property
     def feature_hash(self) -> str:
@@ -213,6 +254,7 @@ class TrainingDatasetManifest:
         code_version: str = "unknown",
         status: DatasetStatus | str | None = None,
         error: str | None = None,
+        _schema_version: int = LEGACY_TRAINING_DATASET_SCHEMA_VERSION,
     ) -> TrainingDatasetManifest:
         normalized_samples = _normalize_samples(samples)
         normalized_input_refs = tuple(
@@ -247,14 +289,34 @@ class TrainingDatasetManifest:
             status=normalized_status,
             error=normalized_error,
         )
+        if _schema_version not in {
+            LEGACY_TRAINING_DATASET_SCHEMA_VERSION,
+            TRAINING_DATASET_SCHEMA_VERSION,
+        }:
+            raise ValueError("unsupported training dataset schema_version")
+        if _schema_version == TRAINING_DATASET_SCHEMA_VERSION and any(
+            not sample.formally_bound for sample in normalized_samples
+        ):
+            raise ValueError("formal training datasets require bound qualification artifacts")
+        if _schema_version == LEGACY_TRAINING_DATASET_SCHEMA_VERSION and any(
+            sample.formally_bound for sample in normalized_samples
+        ):
+            raise ValueError("legacy training datasets cannot carry formal qualification bindings")
         digest = hashlib.sha256(
-            _canonical_json({"schema_version": TRAINING_DATASET_SCHEMA_VERSION, **fields})
+            _canonical_json({"schema_version": _schema_version, **fields})
         ).hexdigest()
         return cls(
             dataset_id=_DATASET_PREFIX + digest,
-            schema_version=TRAINING_DATASET_SCHEMA_VERSION,
+            schema_version=_schema_version,
             **fields,
         )
+
+    @classmethod
+    def create_formal(cls, **kwargs: Any) -> TrainingDatasetManifest:
+        """Create schema v2; storage still replays every bound qualification."""
+
+        kwargs.setdefault("transform_version", "training-dataset/2")
+        return cls.create(**kwargs, _schema_version=TRAINING_DATASET_SCHEMA_VERSION)
 
     @property
     def id(self) -> str:
@@ -407,6 +469,10 @@ def verify_training_sample(sample: TrainingSample) -> None:
         split=sample.split,
         capture_evidence_ref=sample.capture_evidence_ref,
         capture_observed_at=sample.capture_observed_at,
+        match_id=sample.match_id,
+        match_version=sample.match_version,
+        snapshot_ref=sample.snapshot_ref,
+        qualification_ref=sample.qualification_ref,
     )
 
 
@@ -415,7 +481,10 @@ def verify_training_dataset(dataset: TrainingDatasetManifest) -> None:
 
     if not isinstance(dataset, TrainingDatasetManifest):
         raise TypeError("dataset must be a TrainingDatasetManifest")
-    if dataset.schema_version != TRAINING_DATASET_SCHEMA_VERSION:
+    if dataset.schema_version not in {
+        LEGACY_TRAINING_DATASET_SCHEMA_VERSION,
+        TRAINING_DATASET_SCHEMA_VERSION,
+    }:
         raise ValueError("unsupported training dataset schema_version")
     if not isinstance(dataset.status, DatasetStatus):
         raise TypeError("dataset status must be a DatasetStatus")
@@ -436,6 +505,14 @@ def verify_training_dataset(dataset: TrainingDatasetManifest) -> None:
         status=dataset.status,
         error=dataset.error,
     )
+    if dataset.schema_version == TRAINING_DATASET_SCHEMA_VERSION and any(
+        not sample.formally_bound for sample in dataset.samples
+    ):
+        raise ValueError("formal training datasets require bound qualification artifacts")
+    if dataset.schema_version == LEGACY_TRAINING_DATASET_SCHEMA_VERSION and any(
+        sample.formally_bound for sample in dataset.samples
+    ):
+        raise ValueError("legacy training datasets cannot carry formal qualification bindings")
     expected = (
         _DATASET_PREFIX
         + hashlib.sha256(
@@ -528,7 +605,7 @@ def verify_model_run_artifact(
 
 def training_sample_payload(sample: TrainingSample) -> dict[str, Any]:
     verify_training_sample(sample)
-    return {
+    payload = {
         "sample_id": sample.sample_id,
         "as_of": _timestamp(sample.as_of),
         "feature_known_at": _timestamp(sample.feature_known_at),
@@ -551,6 +628,16 @@ def training_sample_payload(sample: TrainingSample) -> dict[str, Any]:
             None if sample.capture_observed_at is None else _timestamp(sample.capture_observed_at)
         ),
     }
+    if sample.formally_bound:
+        payload.update(
+            {
+                "match_id": sample.match_id,
+                "match_version": sample.match_version,
+                "snapshot_ref": sample.snapshot_ref,
+                "qualification_ref": sample.qualification_ref,
+            }
+        )
+    return payload
 
 
 def dataset_identity_payload(dataset: TrainingDatasetManifest) -> dict[str, Any]:
@@ -606,7 +693,7 @@ def feature_label_payload(sample: TrainingSample) -> dict[str, Any]:
     """Return the versioned feature/label identity for one sample."""
 
     verify_training_sample(sample)
-    return {
+    payload = {
         "sample_id": sample.sample_id,
         "feature_version": sample.feature_version,
         "label_version": sample.label_version,
@@ -615,6 +702,16 @@ def feature_label_payload(sample: TrainingSample) -> dict[str, Any]:
         "feature_refs": list(sample.feature_refs),
         "label_ref": sample.label_ref,
     }
+    if sample.formally_bound:
+        payload.update(
+            {
+                "match_id": sample.match_id,
+                "match_version": sample.match_version,
+                "snapshot_ref": sample.snapshot_ref,
+                "qualification_ref": sample.qualification_ref,
+            }
+        )
+    return payload
 
 
 def build_training_dataset(**kwargs: Any) -> TrainingDatasetManifest:

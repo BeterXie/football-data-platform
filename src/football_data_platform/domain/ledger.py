@@ -20,16 +20,19 @@ from typing import Any
 from football_data_platform.domain.ids import MatchId, ModelRunId, PredictionId
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.predictions import (
+    MARKET_PERIOD_90_MINUTES,
+    MARKET_SNAPSHOT_SCHEMA_VERSION,
+    MAX_ABSOLUTE_MARKET_LINE,
     MarketDataKind,
     MarketQuote,
     MarketSnapshot,
-    MarketSourceValidator,
+    MarketSnapshotValidator,
     MarketStatus,
     MatchResult90,
     MatchResultValidator,
     ModelRunValidator,
     ScorePrediction,
-    verify_market_snapshot,
+    verify_authoritative_market_snapshot,
     verify_match_result_source,
     verify_score_prediction,
 )
@@ -145,8 +148,28 @@ class SettlementRules:
         _require_text(self.version, "settlement rules version")
         _require_text(self.market_type, "settlement market_type")
         _require_text(self.selection, "settlement selection")
-        if self.line is not None and (not math.isfinite(self.line) or abs(self.line) > 1000):
+        if self.line is not None and (
+            not isinstance(self.line, (int, float))
+            or isinstance(self.line, bool)
+            or not math.isfinite(self.line)
+            or abs(self.line) > MAX_ABSOLUTE_MARKET_LINE
+        ):
             raise ValueError("settlement line must be finite")
+        market_type = self.market_type.lower()
+        if market_type in {"result", "result_90", "1x2"} and self.line is not None:
+            raise ValueError("result settlement rules cannot contain a line")
+        if (
+            market_type
+            in {
+                "total_goals",
+                "totals",
+                "asian_handicap",
+                "handicap",
+                "home_handicap_3way",
+            }
+            and self.line is None
+        ):
+            raise ValueError("line-market settlement rules require a line")
 
     def settle(self, result: MatchResult90 | None) -> SettlementOutcome:
         """Compute the outcome from a 90-minute result, never from caller status."""
@@ -352,7 +375,7 @@ class PaperBetEntry:
         *,
         prediction: ScorePrediction,
         market_snapshot: MarketSnapshot,
-        market_source_validator: MarketSourceValidator,
+        market_snapshot_validator: MarketSnapshotValidator,
         selection: str,
         risk_config: RiskConfig,
         stake: float,
@@ -369,7 +392,10 @@ class PaperBetEntry:
         """Build an accepted entry after all prediction/market gates pass."""
 
         verify_score_prediction(prediction, model_run_validator=model_run_validator)
-        verify_market_snapshot(market_snapshot, source_validator=market_source_validator)
+        verify_authoritative_market_snapshot(
+            market_snapshot,
+            validator=market_snapshot_validator,
+        )
         _validate_market_gate(
             prediction=prediction,
             market_snapshot=market_snapshot,
@@ -555,20 +581,23 @@ PaperBetCandidate = PaperBetEntry
 def verify_paper_bet_entry(
     entry: PaperBetEntry,
     *,
-    market_source_validator: MarketSourceValidator | None = None,
+    market_snapshot_validator: MarketSnapshotValidator | None = None,
     result_validator: MatchResultValidator | None = None,
     model_run_validator: ModelRunValidator | None = None,
 ) -> None:
-    """Verify content addressing and optional market/result source lineage."""
+    """Verify content addressing, accepted-market authority, and result lineage."""
 
     if not isinstance(entry, PaperBetEntry):
         raise TypeError("entry must be a PaperBetEntry")
     _verify_prediction_model_reference(entry, model_run_validator)
     if entry.decision is CandidateDecision.ACCEPTED:
-        if market_source_validator is None:
-            raise ValueError("accepted entry requires a market raw evidence validator")
+        if market_snapshot_validator is None:
+            raise ValueError("accepted entry requires an authoritative market snapshot validator")
         assert entry.market_snapshot is not None
-        verify_market_snapshot(entry.market_snapshot, source_validator=market_source_validator)
+        verify_authoritative_market_snapshot(
+            entry.market_snapshot,
+            validator=market_snapshot_validator,
+        )
         _validate_market_gate(
             prediction=None,
             market_snapshot=entry.market_snapshot,
@@ -668,6 +697,10 @@ def _validate_market_gate(
     placed_at: datetime,
     prediction_snapshot_as_of: datetime | None = None,
 ) -> None:
+    if market_snapshot.schema_version != MARKET_SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError("paper betting requires a current market snapshot")
+    if market_snapshot.period != MARKET_PERIOD_90_MINUTES:
+        raise ValueError("paper betting requires an explicit 90-minute market period")
     if market_snapshot.data_kind is not MarketDataKind.REAL:
         raise ValueError("paper betting requires a real market snapshot")
     if market_snapshot.status is not MarketStatus.OPEN:
@@ -705,6 +738,8 @@ def _validate_market_gate(
         not in _compatible_market_types(market_snapshot.market_type)
     ):
         raise ValueError("settlement rules market_type does not match market snapshot")
+    if settlement_rules is not None and settlement_rules.line != market_snapshot.line:
+        raise ValueError("settlement rules line does not match market snapshot")
 
 
 def _find_quote(quotes: tuple[MarketQuote, ...], selection: str) -> MarketQuote:
@@ -784,7 +819,7 @@ def _entry_digest(entry: PaperBetEntry) -> str:
 def _market_snapshot_payload(snapshot: MarketSnapshot | None) -> dict[str, Any] | None:
     if snapshot is None:
         return None
-    return {
+    payload = {
         "id": snapshot.id.value,
         "schema_version": snapshot.schema_version,
         "match_id": snapshot.match_id.value,
@@ -799,6 +834,10 @@ def _market_snapshot_payload(snapshot: MarketSnapshot | None) -> dict[str, Any] 
         ],
         "raw_asset_ref": snapshot.raw_asset_ref,
     }
+    if snapshot.schema_version == MARKET_SNAPSHOT_SCHEMA_VERSION:
+        payload["period"] = snapshot.period
+        payload["line"] = snapshot.line
+    return payload
 
 
 def _result_payload(result: MatchResult90 | None) -> dict[str, Any] | None:

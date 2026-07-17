@@ -51,25 +51,38 @@ def render_vertical_slice_report(summary: Mapping[str, Any]) -> str:
         )
         if snapshot["missing_fields"]:
             lines.append(f"  Missing fields: `{', '.join(snapshot['missing_fields'])}`")
+    lines.extend(["", "## Model", ""])
+    if prediction.get("available") is False:
+        lines.append(f"- Prediction: `unavailable ({prediction['reason']})`")
+        model_gate = summary["training"]["model_gate"]
+        lines.append(f"- Model gate: `fail ({model_gate['reason']})`")
+        lines.append(f"- Failed model run: `{model_gate['model_run_id']}`")
+    else:
+        lines.extend(
+            [
+                f"- Prediction: `{prediction['id']}`",
+                f"- Model: `{prediction['model_version']}`",
+                f"- Expected goals: `{prediction['lambda_home']:.4f}` / "
+                f"`{prediction['lambda_away']:.4f}`",
+                f"- Dixon-Coles rho: `{prediction['rho']:.4f}`",
+                f"- Score-grid residual: `{prediction['normalization_residual']:.3e}`",
+            ]
+        )
+    lines.extend(["", "## Evaluation", ""])
+    if evaluation.get("available") is False:
+        lines.append(f"- Evaluation: `unavailable ({evaluation['reason']})`")
+    else:
+        lines.extend(
+            [
+                f"- Cohort: `{evaluation['capture_mode']}`",
+                f"- Actual result: `{evaluation['actual_score']}`",
+                f"- Result Brier: `{evaluation['result_brier']:.6f}`",
+                f"- Result LogLoss: `{evaluation['result_log_loss']:.6f}`",
+                f"- Exact-score LogLoss: `{evaluation['score_log_loss']:.6f}`",
+            ]
+        )
     lines.extend(
         [
-            "",
-            "## Model",
-            "",
-            f"- Prediction: `{prediction['id']}`",
-            f"- Model: `{prediction['model_version']}`",
-            f"- Expected goals: `{prediction['lambda_home']:.4f}` / "
-            f"`{prediction['lambda_away']:.4f}`",
-            f"- Dixon-Coles rho: `{prediction['rho']:.4f}`",
-            f"- Score-grid residual: `{prediction['normalization_residual']:.3e}`",
-            "",
-            "## Evaluation",
-            "",
-            f"- Cohort: `{evaluation['capture_mode']}`",
-            f"- Actual result: `{evaluation['actual_score']}`",
-            f"- Result Brier: `{evaluation['result_brier']:.6f}`",
-            f"- Result LogLoss: `{evaluation['result_log_loss']:.6f}`",
-            f"- Exact-score LogLoss: `{evaluation['score_log_loss']:.6f}`",
             "- Market benchmark: `unavailable (no real timestamped market snapshot)`",
             "",
             "## Training Readiness",

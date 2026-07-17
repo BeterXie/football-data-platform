@@ -35,6 +35,7 @@ class ScheduleMatch:
     home_goals: int | None
     away_goals: int | None
     report_url: str | None
+    fixture_known_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +137,9 @@ class _ScheduleTableParser(HTMLParser):
                     self.fixture_known_at_values.append(fixture_known_at)
         elif self.in_schedule_table and tag == "tr":
             self.current_row = {}
+            fixture_known_at = attributes.get("data-fdp-fixture-known-at")
+            if fixture_known_at:
+                self.current_row["__fdp_fixture_known_at"] = _Cell(text_parts=[fixture_known_at])
         elif self.in_schedule_table and self.current_row is not None and tag in {"td", "th"}:
             self.current_stat = attributes.get("data-stat")
             self.current_cell = _Cell()
@@ -376,6 +380,8 @@ def _parse_row(
             status = MatchStatus.FINISHED
         elif "postpon" in score_text.casefold():
             status = MatchStatus.POSTPONED
+        elif "cancel" in score_text.casefold():
+            status = MatchStatus.CANCELLED
         else:
             raise ValueError(f"unrecognized score value {score_text!r}")
 
@@ -393,6 +399,7 @@ def _parse_row(
             home_goals=home_goals,
             away_goals=away_goals,
             report_url=report_url,
+            fixture_known_at=_row_fixture_known_at(row),
         ),
         kickoff,
     )
@@ -429,6 +436,13 @@ def _parse_kickoff(row: dict[str, _Cell], timezone_name: str) -> _KickoffParse:
             f"invalid kickoff {date_text!r} {time_text!r}; kickoff is unknown",
         )
     return _KickoffParse(local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC))
+
+
+def _row_fixture_known_at(row: dict[str, _Cell]) -> datetime | None:
+    cell = row.get("__fdp_fixture_known_at")
+    if cell is None:
+        return None
+    return _fixture_known_at([cell.text])
 
 
 def _read_http_error_body(error: urllib.error.HTTPError) -> bytes | None:

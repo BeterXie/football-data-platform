@@ -14,8 +14,14 @@ from typing import Any, Protocol
 
 from football_data_platform.domain.ids import MatchId, PlayerId, SnapshotId, TeamId
 from football_data_platform.domain.models import require_utc
+from football_data_platform.features.team_baseline import (
+    TEAM_BASELINE_INPUT_TRANSFORM_V3,
+    expected_goals_from_baseline,
+    parse_team_baseline_payload,
+)
 
 SNAPSHOT_SCHEMA_VERSION = 2
+CURRENT_FEATURE_SPEC_VERSION = "prematch-features/3"
 _DERIVED_REF = re.compile(r"^derived-source:[0-9a-f]{64}$")
 
 
@@ -98,13 +104,17 @@ _FEATURE_SPEC_V1 = {
     ),
 }
 _FEATURE_SPEC_V2 = _FEATURE_SPEC_V1
+_FEATURE_SPEC_V3 = _FEATURE_SPEC_V2
 _FEATURE_SPECS = {
     "prematch-features/1": _FEATURE_SPEC_V1,
     "prematch-features/2": _FEATURE_SPEC_V2,
+    CURRENT_FEATURE_SPEC_VERSION: _FEATURE_SPEC_V3,
 }
 _FEATURE_TRANSFORMS = {
-    "team_baseline": frozenset({"team-baseline-input/1", "team-baseline-input/2"}),
-    "match_context": frozenset({"match-context-input/1"}),
+    "team_baseline": frozenset(
+        {"team-baseline-input/1", "team-baseline-input/2", TEAM_BASELINE_INPUT_TRANSFORM_V3}
+    ),
+    "match_context": frozenset({"match-context-input/1", "match-context-input/2"}),
     "lineup_delta": frozenset(
         {"lineup-delta-input/1", "lineup-delta-input/2", "lineup-delta-input/3"}
     ),
@@ -199,6 +209,18 @@ def verify_snapshot(
     digest = hashlib.sha256(_canonical_json(_snapshot_identity_from(snapshot))).hexdigest()
     if snapshot.id != SnapshotId(f"snapshot:{digest}"):
         raise ValueError("snapshot identity does not match its canonical content")
+
+
+def verify_current_snapshot(
+    snapshot: PreMatchSnapshot,
+    *,
+    source_validator: SnapshotSourceValidator,
+) -> None:
+    """Apply the current formal gate while legacy specs remain audit-readable."""
+
+    verify_snapshot(snapshot, source_validator=source_validator)
+    if snapshot.feature_spec_version != CURRENT_FEATURE_SPEC_VERSION:
+        raise ValueError("formal snapshot requires prematch-features/3; older specs are audit-only")
 
 
 def snapshot_payload(
@@ -312,6 +334,28 @@ def _validated_state(
     observed_at, input_refs, validations = _validate_sources(
         features, source_validator, spec_version
     )
+    _validate_match_context_evidence(
+        features,
+        validations,
+        spec_version=spec_version,
+        match_id=match_id,
+        match_version=match_version,
+        as_of=as_of,
+        kickoff=kickoff,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+    )
+    _validate_team_baseline_evidence(
+        features,
+        validations,
+        spec_version=spec_version,
+        match_id=match_id,
+        match_version=match_version,
+        as_of=as_of,
+        kickoff=kickoff,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+    )
     if snapshot_type is SnapshotType.LINEUPS_CONFIRMED:
         official_lineups = _validate_lineups(
             [feature for feature in features if feature.name == "official_lineup_confirmed"],
@@ -389,6 +433,20 @@ def _validate_sources(
             raise ValueError("snapshot source validator returned an invalid source kind")
         if result.transform_version not in _FEATURE_TRANSFORMS[feature.name]:
             raise ValueError(f"snapshot source transform does not match feature {feature.name!r}")
+        if feature.name == "match_context" and (
+            (spec_version == CURRENT_FEATURE_SPEC_VERSION)
+            != (result.transform_version == "match-context-input/2")
+        ):
+            raise ValueError(
+                f"snapshot context source does not match feature spec {spec_version!r}"
+            )
+        if feature.name == "team_baseline" and (
+            (spec_version == CURRENT_FEATURE_SPEC_VERSION)
+            != (result.transform_version == TEAM_BASELINE_INPUT_TRANSFORM_V3)
+        ):
+            raise ValueError(
+                f"snapshot baseline source does not match feature spec {spec_version!r}"
+            )
         require_utc(result.observed_at, "source observed_at")
         if result.known_at is not None:
             require_utc(result.known_at, "source known_at")
@@ -474,6 +532,131 @@ def _validate_official_lineup_evidence(
             raise ValueError("official lineup source context does not match snapshot")
 
 
+def _validate_match_context_evidence(
+    features: tuple[SnapshotFeature, ...],
+    validations: dict[str, SnapshotSourceValidation],
+    *,
+    spec_version: str,
+    match_id: MatchId,
+    match_version: int,
+    as_of: datetime,
+    kickoff: datetime,
+    home_team_id: TeamId,
+    away_team_id: TeamId,
+) -> None:
+    context_features = [feature for feature in features if feature.name == "match_context"]
+    if not context_features:
+        return
+    feature = context_features[0]
+    validation = validations[feature.source_ref]
+    if validation.transform_version != "match-context-input/2":
+        return
+    context = validation.source_context
+    expected = {
+        "rule_version": "previous-completed-match-rest/1",
+        "match_id": match_id.value,
+        "match_version": match_version,
+        "as_of": _timestamp(as_of),
+        "scheduled_kickoff": _timestamp(kickoff),
+        "home_team_id": home_team_id.value,
+        "away_team_id": away_team_id.value,
+        "quality_status": (
+            feature.value.get("quality_status") if isinstance(feature.value, dict) else None
+        ),
+    }
+    if spec_version != CURRENT_FEATURE_SPEC_VERSION or context != expected:
+        raise ValueError("match context source does not match snapshot identity and cutoff")
+
+
+def _validate_team_baseline_evidence(
+    features: tuple[SnapshotFeature, ...],
+    validations: dict[str, SnapshotSourceValidation],
+    *,
+    spec_version: str,
+    match_id: MatchId,
+    match_version: int,
+    as_of: datetime,
+    kickoff: datetime,
+    home_team_id: TeamId,
+    away_team_id: TeamId,
+) -> None:
+    """Recompute formal baseline lambdas and bind them to snapshot identity."""
+
+    if spec_version != CURRENT_FEATURE_SPEC_VERSION:
+        return
+    baseline_features = [feature for feature in features if feature.name == "team_baseline"]
+    if not baseline_features:
+        return
+    feature = baseline_features[0]
+    validation = validations[feature.source_ref]
+    if validation.transform_version != TEAM_BASELINE_INPUT_TRANSFORM_V3:
+        raise ValueError("formal snapshot requires team-baseline-input/3 evidence")
+    value = feature.value
+    if not isinstance(value, dict) or set(value) != {
+        "artifact_id",
+        "artifact",
+        "lambda_home",
+        "lambda_away",
+    }:
+        raise ValueError("team_baseline does not satisfy prematch-features/3")
+    context = validation.source_context
+    expected_context_fields = {
+        "rule_version",
+        "transform_version",
+        "match_id",
+        "match_version",
+        "home_team_id",
+        "away_team_id",
+        "scheduled_kickoff",
+        "as_of",
+        "baseline_artifact_id",
+        "baseline_as_of",
+        "baseline_transform_version",
+    }
+    if not isinstance(context, dict) or set(context) != expected_context_fields:
+        raise ValueError("team baseline source context is invalid")
+    expected_context = {
+        "rule_version": "expected-goals-from-team-baseline/1",
+        "transform_version": TEAM_BASELINE_INPUT_TRANSFORM_V3,
+        "match_id": match_id.value,
+        "match_version": match_version,
+        "home_team_id": home_team_id.value,
+        "away_team_id": away_team_id.value,
+        "scheduled_kickoff": _timestamp(kickoff),
+        "as_of": _timestamp(as_of),
+        "baseline_artifact_id": value["artifact_id"],
+        "baseline_as_of": context.get("baseline_as_of"),
+        "baseline_transform_version": context.get("baseline_transform_version"),
+    }
+    if context != expected_context:
+        raise ValueError("team baseline source context does not match snapshot identity")
+    try:
+        baseline = parse_team_baseline_payload(value["artifact"])
+        expected_home, expected_away = expected_goals_from_baseline(
+            baseline,
+            home_team_id=home_team_id.value,
+            away_team_id=away_team_id.value,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("team baseline source cannot be recomputed") from error
+    if (
+        value["artifact_id"] != baseline.artifact_id
+        or context["baseline_artifact_id"] != baseline.artifact_id
+        or context["baseline_as_of"] != _timestamp(baseline.as_of)
+        or context["baseline_transform_version"] != baseline.transform_version
+        or validation.input_refs != tuple(sorted(set(baseline.input_refs)))
+        or validation.known_at != baseline.as_of
+        or validation.value != value
+        or type(value["lambda_home"]) not in {int, float}
+        or type(value["lambda_away"]) not in {int, float}
+        or not math.isfinite(float(value["lambda_home"]))
+        or not math.isfinite(float(value["lambda_away"]))
+        or value["lambda_home"] != expected_home
+        or value["lambda_away"] != expected_away
+    ):
+        raise ValueError("team baseline lambdas do not match recomputed baseline")
+
+
 def _assess_readiness(
     spec_version: str,
     snapshot_type: SnapshotType,
@@ -493,7 +676,18 @@ def _assess_readiness(
             raise ValueError(f"feature spec allows only one {name!r} feature")
         if name in by_name and by_name[name][0].value is None:
             missing.add(f"feature:{name}:value")
-    _validate_core_values(by_name)
+    _validate_core_values(
+        by_name,
+        spec_version=spec_version,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+    )
+    if spec_version == CURRENT_FEATURE_SPEC_VERSION and by_name.get("match_context"):
+        context = by_name["match_context"][0].value
+        if isinstance(context, dict) and isinstance(context.get("teams"), dict):
+            for team_id in (home_team_id.value, away_team_id.value):
+                if context["teams"][team_id]["status"] != "available":
+                    missing.add(f"feature:match_context:{team_id}:previous_match")
     if snapshot_type is SnapshotType.LINEUPS_CONFIRMED:
         _validate_lineups(by_name.get("official_lineup_confirmed", []), home_team_id, away_team_id)
         if by_name.get("lineup_delta") and by_name["lineup_delta"][0].value is not None:
@@ -508,7 +702,13 @@ def _assess_readiness(
     return tuple(sorted(missing))
 
 
-def _validate_core_values(by_name: dict[str, list[SnapshotFeature]]) -> None:
+def _validate_core_values(
+    by_name: dict[str, list[SnapshotFeature]],
+    *,
+    spec_version: str,
+    home_team_id: TeamId,
+    away_team_id: TeamId,
+) -> None:
     if by_name.get("team_baseline") and (value := by_name["team_baseline"][0].value) is not None:
         numbers = (
             (value.get("lambda_home"), value.get("lambda_away")) if isinstance(value, dict) else ()
@@ -527,9 +727,58 @@ def _validate_core_values(by_name: dict[str, list[SnapshotFeature]]) -> None:
         ):
             raise ValueError("team_baseline does not satisfy prematch-features/1")
     if by_name.get("match_context") and (value := by_name["match_context"][0].value) is not None:
+        if spec_version == CURRENT_FEATURE_SPEC_VERSION:
+            _validate_match_context_v2_value(value, home_team_id, away_team_id)
+            return
         days = value.get("days_since_previous_match") if isinstance(value, dict) else None
         if not isinstance(days, (int, float)) or isinstance(days, bool) or days < 0:
             raise ValueError("match_context does not satisfy prematch-features/1")
+
+
+def _validate_match_context_v2_value(value: Any, home: TeamId, away: TeamId) -> None:
+    expected_teams = {home.value, away.value}
+    teams = value.get("teams") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 2
+        or value.get("rule_version") != "previous-completed-match-rest/1"
+        or value.get("home_team_id") != home.value
+        or value.get("away_team_id") != away.value
+        or not isinstance(teams, dict)
+        or set(teams) != expected_teams
+        or value.get("quality_status") not in {"ready", "missing"}
+    ):
+        raise ValueError("match_context does not satisfy prematch-features/3")
+    available = True
+    for team_id in expected_teams:
+        item = teams[team_id]
+        if not isinstance(item, dict) or item.get("team_id") != team_id:
+            raise ValueError("match_context does not satisfy prematch-features/3")
+        status = item.get("status")
+        if status == "available":
+            rest_days = item.get("rest_days")
+            if (
+                not isinstance(rest_days, (int, float))
+                or isinstance(rest_days, bool)
+                or not math.isfinite(float(rest_days))
+                or rest_days <= 0
+            ):
+                raise ValueError("match_context has invalid per-team rest_days")
+        elif status == "missing":
+            available = False
+            reason = item.get("reason")
+            if (
+                not isinstance(reason, str)
+                or not reason
+                or "rest_days" in item
+                or set(item) != {"team_id", "status", "reason"}
+            ):
+                raise ValueError("missing match_context must retain an explicit reason")
+        else:
+            raise ValueError("match_context team status is invalid")
+    expected_quality = "ready" if available else "missing"
+    if value["quality_status"] != expected_quality:
+        raise ValueError("match_context quality does not match per-team evidence")
 
 
 def _validate_lineups(

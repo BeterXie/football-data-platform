@@ -21,6 +21,7 @@ from football_data_platform.domain.training import (
     TrainingSample,
 )
 from football_data_platform.storage.canonical import CanonicalStore
+from football_data_platform.storage.derived import DerivedArtifactManifest
 from football_data_platform.storage.facts import load_verified_match_result
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import RawArchive
@@ -424,10 +425,8 @@ def test_training_store_rejects_backdated_derived_artifact_input(
     assert "generated_at predates input availability" in str(write_error.value.__cause__)
 
     store._write_json(store.dataset_path(dataset.dataset_id), dataset.to_payload())
-    with pytest.raises(TrainingArtifactConflict) as load_error:
+    with pytest.raises(TrainingArtifactConflict, match="exactly one derived artifact manifest"):
         store.load_dataset(dataset.dataset_id)
-    assert load_error.value.__cause__ is not None
-    assert "generated_at predates input availability" in str(load_error.value.__cause__)
 
 
 def test_training_store_accepts_derived_artifact_availability_boundary(
@@ -498,7 +497,7 @@ def test_model_run_requires_persisted_dataset_and_matching_capture_mode(tmp_path
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
     with pytest.raises(TrainingArtifactConflict, match="persisted training dataset"):
-        store.write_model_run(run)
+        store.write_model_run_for_audit(run)
 
     store.write_dataset(dataset)
     claimed_captured = _model_run(
@@ -507,7 +506,7 @@ def test_model_run_requires_persisted_dataset_and_matching_capture_mode(tmp_path
         capture_mode=CaptureMode.CAPTURED,
     )
     with pytest.raises(ValueError, match="capture mode"):
-        store.write_model_run(claimed_captured)
+        store.write_model_run_for_audit(claimed_captured)
 
     with pytest.raises(ValueError, match="captured evaluation cohort"):
         _model_run(
@@ -567,7 +566,7 @@ def test_partial_manifest_preserves_diagnostic_error(tmp_path: Path) -> None:
         error="evaluation report incomplete",
     )
     _write_model_bytes(store)
-    store.write_model_run(run)
+    store.write_model_run_for_audit(run)
     manifests = list((store.layout.derived / "manifests" / "artifacts").rglob("*.json"))
     manifest_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in manifests]
     run_manifest = next(
@@ -722,7 +721,7 @@ def test_training_store_uses_raw_observation_for_result_availability(tmp_path: P
             (forged_observed_at, sample.label_ref),
         )
 
-    with pytest.raises(TrainingArtifactConflict, match="reference is unavailable or invalid"):
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
         store.load_dataset(dataset.dataset_id)
 
 
@@ -749,15 +748,15 @@ def test_model_run_round_trip_and_tamper_detection(tmp_path: Path) -> None:
         run_role="formal",
     )
     assert run.started_at == dataset.generated_at
-    path = store.write_model_run(run)
-    assert store.write_model_run(run) == path
-    assert store.load_model_run(run.model_run_id) == run
+    path = store.write_model_run_for_audit(run)
+    assert store.write_model_run_for_audit(run) == path
+    assert store.load_model_run_for_audit(run.model_run_id) == run
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["parameters"]["rho"] = -0.2
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(TrainingArtifactConflict, match="identity"):
-        store.load_model_run(run.model_run_id)
+        store.load_model_run_for_audit(run.model_run_id)
 
 
 def test_model_run_rejects_start_before_dataset_generation(tmp_path: Path) -> None:
@@ -775,7 +774,7 @@ def test_model_run_rejects_start_before_dataset_generation(tmp_path: Path) -> No
     )
 
     with pytest.raises(ValueError, match="cannot start before"):
-        store.write_model_run(run)
+        store.write_model_run_for_audit(run)
 
 
 def test_model_run_rejects_train_evaluation_split_and_missing_or_tampered_bytes(
@@ -791,7 +790,7 @@ def test_model_run_rejects_train_evaluation_split_and_missing_or_tampered_bytes(
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
     with pytest.raises(ValueError, match="out-of-time split"):
-        store.write_model_run(run)
+        store.write_model_run_for_audit(run)
 
     training = _sample("sample:training", sample_as_of=AS_OF - timedelta(days=1))
     holdout = _sample("sample:holdout", split="holdout")
@@ -803,13 +802,13 @@ def test_model_run_rejects_train_evaluation_split_and_missing_or_tampered_bytes(
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
     with pytest.raises(TrainingArtifactConflict, match="unavailable"):
-        store.write_model_run(run)
+        store.write_model_run_for_audit(run)
 
     _write_model_bytes(store)
-    store.write_model_run(run)
+    store.write_model_run_for_audit(run)
     store.model_artifact_path(MODEL_REF).write_bytes(b"tampered")
-    with pytest.raises(TrainingArtifactConflict, match="hash mismatch"):
-        store.load_model_run(run.model_run_id)
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
+        store.load_model_run_for_audit(run.model_run_id)
 
 
 def test_model_run_rejects_non_temporal_or_mislabeled_holdout(tmp_path: Path) -> None:
@@ -829,7 +828,7 @@ def test_model_run_rejects_non_temporal_or_mislabeled_holdout(tmp_path: Path) ->
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
     with pytest.raises(ValueError, match="strictly later"):
-        store.write_model_run(run)
+        store.write_model_run_for_audit(run)
 
     later_holdout = _sample("sample:later", split="holdout", sample_as_of=AS_OF)
     temporal_base = _sample("sample:base", sample_as_of=AS_OF - timedelta(days=1))
@@ -845,7 +844,7 @@ def test_model_run_rejects_non_temporal_or_mislabeled_holdout(tmp_path: Path) ->
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
     with pytest.raises(ValueError, match="forward or temporal"):
-        store.write_model_run(random_run)
+        store.write_model_run_for_audit(random_run)
 
 
 def test_score_dataset_loads_typed_canonical_result(tmp_path: Path) -> None:
@@ -883,7 +882,7 @@ def test_score_dataset_rejects_result_goal_tamper_with_preserved_record_id(
             (tampered_goal, dataset.samples[0].label_ref),
         )
 
-    with pytest.raises(TrainingArtifactConflict, match="result lineage is invalid"):
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
         store.load_dataset(dataset.dataset_id)
 
 
@@ -915,7 +914,7 @@ def test_score_dataset_rejects_result_evidence_swap(tmp_path: Path) -> None:
             ),
         )
 
-    with pytest.raises(TrainingArtifactConflict, match="result lineage is invalid"):
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
         store.load_dataset(dataset.dataset_id)
 
 
@@ -952,7 +951,7 @@ def test_score_dataset_rejects_result_raw_byte_tamper(tmp_path: Path) -> None:
     asset = archive.load(RawAssetId(raw_asset_id))
     layout.raw_object_path(asset.checksum).write_bytes(b"tampered-result-bytes")
 
-    with pytest.raises(TrainingArtifactConflict, match="result lineage is invalid"):
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
         store.load_dataset(dataset.dataset_id)
 
 
@@ -982,6 +981,20 @@ def test_score_dataset_load_rejects_label_contract_mismatch(
     )
     dataset = _dataset((forged,))
     store._write_json(store.dataset_path(dataset.dataset_id), dataset.to_payload())
+    store.derived.write_artifact_manifest(
+        DerivedArtifactManifest.create(
+            artifact_type="training-dataset",
+            schema_version=dataset.schema_version,
+            payload=dataset.to_payload(),
+            generated_at=dataset.generated_at,
+            transform_version=dataset.transform_version,
+            code_version=dataset.code_version,
+            input_refs=dataset.input_refs,
+            output_refs=(dataset.dataset_id,),
+            status=dataset.status.value,
+            quality=dataset.status.value,
+        )
+    )
 
     with pytest.raises(TrainingArtifactConflict, match=expected_message):
         store.load_dataset(dataset.dataset_id)
@@ -1005,5 +1018,121 @@ def test_model_run_rejects_dataset_with_tampered_canonical_result(tmp_path: Path
         capture_mode=CaptureMode.RECONSTRUCTED,
     )
 
-    with pytest.raises(TrainingArtifactConflict, match="result lineage is invalid"):
+    with pytest.raises(TrainingArtifactConflict, match="manifest is unavailable or invalid"):
+        store.write_model_run_for_audit(run)
+
+
+def test_formal_model_run_consumers_reject_legacy_self_reported_readiness(
+    tmp_path: Path,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    store = TrainingArtifactStore(layout)
+    training = _sample("sample:legacy-train", sample_as_of=AS_OF - timedelta(days=1))
+    holdout = _sample("sample:legacy-holdout", split="holdout")
+    dataset = _dataset((training, holdout), layout=layout)
+    assert dataset.schema_version == 1
+    assert all(sample.qualification_passed for sample in dataset.samples)
+    store.write_dataset(dataset)
+    _write_model_bytes(store)
+    run = _model_run(
+        dataset,
+        cohort=(next(sample for sample in dataset.samples if sample.split == "holdout").sample_id,),
+        capture_mode=CaptureMode.RECONSTRUCTED,
+    )
+
+    with pytest.raises(TrainingArtifactConflict, match="current score feature projection"):
         store.write_model_run(run)
+
+    store.write_model_run_for_audit(run)
+    assert store.load_model_run_for_audit(run.model_run_id) == run
+    with pytest.raises(TrainingArtifactConflict, match="current score feature projection"):
+        store.load_model_run(run.model_run_id)
+    with pytest.raises(TrainingArtifactConflict, match="current score feature projection"):
+        store.verify_model_run(run)
+
+
+@pytest.mark.parametrize("attack", ("delete", "tamper", "duplicate"))
+def test_dataset_load_rejects_missing_tampered_or_duplicate_manifest(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    store = TrainingArtifactStore(layout)
+    dataset = _dataset((_sample(f"sample:dataset-manifest-{attack}"),), layout=layout)
+    store.write_dataset(dataset)
+    manifest = store.derived._load_artifact_manifest_for_output_ref(dataset.dataset_id)
+    path = store.derived.artifact_manifest_path(manifest.artifact_id)
+    _attack_manifest(store, path, attack)
+
+    with pytest.raises(
+        TrainingArtifactConflict,
+        match=(
+            "exactly one derived artifact manifest|manifest is unavailable or invalid|"
+            "manifest does not match"
+        ),
+    ):
+        store.load_dataset(dataset.dataset_id)
+
+
+@pytest.mark.parametrize("attack", ("delete", "tamper", "duplicate"))
+def test_model_run_load_rejects_missing_tampered_or_duplicate_manifest(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    store = TrainingArtifactStore(layout)
+    training = _sample(
+        f"sample:model-manifest-train-{attack}",
+        sample_as_of=AS_OF - timedelta(days=1),
+    )
+    holdout = _sample(f"sample:model-manifest-holdout-{attack}", split="holdout")
+    dataset = _dataset((training, holdout), layout=layout)
+    store.write_dataset(dataset)
+    _write_model_bytes(store)
+    run = _model_run(
+        dataset,
+        cohort=(next(sample for sample in dataset.samples if sample.split == "holdout").sample_id,),
+        capture_mode=CaptureMode.RECONSTRUCTED,
+    )
+    store.write_model_run_for_audit(run)
+    manifest = store.derived._load_artifact_manifest_for_output_ref(run.model_run_id)
+    path = store.derived.artifact_manifest_path(manifest.artifact_id)
+    _attack_manifest(store, path, attack)
+
+    with pytest.raises(
+        TrainingArtifactConflict,
+        match=(
+            "exactly one derived artifact manifest|manifest is unavailable or invalid|"
+            "manifest does not match"
+        ),
+    ):
+        store.load_model_run_for_audit(run.model_run_id)
+
+
+def _attack_manifest(store: TrainingArtifactStore, path: Path, attack: str) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if attack == "delete":
+        path.unlink()
+    elif attack == "tamper":
+        tampered = DerivedArtifactManifest.create(
+            artifact_type=payload["artifact_type"],
+            schema_version=payload["schema_version"],
+            payload=payload["payload"],
+            generated_at=datetime.fromisoformat(payload["generated_at"].replace("Z", "+00:00")),
+            started_at=datetime.fromisoformat(payload["started_at"].replace("Z", "+00:00")),
+            ended_at=datetime.fromisoformat(payload["ended_at"].replace("Z", "+00:00")),
+            transform_version=payload["transform_version"],
+            code_version=payload["code_version"],
+            input_refs=tuple(payload["input_refs"]),
+            output_refs=tuple(payload["output_refs"]),
+            status=payload["status"],
+            error=payload["error"],
+            quality="tampered",
+        )
+        path.unlink()
+        store._write_json(
+            store.derived.artifact_manifest_path(tampered.artifact_id),
+            tampered.to_payload(),
+        )
+    else:
+        store._write_json(path.with_name(f"duplicate-{path.name}"), payload)

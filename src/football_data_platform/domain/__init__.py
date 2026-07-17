@@ -38,7 +38,9 @@ from football_data_platform.domain.models import (
     SourceMapping,
 )
 from football_data_platform.domain.predictions import (
+    MarketSnapshotValidator,
     ModelRunValidator,
+    PersistedPredictionContextValidator,
     PredictionContribution,
     ScorePrediction,
     score_grid_composition_artifact_id,
@@ -62,6 +64,12 @@ from football_data_platform.domain.training import (
     verify_model_run_artifact,
     verify_training_dataset,
 )
+from football_data_platform.domain.training_qualification import (
+    TrainingQualification,
+    parse_training_qualification_payload,
+    score_feature_payload,
+    verify_training_qualification,
+)
 
 __all__ = [
     "CompetitionId",
@@ -69,7 +77,9 @@ __all__ = [
     "BetDecision",
     "CandidateDecision",
     "MatchResultValidator",
+    "MarketSnapshotValidator",
     "ModelRunValidator",
+    "PersistedPredictionContextValidator",
     "PredictionContribution",
     "ScorePrediction",
     "MappingRule",
@@ -104,6 +114,7 @@ __all__ = [
     "TrainingDatasetArtifact",
     "TrainingDatasetManifest",
     "TrainingSample",
+    "TrainingQualification",
     "build_model_run_artifact",
     "build_training_dataset",
     "feature_label_payload",
@@ -116,4 +127,7 @@ __all__ = [
     "score_grid_composition_payload",
     "verify_model_run_artifact",
     "verify_training_dataset",
+    "parse_training_qualification_payload",
+    "score_feature_payload",
+    "verify_training_qualification",
 ]

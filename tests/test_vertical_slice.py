@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from football_data_platform.domain.predictions import SCORE_GRID_COMPOSITION_SCHEMA_VERSION
 from football_data_platform.pipelines.vertical_slice import run_offline_vertical_slice
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError
+from football_data_platform.storage.training import TrainingArtifactStore
 
 ROOT = Path(__file__).parents[1]
 OBSERVED_AT = datetime(2026, 7, 16, 8, 0, tzinfo=UTC)
@@ -61,9 +61,19 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     assert any(ref.startswith("vertical-slice-summary:") for ref in run_manifest.output_refs)
     assert any(ref.startswith("vertical-slice-report:") for ref in run_manifest.output_refs)
     assert summary["run_id"] == run_manifest.run_id
-    assert summary["snapshots"][0]["quality_status"] == "ready"
+    assert summary["snapshots"][0]["quality_status"] == "preview"
     assert summary["snapshots"][0]["capture_mode"] == "reconstructed"
     assert summary["snapshots"][1]["quality_status"] == "preview"
+    assert all(
+        any(field.startswith("feature:match_context:") for field in snapshot["missing_fields"])
+        for snapshot in summary["snapshots"]
+    )
+    assert first.prediction_id is None
+    assert summary["prediction"] == {
+        "available": False,
+        "reason": "snapshot_not_ready:expected_goals_unavailable",
+    }
+    assert not summary["evaluation"]["available"]
     assert not summary["evaluation"]["market_benchmark"]["available"]
     assert summary["evaluation"]["capture_mode"] == "reconstructed"
     assert first.report_path.read_text(encoding="utf-8").startswith(
@@ -92,10 +102,33 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     report_artifact = next(
         item for item in artifacts if item.artifact_type == "vertical-slice-report"
     )
-    composition_artifact = next(
-        item for item in artifacts if item.artifact_type == "score-grid-composition"
-    )
-    assert composition_artifact.schema_version == SCORE_GRID_COMPOSITION_SCHEMA_VERSION
+    qualifications = [item for item in artifacts if item.artifact_type == "training-qualification"]
+    assert sorted(item.quality for item in qualifications) == ["failed", "failed"]
+    assert not any(item.artifact_type == "score-grid-composition" for item in artifacts)
+    assert not any(item.artifact_type == "prediction" for item in artifacts)
+    assert not any(item.artifact_type == "evaluation" for item in artifacts)
+    training = TrainingArtifactStore(DataLayout(arguments["data_root"]))
+    dataset = training.load_formal_dataset(summary["training_dataset_id"])
+    model_run = training.load_model_run(summary["model_run_id"])
+    assert dataset.schema_version == 2
+    assert dataset.status.value == "failed"
+    train_sample = next(sample for sample in dataset.samples if sample.split == "train")
+    holdout_sample = next(sample for sample in dataset.samples if sample.split == "holdout")
+    assert not train_sample.qualification_passed
+    assert "missing_bound_prematch_snapshot" in train_sample.exclusion_reasons
+    assert not holdout_sample.qualification_passed
+    assert "missing_ready_prematch_snapshot" in holdout_sample.exclusion_reasons
+    assert model_run.status.value == "failed"
+    assert model_run.error == "no_eligible_train_split"
+    assert summary["training"]["model_gate"]["passed"] is False
+    assert summary["training"]["eligible_train_samples"] == []
+    assert summary["training"]["eligible_holdout_samples"] == []
+    assert len(summary["training"]["excluded_samples"]) == 2
+    assert summary["lambda_composition"]["available"] is False
+    assert summary["lambda_composition"]["reason"] == "prediction_snapshot_not_ready"
+    assert "lambda_home" not in summary["lambda_composition"]
+    assert "lambda_away" not in summary["lambda_composition"]
+    assert summary["lambda_composition"]["composition_artifact_ref"] is None
     assert any(ref.startswith("file-sha256:") for ref in summary_artifact.output_refs)
     assert any(ref.startswith("file-sha256:") for ref in report_artifact.output_refs)
     registrations = [

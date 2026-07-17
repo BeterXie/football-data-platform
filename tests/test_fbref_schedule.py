@@ -69,9 +69,25 @@ def test_comment_wrapped_schedule_parses_all_valid_league_rows() -> None:
     assert result.matches[0].home_goals == 2
     assert result.matches[0].away_goals == 1
     assert result.matches[0].kickoff_at == datetime(2025, 8, 15, 19, 0, tzinfo=UTC)
+    assert result.matches[0].fixture_known_at == datetime(2025, 6, 18, 8, 0, tzinfo=UTC)
     assert result.matches[1].source_match_id is None
     assert result.fixture_known_at == datetime(2025, 6, 18, 8, 0, tzinfo=UTC)
     assert [diagnostic.code for diagnostic in result.diagnostics] == ["invalid_schedule_row"]
+
+
+def test_cancelled_schedule_row_is_explicitly_unplayed() -> None:
+    _, competition, season = _registration()
+    content = (ROOT / "tests/fixtures/fbref_premier_league_schedule.html").read_bytes()
+    content = content.replace(b">2-1<", b">Cancelled<", 1)
+
+    result = parse_schedule(
+        content,
+        competition=competition,
+        season=season,
+        page_url=schedule_url(competition, season),
+    )
+
+    assert result.matches[0].status is MatchStatus.CANCELLED
 
 
 @pytest.mark.parametrize(

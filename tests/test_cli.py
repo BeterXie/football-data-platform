@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from _formal_training import seed_formal_score_sample
 from _training_refs import seed_training_references
 
 from football_data_platform.cli import _latest_result, _select_report_version, main
@@ -12,9 +13,13 @@ from football_data_platform.domain.ids import MatchId, RawAssetId
 from football_data_platform.domain.models import MatchStatus, MatchVersion
 from football_data_platform.domain.snapshots import CaptureMode
 from football_data_platform.domain.training import (
+    TRAINING_DATASET_SCHEMA_VERSION,
     ModelRunArtifact,
     TrainingDatasetManifest,
     TrainingSample,
+)
+from football_data_platform.domain.training_qualification import (
+    CURRENT_SCORE_FEATURE_PROJECTION_VERSION,
 )
 from football_data_platform.pipelines.schedule import ingest_fbref_schedule
 from football_data_platform.sources.fbref import FBrefFetchError, FetchDiagnostic, schedule_url
@@ -30,6 +35,11 @@ ROOT = Path(__file__).parents[1]
 
 def _write_payload(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _artifact_manifest_payloads(layout: DataLayout) -> tuple[dict[str, object], ...]:
+    root = layout.derived / "manifests" / "artifacts"
+    return tuple(json.loads(path.read_text(encoding="utf-8")) for path in root.rglob("*.json"))
 
 
 def test_cli_runs_golden_slice_and_emits_artifact_pointers(tmp_path: Path, capsys) -> None:
@@ -520,65 +530,63 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
     capsys,
 ) -> None:
     data_root = tmp_path / "data"
+    layout = DataLayout(data_root)
     train_as_of = datetime(2025, 8, 1, 12, tzinfo=UTC)
     holdout_as_of = train_as_of + timedelta(days=7)
-    feature_ref, training_label_ref = seed_training_references(
-        DataLayout(data_root),
-        label_known_at=train_as_of + timedelta(hours=3),
-        observed_at=train_as_of + timedelta(hours=3),
-        reference_key="cli-training",
+    evaluated_at = holdout_as_of + timedelta(days=1, hours=3)
+    training, _ = seed_formal_score_sample(
+        layout,
+        key="cli-training",
+        kickoff=train_as_of + timedelta(hours=24),
+        observed_at=evaluated_at,
+        evaluated_at=evaluated_at,
+        team_indices=(0, 1, 2, 3),
+        goals=(2, 1),
+        split="train",
     )
-    _, holdout_label_ref = seed_training_references(
-        DataLayout(data_root),
-        label_known_at=holdout_as_of + timedelta(hours=3),
-        observed_at=holdout_as_of + timedelta(hours=3),
-        reference_key="cli-holdout",
+    holdout, _ = seed_formal_score_sample(
+        layout,
+        key="cli-holdout",
+        kickoff=holdout_as_of + timedelta(hours=24),
+        observed_at=evaluated_at,
+        evaluated_at=evaluated_at,
+        team_indices=(4, 5, 6, 7),
+        goals=(1, 0),
+        split="holdout",
     )
-
-    def sample(
-        sample_id: str,
-        as_of: datetime,
-        split: str,
-        label_ref: str,
-    ) -> TrainingSample:
-        return TrainingSample(
-            sample_id=sample_id,
-            as_of=as_of,
-            feature_known_at=as_of - timedelta(hours=1),
-            label_known_at=as_of + timedelta(hours=3),
-            capture_mode=CaptureMode.RECONSTRUCTED,
-            qualification="score-model-ready",
-            qualification_passed=True,
-            feature_version="score-features/1",
-            label_version="result-90/1",
-            feature_refs=(feature_ref,),
-            label_ref=label_ref,
-            features={"home": 1.2, "away": 0.9},
-            label={"home_goals": 2, "away_goals": 1},
-            split=split,
-        )
-
-    training = sample("sample:train", train_as_of, "train", training_label_ref)
-    holdout = sample("sample:holdout", holdout_as_of, "holdout", holdout_label_ref)
-    dataset = TrainingDatasetManifest.create(
-        dataset_version="score-dataset/cli-1",
+    dataset = TrainingDatasetManifest.create_formal(
+        dataset_version="score-dataset/cli-2",
         task="score-model",
         qualification="score-model-ready",
         qualification_ruleset_version="readiness/1",
-        feature_version="score-features/1",
+        feature_version=CURRENT_SCORE_FEATURE_PROJECTION_VERSION,
         label_version="result-90/1",
-        as_of=holdout_as_of,
+        as_of=holdout.as_of,
         split_strategy="forward-chaining/1",
         samples=(training, holdout),
-        generated_at=holdout_as_of + timedelta(hours=4),
+        generated_at=evaluated_at,
         code_version="git:test",
     )
+    assert dataset.schema_version == TRAINING_DATASET_SCHEMA_VERSION
     dataset_file = tmp_path / "dataset.json"
     _write_payload(dataset_file, dataset.to_payload())
     common = ["--data-root", str(data_root), "--registry", str(ROOT / "config/competitions.toml")]
     assert main(["register-training-dataset", *common, "--file", str(dataset_file)]) == 0
     dataset_result = json.loads(capsys.readouterr().out)
     assert dataset_result["dataset_id"] == dataset.dataset_id
+    manifests = _artifact_manifest_payloads(layout)
+    dataset_owners = [
+        payload for payload in manifests if dataset.dataset_id in payload.get("output_refs", [])
+    ]
+    assert len(dataset_owners) == 1
+    assert dataset_owners[0]["artifact_type"] == "training-dataset"
+    dataset_command = next(
+        payload
+        for payload in manifests
+        if payload["artifact_type"] == "cli-register-training-dataset"
+    )
+    assert dataset.dataset_id not in dataset_command["output_refs"]
+    assert any(reference.startswith("file-sha256:") for reference in dataset_command["output_refs"])
 
     model_file = tmp_path / "model.bin"
     model_file.write_bytes(b"deterministic dixon-coles parameters\n")
@@ -601,7 +609,7 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
     )
     output_result = json.loads(capsys.readouterr().out)
     artifact = ModelRunArtifact.create(
-        model_version="dixon-coles/cli-1",
+        model_version="dixon-coles/cli-2",
         run_role="research",
         task="score-model",
         dataset_id=dataset.dataset_id,
@@ -611,8 +619,8 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
         parameters={"rho": -0.1, "max_goals": 11},
         code_version="git:test",
         environment_version="python:test-lock",
-        started_at=holdout_as_of + timedelta(hours=4),
-        ended_at=holdout_as_of + timedelta(hours=4, seconds=1),
+        started_at=evaluated_at,
+        ended_at=evaluated_at + timedelta(seconds=1),
         random_seed=17,
         model_artifact_refs=(model_result["content_ref"],),
         evaluation_cohort=(holdout.sample_id,),
@@ -625,6 +633,19 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
     assert main(["register-model-run", *common, "--file", str(run_file)]) == 0
     run_result = json.loads(capsys.readouterr().out)
     assert run_result["model_run_id"] == artifact.model_run_id
+    manifests = _artifact_manifest_payloads(layout)
+    model_run_owners = [
+        payload for payload in manifests if artifact.model_run_id in payload.get("output_refs", [])
+    ]
+    assert len(model_run_owners) == 1
+    assert model_run_owners[0]["artifact_type"] == "model-run"
+    model_run_command = next(
+        payload for payload in manifests if payload["artifact_type"] == "cli-register-model-run"
+    )
+    assert artifact.model_run_id not in model_run_command["output_refs"]
+    assert any(
+        reference.startswith("file-sha256:") for reference in model_run_command["output_refs"]
+    )
     assert (
         TrainingArtifactStore(DataLayout(data_root)).load_model_run(artifact.model_run_id)
         == artifact

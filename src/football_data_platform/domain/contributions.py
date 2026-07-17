@@ -11,6 +11,7 @@ from typing import Any, Protocol
 BOUNDED_EXP_LINEAR_VERSION = "bounded-exp-linear/1"
 EXPECTED_GOALS_COMPOSITION_VERSION = "expected-goals-composition/2"
 MATCH_CONTEXT_CALIBRATION_VERSION = "match-context-calibration/1"
+MATCH_CONTEXT_CALIBRATION_VERSION_V2 = "match-context-calibration/2"
 LINEUP_DELTA_CALIBRATION_VERSION = "lineup-delta-calibration/1"
 
 LINEUP_ATTACK_DIMENSIONS = frozenset(
@@ -43,6 +44,15 @@ CONTRIBUTION_CALIBRATION_POLICIES: Mapping[str, ContributionCalibrationPolicy] =
             source_path_template=("days_since_previous_match",),
             contribution_key_template="context:rest-days:{version}",
             coefficient_rule="symmetric",
+            reference_value=5.0,
+            coefficient=0.02,
+        ),
+        MATCH_CONTEXT_CALIBRATION_VERSION_V2: ContributionCalibrationPolicy(
+            version=MATCH_CONTEXT_CALIBRATION_VERSION_V2,
+            source_feature_name="match_context",
+            source_path_template=("teams", "{team_id}", "rest_days"),
+            contribution_key_template="context:rest-days:{team_id}:{version}",
+            coefficient_rule="team-side-rest",
             reference_value=5.0,
             coefficient=0.02,
         ),
@@ -165,6 +175,48 @@ def validate_contribution_calibration_policy(
             raise ValueError(f"contribution does not match calibration policy {policy.version!r}")
         return
 
+    if policy.coefficient_rule == "team-side-rest":
+        if (
+            len(calibration.source_path) != 3
+            or calibration.source_path[0] != "teams"
+            or calibration.source_path[2] != "rest_days"
+            or not calibration.source_path[1]
+        ):
+            raise ValueError(f"contribution does not match calibration policy {policy.version!r}")
+        team_id = calibration.source_path[1]
+        expected_path = tuple(
+            segment.format(team_id=team_id) for segment in policy.source_path_template
+        )
+        expected_key = policy.contribution_key_template.format(
+            team_id=team_id,
+            version=policy.version,
+        )
+        actual_pair = (
+            float(calibration.lambda_home_coefficient),
+            float(calibration.lambda_away_coefficient),
+        )
+        if (
+            calibration.source_path != expected_path
+            or contribution.contribution_key != expected_key
+            or actual_pair not in {(policy.coefficient, 0.0), (0.0, policy.coefficient)}
+        ):
+            raise ValueError(f"contribution does not match calibration policy {policy.version!r}")
+        if home_team_id is None and away_team_id is None:
+            return
+        if (
+            not home_team_id
+            or not away_team_id
+            or home_team_id == away_team_id
+            or team_id not in {home_team_id, away_team_id}
+        ):
+            raise ValueError("context calibration policy requires the canonical match teams")
+        expected_pair = (
+            (policy.coefficient, 0.0) if team_id == home_team_id else (0.0, policy.coefficient)
+        )
+        if actual_pair != expected_pair:
+            raise ValueError(f"contribution does not match calibration policy {policy.version!r}")
+        return
+
     team_id, dimension = _lineup_source_path(calibration.source_path)
     if policy.coefficient_rule != "team-side-dimension":
         raise ValueError(f"unsupported coefficient rule {policy.coefficient_rule!r}")
@@ -231,14 +283,37 @@ def validate_snapshot_contribution_policy(
     if len(context_features) != 1:
         raise ValueError("formal prediction contribution set requires one match_context")
     context_feature = context_features[0]
-    context_policy = _calibration_policy(MATCH_CONTEXT_CALIBRATION_VERSION)
-    context_key = context_policy.contribution_key_template.format(version=context_policy.version)
-    expected: dict[str, tuple[str, tuple[str, ...]]] = {
-        context_key: (
+    expected: dict[str, tuple[str, tuple[str, ...]]] = {}
+    if snapshot.feature_spec_version == "prematch-features/3":
+        context_policy = _calibration_policy(MATCH_CONTEXT_CALIBRATION_VERSION_V2)
+        teams = (
+            context_feature.value.get("teams")
+            if isinstance(context_feature.value, Mapping)
+            else None
+        )
+        if not isinstance(teams, Mapping):
+            raise ValueError("formal context policy requires per-team context evidence")
+        for team_id in (home_team_id, away_team_id):
+            item = teams.get(team_id)
+            if not isinstance(item, Mapping) or item.get("status") != "available":
+                raise ValueError("formal context policy requires available rest for both teams")
+            key = context_policy.contribution_key_template.format(
+                team_id=team_id,
+                version=context_policy.version,
+            )
+            path = tuple(
+                segment.format(team_id=team_id) for segment in context_policy.source_path_template
+            )
+            expected[key] = (context_feature.source_ref, path)
+    else:
+        context_policy = _calibration_policy(MATCH_CONTEXT_CALIBRATION_VERSION)
+        context_key = context_policy.contribution_key_template.format(
+            version=context_policy.version
+        )
+        expected[context_key] = (
             context_feature.source_ref,
             context_policy.source_path_template,
         )
-    }
 
     lineup_features = [feature for feature in snapshot.features if feature.name == "lineup_delta"]
     if len(lineup_features) > 1:
