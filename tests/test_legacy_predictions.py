@@ -108,7 +108,11 @@ def test_legacy_inline_v3_is_permanently_provenance_incomplete(tmp_path: Path) -
 
 
 def test_real_repository_v3_remains_loadable() -> None:
-    layout = DataLayout(Path(__file__).parents[1] / "data")
+    data_root = Path(__file__).parents[1] / "data"
+    layout = DataLayout(data_root)
+    prediction_path = _content_path(layout.derived, "predictions", REAL_V3_REFERENCE)
+    if not data_root.is_dir() or not prediction_path.is_file():
+        pytest.skip("repository-local legacy v3 audit fixture is unavailable")
 
     prediction = load_legacy_prediction_v3_for_audit(layout, REAL_V3_REFERENCE)
 
