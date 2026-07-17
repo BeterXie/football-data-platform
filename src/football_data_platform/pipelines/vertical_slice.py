@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import MatchId, ModelRunId, PlayerId, RawAssetId
+from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId
 from football_data_platform.domain.lifecycle import (
     SnapshotAvailability,
     assess_lifecycle,
@@ -52,6 +52,10 @@ from football_data_platform.features.team_baseline import (
     team_baseline_payload,
 )
 from football_data_platform.pipelines.match_report import ingest_fbref_match_report
+from football_data_platform.pipelines.official_lineup import (
+    ingest_official_lineup_json,
+    replay_official_lineup_contract,
+)
 from football_data_platform.pipelines.schedule import (
     assess_season_coverage,
     ingest_fbref_schedule,
@@ -62,7 +66,6 @@ from football_data_platform.reporting.vertical_slice import (
 )
 from football_data_platform.sources.fbref import schedule_url
 from football_data_platform.sources.prematch import (
-    OfficialLineupDTO,
     SourceDescriptor,
     SourceKind,
     SourceRegistry,
@@ -166,6 +169,9 @@ def _run_offline_vertical_slice(
         archive=archive,
         canonical=canonical,
     )
+    schedule_known_at = schedule_ingest.parsed.fixture_known_at
+    if schedule_known_at is None:
+        raise ValueError("golden schedule fixture requires explicit known-at metadata")
     if len(schedule_ingest.parsed.matches) < 2:
         raise ValueError("golden vertical slice requires at least two parsed matches")
     first_fixture, second_fixture = schedule_ingest.parsed.matches[:2]
@@ -212,84 +218,61 @@ def _run_offline_vertical_slice(
         raw_asset_id=RawAssetId(schedule_ingest.raw_asset_id),
     )
 
-    lineup_payload = json.loads(lineups_file.read_text(encoding="utf-8"))
-    if lineup_payload.get("schema_version") != 1:
-        raise ValueError("unsupported lineup fixture schema")
-    lineup_known_at = _parse_timestamp(lineup_payload["published_at"])
-    schedule_known_at = _parse_timestamp(lineup_payload["schedule_published_at"])
-    lineup_source = str(lineup_payload["source"])
+    lineup_content = lineups_file.read_bytes()
+    lineup_source = "golden-official-lineup-fixture"
     lineup_url = "fixture://official-lineups"
-    lineup_asset = archive.archive(
-        lineups_file.read_bytes(),
+    lineup_sources = SourceRegistry(
+        (
+            SourceDescriptor(
+                lineup_source,
+                SourceKind.OFFICIAL_LINEUP,
+                lineup_source,
+                official=True,
+            ),
+        )
+    )
+    lineup_ingest = ingest_official_lineup_json(
+        lineup_content,
         source=lineup_source,
-        source_id=second_fixture.source_fixture_id,
-        url=lineup_url,
+        source_match_id=second_fixture.source_fixture_id,
+        page_url=lineup_url,
         observed_at=observed_at,
-        target_event_time=lineup_known_at,
-        collector_version="manual-lineup-import/1",
-        media_type="application/json",
+        archive=archive,
+        canonical=canonical,
+        source_registry=lineup_sources,
     )
-    canonical.register_raw_asset(lineup_asset)
-    official_lineup_facts = CanonicalFactStore(
-        canonical,
-        source_registry=SourceRegistry(
-            (
-                SourceDescriptor(
-                    lineup_source,
-                    SourceKind.OFFICIAL_LINEUP,
-                    lineup_source,
-                    official=True,
-                ),
-            )
-        ),
+    lineup_contract = replay_official_lineup_contract(
+        lineup_ingest.contract_id,
+        archive=archive,
+        canonical=canonical,
     )
+    if lineup_contract.match_id != second_match_id or lineup_contract.match_version != 1:
+        raise ValueError("official lineup replay does not match the golden target fixture")
+    lineup_known_at = lineup_contract.published_at
+    lineup_asset_id = lineup_contract.raw_asset_id
     lineup_features: list[SnapshotFeature] = []
     lineup_player_ids_by_team: dict[str, tuple[str, ...]] = {}
-    for team_payload in lineup_payload["teams"]:
-        team = canonical.mapped_team(source="fbref", source_id=str(team_payload["source_team_id"]))
-        player_ids: list[str] = []
-        for player_payload in team_payload["starters"]:
-            player = canonical.resolve_or_create_player(
-                source=str(lineup_payload["source"]),
-                source_id=str(player_payload["source_player_id"]),
-                canonical_name=str(player_payload["name"]),
-                observed_at=observed_at,
-                raw_asset_id=lineup_asset.id,
-            )
-            player_ids.append(player.id.value)
-        if len(player_ids) != 11:
-            raise ValueError(f"official lineup for {team.id} must contain 11 starters")
-        official_lineup_facts.append_official_lineup(
-            OfficialLineupDTO(
-                match_id=second_match_id,
-                match_version=1,
-                team_id=team.id,
-                player_ids=tuple(PlayerId(player_id) for player_id in player_ids),
-                source=lineup_source,
-                published_at=lineup_known_at,
-                observed_at=observed_at,
-                raw_asset_id=lineup_asset.id,
-                url=lineup_url,
-            )
-        )
-        lineup_player_ids_by_team[team.id.value] = tuple(player_ids)
+    for team_id, contract_player_ids in lineup_contract.team_lineups:
+        player_ids = tuple(player_id.value for player_id in contract_player_ids)
+        lineup_player_ids_by_team[team_id.value] = player_ids
         lineup_source_ref = derived.write_official_lineup_source(
+            contract_id=lineup_contract.contract_id,
             match_id=second_match_id,
             match_version=1,
-            team_id=team.id,
-            player_ids=tuple(PlayerId(player_id) for player_id in player_ids),
+            team_id=team_id,
+            player_ids=contract_player_ids,
             known_at=lineup_known_at,
             observed_at=observed_at,
-            raw_asset_id=lineup_asset.id,
+            raw_asset_id=lineup_asset_id,
         )
         lineup_features.append(
             SnapshotFeature(
                 name="official_lineup_confirmed",
-                value=player_ids,
+                value=list(player_ids),
                 known_at=lineup_known_at,
                 source_ref=lineup_source_ref,
-                contribution_key=f"official-lineup:{team.id.value}",
-                entity_id=team.id.value,
+                contribution_key=f"official-lineup:{team_id.value}",
+                entity_id=team_id.value,
             )
         )
 
@@ -406,13 +389,13 @@ def _run_offline_vertical_slice(
             starter_ids=player_ids,
             reference_starter_ids=None,
             profiles=(),
-            lineup_input_refs=(lineup_asset.id.value,),
+            lineup_input_refs=(lineup_asset_id.value,),
         )
         for team_id, player_ids in lineup_player_ids_by_team.items()
     }
     lineup_delta_source_ref = derived.write_snapshot_source(
         value=lineup_delta_value,
-        input_refs=(lineup_asset.id,),
+        input_refs=(lineup_asset_id,),
         transform_version=LINEUP_DELTA_INPUT_TRANSFORM_V3,
         generated_at=observed_at,
         known_at=lineup_known_at,
@@ -478,13 +461,13 @@ def _run_offline_vertical_slice(
         sample_id=f"sample:{first_match_id.value}:score-model",
         as_of=train_as_of,
         feature_known_at=first_report_known_at - timedelta(hours=2),
-        label_known_at=first_report_known_at + timedelta(hours=1),
+        label_known_at=first_report_known_at,
         capture_mode=CaptureMode.RECONSTRUCTED,
         qualification="score-model-ready",
         qualification_passed=True,
         feature_version="score-features/vertical-slice-1",
         label_version="result-90/1",
-        feature_refs=tuple(sorted((baseline.artifact_id, report_ingest.raw_asset_id))),
+        feature_refs=(report_ingest.raw_asset_id,),
         label_ref=first_result_fact.record_id,
         features={
             "lambda_home": lambda_home,
@@ -500,7 +483,7 @@ def _run_offline_vertical_slice(
     holdout_sample = TrainingSample(
         sample_id=f"sample:{second_match_id.value}:score-model",
         as_of=holdout_as_of,
-        feature_known_at=holdout_as_of - timedelta(hours=1),
+        feature_known_at=holdout_as_of,
         label_known_at=second_result_known_at,
         capture_mode=CaptureMode.RECONSTRUCTED,
         qualification="score-model-ready",
@@ -573,8 +556,8 @@ def _run_offline_vertical_slice(
         parameters={"rho": -0.1, "max_goals": 11},
         code_version=DERIVED_CODE_VERSION,
         environment_version="python-runtime:locked",
-        started_at=observed_at - timedelta(seconds=2),
-        ended_at=observed_at - timedelta(seconds=1),
+        started_at=observed_at,
+        ended_at=observed_at,
         random_seed=0,
         model_artifact_refs=(model_ref,),
         evaluation_cohort=(holdout_sample.sample_id,),
@@ -665,7 +648,7 @@ def _run_offline_vertical_slice(
         input_refs=(
             schedule_ingest.raw_asset_id,
             report_ingest.raw_asset_id,
-            lineup_asset.id.value,
+            lineup_asset_id.value,
             training_dataset.dataset_id,
             model_ref,
             output_ref,

@@ -32,6 +32,7 @@ _KNOWN_MODEL_STATUSES = frozenset({"succeeded", "partial", "failed"})
 _KNOWN_SPLITS = frozenset({"train", "validation", "test", "holdout"})
 _OUT_OF_TIME_SPLITS = frozenset({"validation", "test", "holdout"})
 _TEMPORAL_SPLIT_MARKERS = ("forward", "rolling", "temporal")
+_RESULT_90_LABEL_FIELDS = frozenset({"home_goals", "away_goals"})
 
 
 class TrainingArtifactConflict(ValueError):
@@ -48,6 +49,19 @@ class ModelRunStatus(StrEnum):
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
     FAILED = "failed"
+
+
+def validate_training_label(label_version: str, label: Any) -> None:
+    """Validate the known schema for one versioned training label."""
+
+    _require_text(label_version, "label_version")
+    _ensure_json(label, "label")
+    if label_version != "result-90/1":
+        return
+    if not isinstance(label, dict) or set(label) != _RESULT_90_LABEL_FIELDS:
+        raise ValueError("result-90/1 label must contain exactly home_goals and away_goals")
+    if any(type(label[field]) is not int or label[field] < 0 for field in _RESULT_90_LABEL_FIELDS):
+        raise ValueError("result-90/1 label goals must be non-negative integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +138,7 @@ class TrainingSample:
         elif self.capture_evidence_ref is not None or self.capture_observed_at is not None:
             raise ValueError("reconstructed samples cannot carry captured evidence metadata")
         _ensure_json(self.features, "features")
-        _ensure_json(self.label, "label")
+        validate_training_label(self.label_version, self.label)
 
     @property
     def eligible(self) -> bool:
@@ -479,6 +493,8 @@ def verify_model_run_artifact(
         verify_training_dataset(dataset)
         if artifact.dataset_id != dataset.dataset_id:
             raise ValueError("model run references a different training dataset")
+        if dataset.generated_at > artifact.started_at:
+            raise ValueError("model run cannot start before its training dataset is generated")
         by_id = {sample.sample_id: sample for sample in dataset.samples}
         missing = sorted(set(artifact.evaluation_cohort) - set(by_id))
         if missing:
@@ -653,6 +669,13 @@ def _dataset_fields(**kwargs: Any) -> dict[str, Any]:
             raise ValueError("sample label_version does not match dataset")
         if sample.as_of > kwargs["as_of"]:
             raise ValueError("sample as_of cannot follow dataset as_of")
+        for field_name, known_at in (
+            ("feature_known_at", sample.feature_known_at),
+            ("label_known_at", sample.label_known_at),
+            ("capture_observed_at", sample.capture_observed_at),
+        ):
+            if known_at is not None and known_at > kwargs["generated_at"]:
+                raise ValueError(f"dataset generated_at cannot precede sample {field_name}")
     return {
         "dataset_version": kwargs["dataset_version"],
         "task": kwargs["task"],

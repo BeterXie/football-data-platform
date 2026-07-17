@@ -595,7 +595,7 @@ def test_official_lineup_dto_rejects_future_publication() -> None:
         )
 
 
-def test_official_lineup_adapter_is_the_verified_official_write_path(tmp_path: Path) -> None:
+def test_official_lineup_dto_cannot_bypass_verified_raw_replay_path(tmp_path: Path) -> None:
     canonical, facts, assets, teams, match = _context(tmp_path)
     players = tuple(
         canonical.resolve_or_create_player(
@@ -618,18 +618,15 @@ def test_official_lineup_adapter_is_the_verified_official_write_path(tmp_path: P
         url="https://club-official.example/official",
     )
 
-    stored = facts.append_official_lineup(lineup)
+    with pytest.raises(ValueError, match="raw replay contract"):
+        facts.append_official_lineup(lineup)
 
-    assert len(stored) == 11
     with canonical.connect() as connection:
-        rows = connection.execute(
-            "SELECT official, raw_asset_id FROM lineup_facts WHERE match_id = ? AND team_id = ?",
+        count = connection.execute(
+            "SELECT COUNT(*) FROM lineup_facts WHERE match_id = ? AND team_id = ?",
             (match.id.value, teams[0].id.value),
-        ).fetchall()
-    assert len(rows) == 11
-    assert {(row["official"], row["raw_asset_id"]) for row in rows} == {
-        (1, assets["official"].id.value)
-    }
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_official_lineup_validation_failure_leaves_no_partial_xi(tmp_path: Path) -> None:
@@ -652,7 +649,7 @@ def test_official_lineup_validation_failure_leaves_no_partial_xi(tmp_path: Path)
         url="https://club-official.example/official",
     )
 
-    with pytest.raises(KeyError, match="not registered"):
+    with pytest.raises(ValueError, match="raw replay contract"):
         facts.append_official_lineup(lineup)
     with canonical.connect() as connection:
         stored = connection.execute(

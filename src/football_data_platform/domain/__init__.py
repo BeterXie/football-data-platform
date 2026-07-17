@@ -1,5 +1,6 @@
 """Stable domain identifiers and immutable platform contracts."""
 
+from football_data_platform.domain.contributions import ContributionCalibration
 from football_data_platform.domain.ids import (
     CompetitionId,
     MatchId,
@@ -64,6 +65,7 @@ from football_data_platform.domain.training import (
 
 __all__ = [
     "CompetitionId",
+    "ContributionCalibration",
     "BetDecision",
     "CandidateDecision",
     "MatchResultValidator",

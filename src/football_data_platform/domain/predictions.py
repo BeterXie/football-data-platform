@@ -10,6 +10,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
 
+from football_data_platform.domain.contributions import (
+    EXPECTED_GOALS_COMPOSITION_VERSION,
+    ContributionCalibration,
+    calibrated_multipliers,
+    contribution_calibration_payload,
+    parse_contribution_calibration,
+    validate_contribution_calibration_policy,
+    validate_snapshot_contribution_policy,
+)
 from football_data_platform.domain.ids import (
     MarketSnapshotId,
     MatchId,
@@ -32,8 +41,8 @@ from football_data_platform.domain.training import (
 )
 from football_data_platform.models.score_grid import DixonColesGrid
 
-PREDICTION_SCHEMA_VERSION = 3
-SCORE_GRID_COMPOSITION_SCHEMA_VERSION = 1
+PREDICTION_SCHEMA_VERSION = 4
+SCORE_GRID_COMPOSITION_SCHEMA_VERSION = 2
 SCORE_GRID_COMPOSITION_ARTIFACT_TYPE = "score-grid-composition"
 SCORE_GRID_COMPOSITION_CODE_VERSION = "football-data-platform/0.1.0"
 LEGACY_COMPOSITION_VERSION = "legacy-inline/1"
@@ -78,6 +87,7 @@ class PredictionContribution:
     lambda_away_multiplier: float
     source_ref: str
     version: str
+    calibration: ContributionCalibration
 
     def __post_init__(self) -> None:
         _require_text(self.contribution_key, "contribution_key")
@@ -89,6 +99,14 @@ class PredictionContribution:
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        validate_contribution_calibration_policy(self)
+        expected_home, expected_away = calibrated_multipliers(self.calibration)
+        if not math.isclose(
+            self.lambda_home_multiplier, expected_home, rel_tol=1e-12, abs_tol=1e-12
+        ) or not math.isclose(
+            self.lambda_away_multiplier, expected_away, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError("prediction multipliers do not match calibration parameters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +133,7 @@ class ScorePrediction:
     baseline_lambda_away: float | None = None
     contribution_keys: tuple[str, ...] = ()
     contribution_multipliers: tuple[PredictionContribution, ...] = ()
-    composition_version: str = LEGACY_COMPOSITION_VERSION
+    composition_version: str = EXPECTED_GOALS_COMPOSITION_VERSION
     calibration_versions: tuple[str, ...] = ()
     composition_artifact_ref: str | None = None
 
@@ -306,11 +324,10 @@ def build_score_prediction(
 ) -> ScorePrediction:
     """Build the one score distribution consumed by every football market view.
 
-    ``expected_goals`` (or its ``composition`` alias) is the preferred input
-    because it carries the baseline and auditable feature contributions.  A
-    legacy low-level caller may omit it; that path is explicitly represented
-    as ``legacy-inline/1`` and still receives a content-addressed composition
-    reference so persistence cannot silently lose provenance.
+    ``expected_goals`` (or its ``composition`` alias) is mandatory because a
+    formal prediction must retain the baseline and every auditable feature
+    contribution.  Historical ``legacy-inline/1`` payloads remain historical
+    bytes; they cannot be used to create a new formal prediction.
     """
 
     verify_snapshot(snapshot, source_validator=snapshot_validator)
@@ -337,7 +354,12 @@ def build_score_prediction(
         lambda_away=lambda_away,
         calibration_versions=calibration_versions,
     )
-    _verify_prediction_contribution_sources(snapshot, contribution_multipliers)
+    _verify_prediction_composition_sources(
+        snapshot,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contributions=contribution_multipliers,
+    )
     normalized_input_refs = tuple(
         sorted({*input_refs, snapshot.id.value, model_run_id.value, *composition_input_refs})
     )
@@ -528,7 +550,12 @@ def verify_prediction_snapshot(
         raise ValueError("prediction capture_mode does not match the validated snapshot")
     if prediction.snapshot_quality_status != snapshot.quality_status:
         raise ValueError("prediction quality does not match the validated snapshot")
-    _verify_prediction_contribution_sources(snapshot, prediction.contribution_multipliers)
+    _verify_prediction_composition_sources(
+        snapshot,
+        baseline_lambda_home=prediction.baseline_lambda_home,
+        baseline_lambda_away=prediction.baseline_lambda_away,
+        contributions=prediction.contribution_multipliers,
+    )
 
 
 def prediction_payload(prediction: ScorePrediction) -> dict[str, Any]:
@@ -590,6 +617,7 @@ def parse_prediction_payload(
                 lambda_away_multiplier=float(item["lambda_away_multiplier"]),
                 source_ref=str(item["source_ref"]),
                 version=str(item["version"]),
+                calibration=parse_contribution_calibration(item["calibration"]),
             )
             for item in contribution_payloads
         )
@@ -604,6 +632,7 @@ def parse_prediction_payload(
             baseline_lambda_away=float(payload["baseline_lambda_away"]),
             composition_version=str(payload["composition_version"]),
             contributions=contributions,
+            calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
         )
         prediction = build_score_prediction(
             snapshot=snapshot,
@@ -630,15 +659,31 @@ def parse_prediction_payload(
     return prediction
 
 
-def _verify_prediction_contribution_sources(
+def _verify_prediction_composition_sources(
     snapshot: PreMatchSnapshot,
+    *,
+    baseline_lambda_home: float,
+    baseline_lambda_away: float,
     contributions: tuple[PredictionContribution, ...],
 ) -> None:
-    feature_source_refs = frozenset(feature.source_ref for feature in snapshot.features)
-    if any(item.source_ref not in feature_source_refs for item in contributions):
-        raise ValueError(
-            "expected-goals contribution source refs must cite verified snapshot feature sources"
-        )
+    baseline_features = [
+        feature for feature in snapshot.features if feature.name == "team_baseline"
+    ]
+    if len(baseline_features) != 1 or not isinstance(baseline_features[0].value, dict):
+        raise ValueError("formal composition requires one team_baseline snapshot feature")
+    baseline_value = baseline_features[0].value
+    for name, actual, expected in (
+        ("home", baseline_lambda_home, baseline_value.get("lambda_home")),
+        ("away", baseline_lambda_away, baseline_value.get("lambda_away")),
+    ):
+        if (
+            not isinstance(expected, (int, float))
+            or isinstance(expected, bool)
+            or not math.isclose(actual, float(expected), rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            raise ValueError(f"expected-goals {name} baseline does not match the snapshot")
+
+    validate_snapshot_contribution_policy(snapshot, contributions)
 
 
 def _prediction_composition_metadata(
@@ -657,21 +702,9 @@ def _prediction_composition_metadata(
     tuple[str, ...],
 ]:
     if expected_goals is None:
-        if (
-            not math.isfinite(lambda_home)
-            or not math.isfinite(lambda_away)
-            or lambda_home <= 0
-            or lambda_away <= 0
-        ):
-            raise ValueError("prediction lambdas must be finite and positive")
-        return (
-            float(lambda_home),
-            float(lambda_away),
-            (),
-            (),
-            LEGACY_COMPOSITION_VERSION,
-            tuple(sorted(set(calibration_versions or ()))),
-            (),
+        raise ValueError(
+            "formal score predictions require expected_goals composition; "
+            "legacy-inline/1 is read-only"
         )
 
     try:
@@ -691,6 +724,8 @@ def _prediction_composition_metadata(
     ):
         raise ValueError("expected-goals baseline lambdas must be finite and positive")
     _require_text(composition_version, "composition_version")
+    if composition_version != EXPECTED_GOALS_COMPOSITION_VERSION:
+        raise ValueError("formal score predictions require expected-goals-composition/2")
     contributions = tuple(_prediction_contribution(item) for item in raw_contributions)
     keys = tuple(item.contribution_key for item in contributions)
     if raw_keys != keys:
@@ -707,12 +742,17 @@ def _prediction_composition_metadata(
         raise ValueError("expected-goals home lambda does not match prediction")
     if not math.isclose(composed_away, lambda_away, rel_tol=1e-12, abs_tol=1e-12):
         raise ValueError("expected-goals away lambda does not match prediction")
-    explicit_calibrations = (
-        calibration_versions
-        if calibration_versions is not None
-        else tuple(getattr(expected_goals, "calibration_versions", ()))
+    contribution_versions = tuple(sorted({item.version for item in contributions}))
+    embedded_calibrations = tuple(
+        sorted(set(tuple(getattr(expected_goals, "calibration_versions", ()))))
     )
-    resolved_calibration_versions = tuple(sorted(set(explicit_calibrations)))
+    if embedded_calibrations != contribution_versions:
+        raise ValueError("expected-goals calibration versions do not match contributions")
+    if calibration_versions is not None and tuple(sorted(set(calibration_versions))) != (
+        contribution_versions
+    ):
+        raise ValueError("calibration_versions do not match contribution calibration versions")
+    resolved_calibration_versions = contribution_versions
     return (
         baseline_home,
         baseline_away,
@@ -732,6 +772,7 @@ def _prediction_contribution(value: Any) -> PredictionContribution:
             lambda_away_multiplier=float(value.lambda_away_multiplier),
             source_ref=str(value.source_ref),
             version=str(value.version),
+            calibration=value.calibration,
         )
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError("invalid expected-goals contribution") from error
@@ -745,6 +786,8 @@ def _verify_prediction_composition_metadata(prediction: ScorePrediction) -> None
         if value is None or not math.isfinite(value) or value <= 0:
             raise ValueError(f"prediction {name} must be finite and positive")
     _require_text(prediction.composition_version, "composition_version")
+    if prediction.composition_version != EXPECTED_GOALS_COMPOSITION_VERSION:
+        raise ValueError("formal prediction has an unsupported composition version")
     if prediction.contribution_keys != tuple(sorted(set(prediction.contribution_keys))):
         raise ValueError("prediction contribution keys must be unique and sorted")
     if any(not isinstance(item, str) or not item for item in prediction.contribution_keys):
@@ -760,7 +803,21 @@ def _verify_prediction_composition_metadata(prediction: ScorePrediction) -> None
         raise ValueError("prediction calibration_versions must be unique and sorted")
     if any(not isinstance(item, str) or not item for item in prediction.calibration_versions):
         raise ValueError("prediction calibration_versions must be non-empty text")
+    expected_calibration_versions = tuple(
+        sorted({item.version for item in prediction.contribution_multipliers})
+    )
+    if prediction.calibration_versions != expected_calibration_versions:
+        raise ValueError("prediction calibration versions do not match contribution details")
     for item in prediction.contribution_multipliers:
+        validate_contribution_calibration_policy(item)
+        PredictionContribution(
+            contribution_key=item.contribution_key,
+            lambda_home_multiplier=item.lambda_home_multiplier,
+            lambda_away_multiplier=item.lambda_away_multiplier,
+            source_ref=item.source_ref,
+            version=item.version,
+            calibration=item.calibration,
+        )
         if item.source_ref not in prediction.input_refs:
             raise ValueError("prediction contribution source is missing from input_refs")
     calculated_home = prediction.baseline_lambda_home * math.prod(
@@ -885,6 +942,7 @@ def _prediction_contribution_payload(item: PredictionContribution) -> dict[str, 
         "lambda_away_multiplier": item.lambda_away_multiplier,
         "source_ref": item.source_ref,
         "version": item.version,
+        "calibration": contribution_calibration_payload(item.calibration),
     }
 
 

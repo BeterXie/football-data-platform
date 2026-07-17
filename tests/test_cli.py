@@ -520,11 +520,27 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
     capsys,
 ) -> None:
     data_root = tmp_path / "data"
-    feature_ref, label_ref = seed_training_references(DataLayout(data_root))
     train_as_of = datetime(2025, 8, 1, 12, tzinfo=UTC)
     holdout_as_of = train_as_of + timedelta(days=7)
+    feature_ref, training_label_ref = seed_training_references(
+        DataLayout(data_root),
+        label_known_at=train_as_of + timedelta(hours=3),
+        observed_at=train_as_of + timedelta(hours=3),
+        reference_key="cli-training",
+    )
+    _, holdout_label_ref = seed_training_references(
+        DataLayout(data_root),
+        label_known_at=holdout_as_of + timedelta(hours=3),
+        observed_at=holdout_as_of + timedelta(hours=3),
+        reference_key="cli-holdout",
+    )
 
-    def sample(sample_id: str, as_of: datetime, split: str) -> TrainingSample:
+    def sample(
+        sample_id: str,
+        as_of: datetime,
+        split: str,
+        label_ref: str,
+    ) -> TrainingSample:
         return TrainingSample(
             sample_id=sample_id,
             as_of=as_of,
@@ -542,8 +558,8 @@ def test_cli_registers_temporal_training_and_content_addressed_model_run(
             split=split,
         )
 
-    training = sample("sample:train", train_as_of, "train")
-    holdout = sample("sample:holdout", holdout_as_of, "holdout")
+    training = sample("sample:train", train_as_of, "train", training_label_ref)
+    holdout = sample("sample:holdout", holdout_as_of, "holdout", holdout_label_ref)
     dataset = TrainingDatasetManifest.create(
         dataset_version="score-dataset/cli-1",
         task="score-model",
@@ -657,8 +673,15 @@ def test_cli_resume_lineage_survives_operation_failure_and_rejects_wrong_command
 
 def test_cli_training_gate_returns_nonzero_for_failed_dataset(tmp_path: Path, capsys) -> None:
     data_root = tmp_path / "data"
-    feature_ref, label_ref = seed_training_references(DataLayout(data_root))
     as_of = datetime(2025, 8, 1, 12, tzinfo=UTC)
+    feature_ref, label_ref = seed_training_references(
+        DataLayout(data_root),
+        label_known_at=as_of + timedelta(hours=2),
+        observed_at=as_of + timedelta(hours=2),
+        home_goals=0,
+        away_goals=0,
+        reference_key="cli-excluded",
+    )
     excluded = TrainingSample(
         sample_id="sample:excluded",
         as_of=as_of,
@@ -686,7 +709,7 @@ def test_cli_training_gate_returns_nonzero_for_failed_dataset(tmp_path: Path, ca
         as_of=as_of,
         split_strategy="forward-chaining/1",
         samples=(excluded,),
-        generated_at=as_of + timedelta(hours=1),
+        generated_at=as_of + timedelta(hours=2),
         code_version="git:test",
     )
     manifest = tmp_path / "failed-dataset.json"
@@ -739,21 +762,10 @@ def test_cli_registers_governance_and_persists_blocked_decision(
     tmp_path: Path,
     capsys,
 ) -> None:
-    from dataclasses import replace
+    from test_governance_artifacts import _artifacts, _policy
 
-    from test_governance_artifacts import _artifacts, _evidence, _policy
-
-    layout, dataset, _sample, challenger, champion, evaluation_ref = _artifacts(tmp_path)
+    layout, _, _, _, champion, _, evidence, _ = _artifacts(tmp_path)
     policy = _policy(champion.model_run_id)
-    evidence = replace(
-        _evidence(
-            dataset.dataset_id,
-            challenger.model_run_id,
-            champion.model_run_id,
-            evaluation_ref,
-        ),
-        subgroup_diagnostics_passed=False,
-    )
     policy_file = tmp_path / "policy.json"
     evidence_file = tmp_path / "evidence.json"
     _write_payload(policy_file, policy.to_payload())
@@ -791,3 +803,34 @@ def test_cli_registers_governance_and_persists_blocked_decision(
     assert decision_result["decision_id"] in decision_manifest.output_refs
     latest = json.loads(Path(decision_result["latest"]).read_text(encoding="utf-8"))
     assert latest["run_id"] == decision_result["run_id"]
+
+
+def test_cli_rejects_self_reported_challenger_metrics(tmp_path: Path, capsys) -> None:
+    from dataclasses import replace
+
+    from test_governance_artifacts import _artifacts
+
+    layout, _, _, _, _, _, evidence, _ = _artifacts(tmp_path)
+    tampered = replace(
+        evidence,
+        brier_delta_vs_champion=evidence.brier_delta_vs_champion + 0.1,
+    )
+    evidence_file = tmp_path / "tampered-evidence.json"
+    _write_payload(evidence_file, tampered.to_payload())
+
+    code = main(
+        [
+            "register-challenger-evidence",
+            "--data-root",
+            str(layout.root),
+            "--registry",
+            str(ROOT / "config/competitions.toml"),
+            "--file",
+            str(evidence_file),
+        ]
+    )
+
+    assert code == 1
+    result = json.loads(capsys.readouterr().err)
+    assert result["status"] == "failed"
+    assert "recomputed evaluation records" in result["diagnostic_message"]

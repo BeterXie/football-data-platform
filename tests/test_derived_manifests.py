@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import football_data_platform.storage.derived as derived_module
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import CompetitionId, SeasonId
+from football_data_platform.domain.ids import CompetitionId, MatchId, RawAssetId, SeasonId
 from football_data_platform.domain.models import MatchStatus
+from football_data_platform.domain.snapshots import CaptureMode
+from football_data_platform.evaluation.metrics import BenchmarkScore, EvaluationRecord
 from football_data_platform.features.contributions import lineup_delta_contributions
 from football_data_platform.features.lineup import (
     LINEUP_DELTA_INPUT_TRANSFORM_V3,
@@ -21,8 +25,17 @@ from football_data_platform.features.player_profiles import (
     RoleMetricContract,
     build_player_profiles,
 )
+from football_data_platform.pipelines.match_report import (
+    PRODUCTION_REQUIRED_TABLES,
+    ingest_fbref_match_report,
+)
+from football_data_platform.pipelines.official_lineup import (
+    ingest_official_lineup_json,
+    replay_official_lineup_contract,
+)
+from football_data_platform.pipelines.schedule import ingest_fbref_schedule
+from football_data_platform.sources.fbref import schedule_url
 from football_data_platform.sources.prematch import (
-    OfficialLineupDTO,
     SourceDescriptor,
     SourceKind,
     SourceRegistry,
@@ -43,10 +56,376 @@ RAW_REF = "raw-asset:" + "a" * 64
 ROOT = Path(__file__).parents[1]
 
 
+def _archive_evidence(layout: DataLayout, content: bytes = b"manifest-evidence"):
+    return RawArchive(layout).archive(
+        content,
+        source="test-source",
+        source_id="manifest-evidence",
+        url="fixture://manifest-evidence",
+        observed_at=GENERATED_AT,
+        target_event_time=GENERATED_AT - timedelta(hours=1),
+        collector_version="test/1",
+        media_type="application/octet-stream",
+    )
+
+
+def _schedule_contract_context(tmp_path: Path):
+    registry = load_competition_registry(ROOT / "config" / "competitions.toml")
+    competition = registry.competitions[0]
+    season = competition.seasons[0]
+    layout = DataLayout(tmp_path / "data")
+    raw = RawArchive(layout)
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    canonical.initialize()
+    canonical.register_registry(registry, registered_at=GENERATED_AT)
+    schedule = ingest_fbref_schedule(
+        (ROOT / "tests/fixtures/fbref_premier_league_schedule.html").read_bytes(),
+        page_url=schedule_url(competition, season),
+        competition=competition,
+        season=season,
+        observed_at=GENERATED_AT,
+        archive=raw,
+        canonical=canonical,
+    )
+    return layout, raw, canonical, schedule
+
+
+def _contract_manifest(contract_id: str) -> DerivedArtifactManifest:
+    return DerivedArtifactManifest.create(
+        artifact_type="contract-replay-test",
+        payload={"contract_id": contract_id},
+        generated_at=GENERATED_AT,
+        transform_version="contract-replay-test/1",
+        code_version="git:test",
+        input_refs=(contract_id,),
+        output_refs=("file-sha256:" + "c" * 64,),
+        quality="ready",
+    )
+
+
+def _persisted_match_report_manifest(tmp_path: Path):
+    layout, raw, canonical, schedule = _schedule_contract_context(tmp_path)
+    fixture = schedule.parsed.matches[0]
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    assert fixture.home_goals is not None
+    assert fixture.away_goals is not None
+    CanonicalFactStore(canonical).append_result_90(
+        match_id=match_id,
+        match_version=1,
+        home_goals=fixture.home_goals,
+        away_goals=fixture.away_goals,
+        known_at=GENERATED_AT,
+        observed_at=GENERATED_AT,
+        raw_asset_id=RawAssetId(schedule.raw_asset_id),
+    )
+    missing_tables = (
+        b'<table id="stats_18bb7c10_keeper"><tbody>'
+        b'<tr><th data-stat="player">Team Total</th></tr>'
+        b"</tbody></table>"
+        b'<table id="stats_cff3d9bb_passing"><tbody>'
+        b'<tr><th data-stat="player">Team Total</th></tr>'
+        b"</tbody></table>"
+    )
+    content = (
+        (ROOT / "tests/fixtures/fbref_premier_league_match_report.html")
+        .read_bytes()
+        .replace(b"</body>", missing_tables + b"</body>")
+    )
+    result = ingest_fbref_match_report(
+        content,
+        page_url=f"https://fbref.example/en/matches/{fixture.source_match_id}/report",
+        source_match_id=fixture.source_match_id,
+        match_id=match_id,
+        match_version=1,
+        home_goals=fixture.home_goals,
+        away_goals=fixture.away_goals,
+        known_at=GENERATED_AT,
+        observed_at=GENERATED_AT,
+        archive=raw,
+        canonical=canonical,
+        required_tables=PRODUCTION_REQUIRED_TABLES,
+    )
+    archive = DerivedArchive(layout)
+    manifest = _contract_manifest(result.contract_id)
+    archive.write_artifact_manifest(manifest)
+    assert archive.load_artifact_manifest(manifest.artifact_id) == manifest
+    contract = canonical.match_report_contract(result.contract_id)
+    return layout, raw, canonical, archive, manifest, contract
+
+
+def _persisted_official_lineup_manifest(tmp_path: Path):
+    layout, raw, canonical, schedule = _schedule_contract_context(tmp_path)
+    fixture = schedule.parsed.matches[0]
+    source = "manifest-official"
+    source_registry = SourceRegistry(
+        (SourceDescriptor(source, SourceKind.OFFICIAL_LINEUP, source, official=True),)
+    )
+    content = json.dumps(
+        {
+            "schema_version": 2,
+            "source": source,
+            "source_match_id": fixture.source_match_id,
+            "match_mapping_source": "fbref-schedule",
+            "team_mapping_source": "fbref",
+            "player_mapping_source": source,
+            "published_at": (GENERATED_AT - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "teams": [
+                {
+                    "source_team_id": fixture.home_source_id,
+                    "starters": [
+                        {
+                            "source_player_id": f"manifest-official-player-{index}",
+                            "name": f"Manifest Official Player {index}",
+                        }
+                        for index in range(11)
+                    ],
+                },
+                {
+                    "source_team_id": fixture.away_source_id,
+                    "starters": [
+                        {
+                            "source_player_id": f"manifest-official-player-{index}",
+                            "name": f"Manifest Official Player {index}",
+                        }
+                        for index in range(11, 22)
+                    ],
+                },
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    result = ingest_official_lineup_json(
+        content,
+        source=source,
+        source_match_id=fixture.source_match_id,
+        page_url="fixture://manifest-official-lineup",
+        observed_at=GENERATED_AT,
+        archive=raw,
+        canonical=canonical,
+        source_registry=source_registry,
+    )
+    archive = DerivedArchive(layout)
+    manifest = _contract_manifest(result.contract_id)
+    archive.write_artifact_manifest(manifest)
+    assert archive.load_artifact_manifest(manifest.artifact_id) == manifest
+    contract = canonical.official_lineup_contract(result.contract_id)
+    return canonical, archive, manifest, contract, source
+
+
+def _persisted_result_fact_manifest(tmp_path: Path):
+    layout, raw, canonical, schedule = _schedule_contract_context(tmp_path)
+    fixture = schedule.parsed.matches[0]
+    assert fixture.home_goals is not None
+    assert fixture.away_goals is not None
+    result = CanonicalFactStore(canonical).append_result_90(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=fixture.home_goals,
+        away_goals=fixture.away_goals,
+        known_at=GENERATED_AT,
+        observed_at=GENERATED_AT,
+        raw_asset_id=RawAssetId(schedule.raw_asset_id),
+    )
+    archive = DerivedArchive(layout)
+    manifest = DerivedArtifactManifest.create(
+        artifact_type="result-fact-replay-test",
+        payload={"result_ref": result.record_id},
+        generated_at=GENERATED_AT,
+        transform_version="result-fact-replay-test/1",
+        code_version="git:test",
+        input_refs=(result.record_id,),
+        output_refs=("file-sha256:" + "d" * 64,),
+        quality="ready",
+    )
+    archive.write_artifact_manifest(manifest)
+    assert archive.load_artifact_manifest(manifest.artifact_id) == manifest
+    return layout, raw, canonical, archive, manifest, result
+
+
+def test_output_reference_lookup_deep_parses_only_matching_manifests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    evidence = _archive_evidence(layout)
+    manifests = tuple(
+        DerivedArtifactManifest.create(
+            artifact_type="lookup-test",
+            payload={"index": index, "large": list(range(500))},
+            generated_at=GENERATED_AT,
+            transform_version="lookup-test/1",
+            code_version="git:test",
+            input_refs=(evidence.id.value,),
+            output_refs=(f"team-baseline:{index:064x}",),
+            quality="ready",
+        )
+        for index in range(1, 6)
+    )
+    for manifest in manifests:
+        archive.write_artifact_manifest(manifest)
+
+    parsed_output_refs: list[tuple[str, ...]] = []
+    original = derived_module._parse_artifact_manifest
+
+    def tracked(payload):
+        parsed_output_refs.append(tuple(payload.get("output_refs", ())))
+        return original(payload)
+
+    monkeypatch.setattr(derived_module, "_parse_artifact_manifest", tracked)
+    target = manifests[-1].output_refs[0]
+
+    assert archive._load_artifact_manifest_for_output_ref(target) == manifests[-1]
+    assert parsed_output_refs == [(target,), (target,)]
+
+
+def test_output_reference_lookup_allows_only_code_version_to_differ(
+    tmp_path: Path,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    evidence = _archive_evidence(layout)
+    output_ref = "team-baseline:" + "f" * 64
+    common = {
+        "artifact_type": "duplicate-output-test",
+        "payload": {"value": 1, "parameters": {"alpha": 0.5}},
+        "generated_at": GENERATED_AT,
+        "started_at": GENERATED_AT - timedelta(seconds=1),
+        "ended_at": GENERATED_AT + timedelta(seconds=1),
+        "transform_version": "duplicate-output/1",
+        "input_refs": (evidence.id.value,),
+        "output_refs": (output_ref,),
+        "quality": "ready",
+    }
+    first = DerivedArtifactManifest.create(
+        **common,
+        code_version="git:first",
+    )
+    second = DerivedArtifactManifest.create(
+        **common,
+        code_version="git:second",
+    )
+    archive.write_artifact_manifest(first)
+    archive.write_artifact_manifest(second)
+
+    resolved = archive._load_artifact_manifest_for_output_ref(output_ref)
+    assert resolved.artifact_id == min(first.artifact_id, second.artifact_id)
+    assert resolved.payload == common["payload"]
+
+
+def test_evaluation_output_lookup_accepts_replay_with_only_code_version_changed(
+    tmp_path: Path,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    evidence = _archive_evidence(layout)
+    evaluation = EvaluationRecord(
+        schema_version=2,
+        record_type="evaluation-record",
+        prediction_id=evidence.id.value,
+        model_run_ref="model-run:" + "a" * 64,
+        sample_ref=None,
+        match_id="match:test",
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        actual_outcome="home",
+        actual_score="1:0",
+        result_probabilities=(("home", 0.5), ("draw", 0.25), ("away", 0.25)),
+        result_brier=0.375,
+        result_log_loss=-math.log(0.5),
+        score_log_loss=1.0,
+        market_benchmark=BenchmarkScore(False, None, None, "market_snapshot_missing", (), None),
+        evaluated_at=GENERATED_AT,
+        input_refs=(evidence.id.value,),
+    )
+
+    first_path = archive.write_evaluation(evaluation, code_version="git:first")
+    second_path = archive.write_evaluation(evaluation, code_version="git:replay")
+    manifest_ids = tuple(
+        sorted(
+            (
+                f"derived-artifact:{first_path.stem}",
+                f"derived-artifact:{second_path.stem}",
+            )
+        )
+    )
+    output_ref = archive.load_artifact_manifest(manifest_ids[0]).output_refs[0]
+
+    resolved = archive._load_artifact_manifest_for_output_ref(output_ref)
+
+    assert first_path != second_path
+    assert resolved.artifact_id == manifest_ids[0]
+    assert resolved.payload["prediction_id"] == evaluation.prediction_id
+
+
+@pytest.mark.parametrize(
+    "difference",
+    (
+        "payload",
+        "parameters",
+        "lineage",
+        "quality",
+        "generated_at",
+        "started_at",
+        "ended_at",
+    ),
+)
+def test_output_reference_lookup_rejects_non_code_version_differences(
+    tmp_path: Path,
+    difference: str,
+) -> None:
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    first_evidence = _archive_evidence(layout, b"first-output-evidence")
+    second_evidence = _archive_evidence(layout, b"second-output-evidence")
+    output_ref = "evaluation:" + "e" * 64
+    payload = {"score": 1, "parameters": {"alpha": 0.5}}
+    first = DerivedArtifactManifest.create(
+        artifact_type="evaluation",
+        payload=payload,
+        generated_at=GENERATED_AT,
+        transform_version="evaluation/2",
+        code_version="git:first",
+        input_refs=(first_evidence.id.value,),
+        output_refs=(output_ref,),
+        quality="ready",
+    )
+    generated_at = (
+        GENERATED_AT + timedelta(seconds=1) if difference == "generated_at" else GENERATED_AT
+    )
+    second_payload = copy.deepcopy(payload)
+    if difference == "payload":
+        second_payload["score"] = 2
+    elif difference == "parameters":
+        second_payload["parameters"]["alpha"] = 0.75
+    second = DerivedArtifactManifest.create(
+        artifact_type="evaluation",
+        payload=second_payload,
+        generated_at=generated_at,
+        started_at=(
+            generated_at - timedelta(seconds=1) if difference == "started_at" else generated_at
+        ),
+        ended_at=(
+            generated_at + timedelta(seconds=1) if difference == "ended_at" else generated_at
+        ),
+        transform_version="evaluation/2",
+        code_version="git:second",
+        input_refs=((second_evidence.id.value,) if difference == "lineage" else first.input_refs),
+        output_refs=(output_ref,),
+        quality="preview" if difference == "quality" else "ready",
+    )
+    archive.write_artifact_manifest(first)
+    archive.write_artifact_manifest(second)
+
+    with pytest.raises(ArchiveConflictError, match="conflicting manifests"):
+        archive._load_artifact_manifest_for_output_ref(output_ref)
+
+
 def test_derived_artifact_manifest_requires_lineage_and_is_content_addressed(
     tmp_path: Path,
 ) -> None:
-    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    evidence = _archive_evidence(layout)
     with pytest.raises(ValueError, match="input_refs"):
         DerivedArtifactManifest.create(
             artifact_type="team-baseline",
@@ -55,7 +434,7 @@ def test_derived_artifact_manifest_requires_lineage_and_is_content_addressed(
             transform_version="baseline/1",
             code_version="git:test",
             input_refs=(),
-            output_refs=("team-baseline:test",),
+            output_refs=("team-baseline:" + "b" * 64,),
             quality="ready",
         )
 
@@ -65,8 +444,8 @@ def test_derived_artifact_manifest_requires_lineage_and_is_content_addressed(
         generated_at=GENERATED_AT,
         transform_version="baseline/1",
         code_version="git:test",
-        input_refs=(RAW_REF,),
-        output_refs=("team-baseline:test",),
+        input_refs=(evidence.id.value,),
+        output_refs=("team-baseline:" + "b" * 64,),
         quality="ready",
     )
     path = archive.write_artifact_manifest(manifest)
@@ -76,15 +455,17 @@ def test_derived_artifact_manifest_requires_lineage_and_is_content_addressed(
 
 
 def test_derived_artifact_manifest_rejects_tampering(tmp_path: Path) -> None:
-    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    layout = DataLayout(tmp_path / "data")
+    archive = DerivedArchive(layout)
+    evidence = _archive_evidence(layout)
     manifest = DerivedArtifactManifest.create(
         artifact_type="prediction",
-        payload={"prediction_id": "prediction:test"},
+        payload={"prediction_id": "prediction:" + "c" * 64},
         generated_at=GENERATED_AT,
         transform_version="model/1",
         code_version="git:test",
-        input_refs=("snapshot:test",),
-        output_refs=("prediction:test",),
+        input_refs=(evidence.id.value,),
+        output_refs=("prediction:" + "c" * 64,),
         quality="ready",
     )
     path = archive.write_artifact_manifest(manifest)
@@ -95,6 +476,238 @@ def test_derived_artifact_manifest_rejects_tampering(tmp_path: Path) -> None:
         archive.load_artifact_manifest(manifest.artifact_id)
 
 
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "fake:anything",
+        "raw-asset:not-a-digest",
+        "raw-asset:" + "f" * 64,
+        "market-snapshot:" + "e" * 64,
+    ),
+)
+def test_successful_manifest_rejects_unknown_malformed_or_unresolved_input(
+    tmp_path: Path,
+    reference: str,
+) -> None:
+    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    manifest = DerivedArtifactManifest.create(
+        artifact_type="evaluation",
+        payload={"status": "ready"},
+        generated_at=GENERATED_AT,
+        transform_version="evaluation/1",
+        code_version="git:test",
+        input_refs=(reference,),
+        output_refs=("evaluation:" + "d" * 64,),
+        quality="ready",
+    )
+
+    with pytest.raises(ArchiveConflictError, match="reference"):
+        archive.write_artifact_manifest(manifest)
+
+
+@pytest.mark.parametrize("status", ("succeeded", "partial"))
+def test_completed_run_requires_resolvable_lineage_beyond_locator_qualifiers(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+
+    qualifier_only = RunManifest.create(
+        run_type="source-probe",
+        started_at=GENERATED_AT,
+        ended_at=GENERATED_AT,
+        transform_version="probe/1",
+        code_version="git:test",
+        input_refs=("source-url:fbref-schedule",),
+        output_refs=("file-sha256:" + "a" * 64,),
+        status=status,
+        error=None,
+        quality="ready" if status == "succeeded" else "partial",
+    )
+    with pytest.raises(ArchiveConflictError, match="resolvable input lineage"):
+        archive.write_run_manifest(qualifier_only)
+
+    content_addressed = RunManifest.create(
+        run_type="source-probe",
+        started_at=GENERATED_AT,
+        ended_at=GENERATED_AT,
+        transform_version="probe/1",
+        code_version="git:test",
+        input_refs=("file-sha256:" + "b" * 64, "source-url:fbref-schedule"),
+        output_refs=("file-sha256:" + "c" * 64,),
+        status=status,
+        error=None,
+        quality="ready" if status == "succeeded" else "partial",
+    )
+    archive.write_run_manifest(content_addressed)
+    assert archive.load_run_manifest(content_addressed.run_id) == content_addressed
+
+
+@pytest.mark.parametrize("reference", ("missing-file:fixture.html", "command:run-golden"))
+def test_successful_manifest_rejects_failure_only_diagnostics(
+    tmp_path: Path,
+    reference: str,
+) -> None:
+    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    manifest = DerivedArtifactManifest.create(
+        artifact_type="diagnostic-test",
+        payload={"status": "ready"},
+        generated_at=GENERATED_AT,
+        transform_version="diagnostic/1",
+        code_version="git:test",
+        input_refs=(reference,),
+        output_refs=("file-sha256:" + "d" * 64,),
+        quality="ready",
+    )
+
+    with pytest.raises(ArchiveConflictError, match="only allowed in failed manifests"):
+        archive.write_artifact_manifest(manifest)
+
+
+def test_successful_manifest_revalidates_upstream_bytes_when_loaded(tmp_path: Path) -> None:
+    layout = DataLayout(tmp_path / "data")
+    evidence = _archive_evidence(layout, b"load-time-evidence")
+    archive = DerivedArchive(layout)
+    manifest = DerivedArtifactManifest.create(
+        artifact_type="evaluation",
+        payload={"status": "ready"},
+        generated_at=GENERATED_AT,
+        transform_version="evaluation/1",
+        code_version="git:test",
+        input_refs=(evidence.id.value,),
+        output_refs=("evaluation:" + "e" * 64,),
+        quality="ready",
+    )
+    archive.write_artifact_manifest(manifest)
+    layout.raw_object_path(evidence.checksum).write_bytes(b"tampered")
+
+    with pytest.raises(ArchiveConflictError, match="unavailable or invalid"):
+        archive.load_artifact_manifest(manifest.artifact_id)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("parser_version", "raw_bytes", "fixture_identity", "canonical_result"),
+)
+def test_successful_manifest_replays_match_report_contract_on_load(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    layout, raw, canonical, archive, manifest, contract = _persisted_match_report_manifest(tmp_path)
+
+    if tamper == "parser_version":
+        with canonical.connect() as connection:
+            connection.execute(
+                "UPDATE match_report_contracts SET parser_version = ? WHERE contract_id = ?",
+                ("forged-parser/1", contract.contract_id),
+            )
+    elif tamper == "raw_bytes":
+        asset = raw.load(contract.raw_asset_id)
+        layout.raw_object_path(asset.checksum).write_bytes(b"tampered report bytes")
+    elif tamper == "fixture_identity":
+        with canonical.connect() as connection:
+            connection.execute(
+                "UPDATE match_versions SET kickoff_at = ? WHERE match_id = ? AND version = ?",
+                ("2025-08-16T19:00:00Z", contract.match_id.value, contract.match_version),
+            )
+    else:
+        with canonical.connect() as connection:
+            connection.execute(
+                "UPDATE match_results_90 SET home_goals = 9 "
+                "WHERE match_id = ? AND match_version = ?",
+                (contract.match_id.value, contract.match_version),
+            )
+
+    with pytest.raises(ArchiveConflictError, match="input reference is unavailable or invalid"):
+        archive.load_artifact_manifest(manifest.artifact_id)
+
+
+@pytest.mark.parametrize("tamper", ("current_mapping", "canonical_fact"))
+def test_successful_manifest_replays_official_lineup_contract_on_load(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    canonical, archive, manifest, contract, source = _persisted_official_lineup_manifest(tmp_path)
+
+    with canonical.connect() as connection:
+        if tamper == "current_mapping":
+            connection.execute(
+                "DELETE FROM source_mappings WHERE source = ? AND entity_type = 'player' "
+                "AND source_id = ? AND valid_to IS NULL",
+                (source, "manifest-official-player-0"),
+            )
+        else:
+            connection.execute(
+                "DELETE FROM lineup_facts WHERE record_id = ?",
+                (contract.fact_ids[0],),
+            )
+
+    with pytest.raises(ArchiveConflictError, match="input reference is unavailable or invalid"):
+        archive.load_artifact_manifest(manifest.artifact_id)
+
+
+@pytest.mark.parametrize("tamper", ("goals", "evidence", "raw_bytes"))
+def test_successful_manifest_replays_result_fact_lineage_on_load(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    layout, raw, canonical, archive, manifest, result = _persisted_result_fact_manifest(tmp_path)
+
+    if tamper == "goals":
+        with canonical.connect() as connection:
+            connection.execute(
+                "UPDATE match_results_90 SET home_goals = 9 WHERE record_id = ?",
+                (result.record_id,),
+            )
+    elif tamper == "evidence":
+        replacement = raw.archive(
+            b"unrelated-result-evidence",
+            source="test-source",
+            source_id="unrelated-result-evidence",
+            url="fixture://unrelated-result-evidence",
+            observed_at=GENERATED_AT,
+            target_event_time=None,
+            collector_version="test/1",
+            media_type="text/plain",
+        )
+        canonical.register_raw_asset(replacement)
+        with canonical.connect() as connection:
+            connection.execute(
+                "UPDATE fact_evidence SET raw_asset_id = ? WHERE record_id = ?",
+                (replacement.id.value, result.record_id),
+            )
+    else:
+        with canonical.connect() as connection:
+            raw_asset_id = connection.execute(
+                "SELECT raw_asset_id FROM match_results_90 WHERE record_id = ?",
+                (result.record_id,),
+            ).fetchone()[0]
+        asset = raw.load(RawAssetId(raw_asset_id))
+        layout.raw_object_path(asset.checksum).write_bytes(b"tampered result bytes")
+
+    with pytest.raises(ArchiveConflictError, match="input reference is unavailable or invalid"):
+        archive.load_artifact_manifest(manifest.artifact_id)
+
+
+def test_successful_manifest_rejects_unknown_output_namespace(tmp_path: Path) -> None:
+    layout = DataLayout(tmp_path / "data")
+    evidence = _archive_evidence(layout)
+    archive = DerivedArchive(layout)
+    manifest = DerivedArtifactManifest.create(
+        artifact_type="evaluation",
+        payload={"status": "ready"},
+        generated_at=GENERATED_AT,
+        transform_version="evaluation/1",
+        code_version="git:test",
+        input_refs=(evidence.id.value,),
+        output_refs=("fake:anything",),
+        quality="ready",
+    )
+
+    with pytest.raises(ArchiveConflictError, match="unsupported manifest reference namespace"):
+        archive.write_artifact_manifest(manifest)
+
+
 def test_failed_run_manifest_is_persisted_and_idempotent(tmp_path: Path) -> None:
     archive = DerivedArchive(DataLayout(tmp_path / "data"))
     run = RunManifest.create(
@@ -103,7 +716,11 @@ def test_failed_run_manifest_is_persisted_and_idempotent(tmp_path: Path) -> None
         ended_at=GENERATED_AT + timedelta(seconds=2),
         transform_version="vertical-slice/1",
         code_version="git:test",
-        input_refs=(),
+        input_refs=(
+            "command:offline-golden",
+            "missing-file:blocked-response.html",
+            "source-url:fbref-schedule",
+        ),
         output_refs=(),
         status="failed",
         error="blocked_by_access_control",
@@ -115,6 +732,26 @@ def test_failed_run_manifest_is_persisted_and_idempotent(tmp_path: Path) -> None
     assert loaded.status == "failed"
     assert loaded.error == "blocked_by_access_control"
     assert loaded.ended_at == GENERATED_AT + timedelta(seconds=2)
+    assert "missing-file:blocked-response.html" in loaded.input_refs
+
+
+def test_failed_run_rejects_unknown_reference_namespace(tmp_path: Path) -> None:
+    archive = DerivedArchive(DataLayout(tmp_path / "data"))
+    run = RunManifest.create(
+        run_type="offline-golden",
+        started_at=GENERATED_AT,
+        ended_at=GENERATED_AT,
+        transform_version="vertical-slice/1",
+        code_version="git:test",
+        input_refs=("fake:anything",),
+        output_refs=(),
+        status="failed",
+        error="blocked_by_access_control",
+        quality="failed",
+    )
+
+    with pytest.raises(ArchiveConflictError, match="unsupported manifest reference namespace"):
+        archive.write_run_manifest(run)
 
 
 def test_failed_run_without_error_is_rejected(tmp_path: Path) -> None:
@@ -328,7 +965,9 @@ def test_player_profile_manifest_rejects_invalid_excluded_refs_on_load(tmp_path:
         quality="ready",
     )
     archive = DerivedArchive(layout)
-    archive.write_artifact_manifest(manifest)
+    path = archive.artifact_manifest_path(manifest.artifact_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest.to_payload(), sort_keys=True), encoding="utf-8")
 
     with pytest.raises(ArchiveConflictError, match="input reference"):
         archive.load_player_profile(profile.artifact_id)
@@ -378,44 +1017,71 @@ def test_lineup_delta_source_recomputes_persisted_player_profiles(tmp_path: Path
         observed_at=GENERATED_AT,
         raw_asset_id=asset.id,
     )
+    lineup_sources = SourceRegistry(
+        (
+            SourceDescriptor(
+                "test-source",
+                SourceKind.OFFICIAL_LINEUP,
+                "test-source",
+                official=True,
+            ),
+        )
+    )
+    lineup_content = json.dumps(
+        {
+            "schema_version": 2,
+            "source": "test-source",
+            "source_match_id": "lineup-manifest-reference",
+            "match_mapping_source": "fbref-schedule",
+            "team_mapping_source": "fbref",
+            "player_mapping_source": "test-source",
+            "published_at": profile_as_of.isoformat().replace("+00:00", "Z"),
+            "teams": [
+                {
+                    "source_team_id": "lineup-manifest-team-0",
+                    "starters": [
+                        {
+                            "source_player_id": f"lineup-player-{index}",
+                            "name": f"Lineup Player {index}",
+                        }
+                        for index in range(11, 22)
+                    ],
+                },
+                {
+                    "source_team_id": "lineup-manifest-team-1",
+                    "starters": [
+                        {
+                            "source_player_id": f"lineup-player-{index}",
+                            "name": f"Lineup Player {index}",
+                        }
+                        for index in range(11)
+                    ],
+                },
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    lineup_ingest = ingest_official_lineup_json(
+        lineup_content,
+        source="test-source",
+        source_match_id="lineup-manifest-reference",
+        page_url="fixture://lineup-and-player-profile-evidence",
+        observed_at=GENERATED_AT,
+        archive=raw,
+        canonical=canonical,
+        source_registry=lineup_sources,
+    )
+    lineup_contract = replay_official_lineup_contract(
+        lineup_ingest.contract_id,
+        archive=raw,
+        canonical=canonical,
+    )
     players = tuple(
-        canonical.resolve_or_create_player(
-            source="lineup-manifest-test",
-            source_id=f"lineup-player-{index}",
-            canonical_name=f"Lineup Player {index}",
-            observed_at=GENERATED_AT,
-            raw_asset_id=asset.id,
-        ).id
+        canonical.mapped_player(source="test-source", source_id=f"lineup-player-{index}").id
         for index in range(22)
     )
     starters = tuple(player_id.value for player_id in players[:11])
     reference = tuple(player_id.value for player_id in players[11:])
-    facts = CanonicalFactStore(
-        canonical,
-        source_registry=SourceRegistry(
-            (
-                SourceDescriptor(
-                    "test-source",
-                    SourceKind.OFFICIAL_LINEUP,
-                    "test-source",
-                    official=True,
-                ),
-            )
-        ),
-    )
-    facts.append_official_lineup(
-        OfficialLineupDTO(
-            match_id=reference_match.id,
-            match_version=reference_version.version,
-            team_id=teams[0].id,
-            player_ids=players[11:],
-            source="test-source",
-            published_at=profile_as_of,
-            observed_at=GENERATED_AT,
-            raw_asset_id=asset.id,
-            url="fixture://lineup-and-player-profile-evidence",
-        )
-    )
     contract = RoleMetricContract(
         role="generic",
         version="lineup-role-metrics/1",
@@ -448,13 +1114,14 @@ def test_lineup_delta_source_recomputes_persisted_player_profiles(tmp_path: Path
     archive = DerivedArchive(layout)
     archive.write_player_profiles(profiles, generated_at=GENERATED_AT)
     reference_source_ref = archive.write_official_lineup_source(
+        contract_id=lineup_contract.contract_id,
         match_id=reference_match.id,
         match_version=reference_version.version,
         team_id=teams[0].id,
         player_ids=players[11:],
         known_at=profile_as_of,
         observed_at=GENERATED_AT,
-        raw_asset_id=asset.id,
+        raw_asset_id=lineup_contract.raw_asset_id,
     )
     value = {
         teams[0].id.value: lineup_delta_input_payload(

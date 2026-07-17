@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from football_data_platform.domain.predictions import SCORE_GRID_COMPOSITION_SCHEMA_VERSION
 from football_data_platform.pipelines.vertical_slice import run_offline_vertical_slice
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
@@ -91,6 +92,10 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
     report_artifact = next(
         item for item in artifacts if item.artifact_type == "vertical-slice-report"
     )
+    composition_artifact = next(
+        item for item in artifacts if item.artifact_type == "score-grid-composition"
+    )
+    assert composition_artifact.schema_version == SCORE_GRID_COMPOSITION_SCHEMA_VERSION
     assert any(ref.startswith("file-sha256:") for ref in summary_artifact.output_refs)
     assert any(ref.startswith("file-sha256:") for ref in report_artifact.output_refs)
     registrations = [

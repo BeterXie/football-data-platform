@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,11 +22,21 @@ from typing import Any, Protocol
 from football_data_platform.domain.ids import ModelRunId
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.snapshots import CaptureMode
+from football_data_platform.evaluation.metrics import (
+    EvaluationRecord,
+    verify_evaluation_record,
+)
 
 GOVERNANCE_SCHEMA_VERSION = 1
 _POLICY_PREFIX = "promotion-policy:"
 _EVIDENCE_PREFIX = "challenger-evidence:"
 _DECISION_PREFIX = "promotion-decision:"
+_EVALUATION_PREFIX = "evaluation:"
+EVALUATION_COMPARISON_SCHEMA_VERSION = 2
+EVALUATION_COMPARISON_TYPE = "evaluation-comparison"
+PAIRED_BOOTSTRAP_VERSION = "paired-bootstrap/1"
+PAIRED_BOOTSTRAP_SEED = 20260716
+PAIRED_BOOTSTRAP_RESAMPLES = 10_000
 
 
 class GovernanceReferenceValidator(Protocol):
@@ -61,6 +72,133 @@ class SubgroupDiagnostic:
             "log_loss_delta": self.log_loss_delta,
             "passed": self.passed,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationPairReference:
+    sample_ref: str
+    challenger_evaluation_ref: str
+    champion_evaluation_ref: str
+
+    def __post_init__(self) -> None:
+        _require_ref(self.sample_ref, "sample_ref")
+        _require_ref(self.challenger_evaluation_ref, "challenger_evaluation_ref")
+        _require_ref(self.champion_evaluation_ref, "champion_evaluation_ref")
+        if self.challenger_evaluation_ref == self.champion_evaluation_ref:
+            raise ValueError("challenger and champion evaluations must be distinct")
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "sample_ref": self.sample_ref,
+            "challenger_evaluation_ref": self.challenger_evaluation_ref,
+            "champion_evaluation_ref": self.champion_evaluation_ref,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationSubgroup:
+    subgroup: str
+    sample_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_text(self.subgroup, "subgroup")
+        normalized = _normalize_refs(self.sample_refs, "subgroup sample_refs")
+        if not normalized:
+            raise ValueError("evaluation subgroup requires samples")
+        object.__setattr__(self, "sample_refs", normalized)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"subgroup": self.subgroup, "sample_refs": list(self.sample_refs)}
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationComparison:
+    model_run_ref: str
+    champion_model_ref: str
+    cohort_ref: str
+    pairs: tuple[EvaluationPairReference, ...]
+    subgroups: tuple[EvaluationSubgroup, ...]
+    confidence_level: float
+    bootstrap_seed: int
+    bootstrap_resamples: int
+    generated_at: datetime
+    confidence_method: str = PAIRED_BOOTSTRAP_VERSION
+
+    def __post_init__(self) -> None:
+        for name in ("model_run_ref", "champion_model_ref", "cohort_ref"):
+            _require_ref(getattr(self, name), name)
+        if self.model_run_ref == self.champion_model_ref:
+            raise ValueError("challenger and champion model runs must be distinct")
+        pairs = tuple(sorted(self.pairs, key=lambda item: item.sample_ref))
+        if not pairs or any(not isinstance(item, EvaluationPairReference) for item in pairs):
+            raise ValueError("evaluation comparison requires pair references")
+        sample_refs = tuple(item.sample_ref for item in pairs)
+        if len(sample_refs) != len(set(sample_refs)):
+            raise ValueError("evaluation comparison sample_refs must be unique")
+        object.__setattr__(self, "pairs", pairs)
+        subgroups = tuple(sorted(self.subgroups, key=lambda item: item.subgroup))
+        if (
+            len(subgroups) != 1
+            or not isinstance(subgroups[0], EvaluationSubgroup)
+            or subgroups[0].subgroup != "all"
+            or subgroups[0].sample_refs != tuple(sorted(sample_refs))
+        ):
+            raise ValueError(
+                "evaluation comparison only supports the all subgroup over the full cohort"
+            )
+        object.__setattr__(self, "subgroups", subgroups)
+        _require_text(self.confidence_method, "confidence_method")
+        if self.confidence_method != PAIRED_BOOTSTRAP_VERSION:
+            raise ValueError("unsupported evaluation confidence method")
+        _require_finite(self.confidence_level, "confidence_level")
+        if not 0 < self.confidence_level < 1:
+            raise ValueError("confidence_level must be between zero and one")
+        if self.bootstrap_seed != PAIRED_BOOTSTRAP_SEED:
+            raise ValueError("unsupported paired bootstrap seed")
+        if self.bootstrap_resamples != PAIRED_BOOTSTRAP_RESAMPLES:
+            raise ValueError("unsupported paired bootstrap resample count")
+        require_utc(self.generated_at, "generated_at")
+
+    @property
+    def content_id(self) -> str:
+        return _content_id(_EVALUATION_PREFIX, self.identity_payload())
+
+    @property
+    def sample_refs(self) -> tuple[str, ...]:
+        return tuple(item.sample_ref for item in self.pairs)
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": EVALUATION_COMPARISON_SCHEMA_VERSION,
+            "record_type": EVALUATION_COMPARISON_TYPE,
+            "model_run_ref": self.model_run_ref,
+            "champion_model_ref": self.champion_model_ref,
+            "cohort_ref": self.cohort_ref,
+            "pairs": [item.to_payload() for item in self.pairs],
+            "subgroups": [item.to_payload() for item in self.subgroups],
+            "confidence_method": self.confidence_method,
+            "confidence_level": self.confidence_level,
+            "bootstrap_seed": self.bootstrap_seed,
+            "bootstrap_resamples": self.bootstrap_resamples,
+            "generated_at": _timestamp(self.generated_at),
+        }
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"id": self.content_id, **self.identity_payload()}
+
+
+@dataclass(frozen=True, slots=True)
+class PairedEvaluation:
+    sample_ref: str
+    challenger: EvaluationRecord
+    champion: EvaluationRecord
+
+    def __post_init__(self) -> None:
+        _require_ref(self.sample_ref, "sample_ref")
+        if not isinstance(self.challenger, EvaluationRecord) or not isinstance(
+            self.champion, EvaluationRecord
+        ):
+            raise TypeError("paired evaluations must contain EvaluationRecord values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +449,103 @@ class ChallengerEvidence:
         return {"id": self.content_id, **self.identity_payload()}
 
 
+def aggregate_challenger_evidence(
+    comparison: EvaluationComparison,
+    paired_evaluations: Sequence[PairedEvaluation],
+    *,
+    sample_as_of: Mapping[str, datetime],
+    prospective_captured: bool,
+) -> ChallengerEvidence:
+    """Derive promotion evidence solely from paired persisted evaluations."""
+
+    if not isinstance(comparison, EvaluationComparison):
+        raise TypeError("comparison must be an EvaluationComparison")
+    pairs = tuple(sorted(paired_evaluations, key=lambda item: item.sample_ref))
+    if any(not isinstance(item, PairedEvaluation) for item in pairs):
+        raise TypeError("paired_evaluations must contain PairedEvaluation values")
+    if tuple(item.sample_ref for item in pairs) != comparison.sample_refs:
+        raise ValueError("paired evaluations do not match comparison samples")
+    if set(sample_as_of) != set(comparison.sample_refs):
+        raise ValueError("sample_as_of must cover the comparison samples exactly")
+    for value in sample_as_of.values():
+        require_utc(value, "sample as_of")
+
+    capture_modes: set[CaptureMode] = set()
+    for pair in pairs:
+        verify_evaluation_record(pair.challenger)
+        verify_evaluation_record(pair.champion)
+        if (
+            pair.challenger.sample_ref != pair.sample_ref
+            or pair.champion.sample_ref != pair.sample_ref
+        ):
+            raise ValueError("paired evaluation sample_ref mismatch")
+        if pair.challenger.model_run_ref != comparison.model_run_ref:
+            raise ValueError("challenger evaluation model run mismatch")
+        if pair.champion.model_run_ref != comparison.champion_model_ref:
+            raise ValueError("champion evaluation model run mismatch")
+        if (
+            pair.challenger.match_id != pair.champion.match_id
+            or pair.challenger.actual_outcome != pair.champion.actual_outcome
+            or pair.challenger.actual_score != pair.champion.actual_score
+        ):
+            raise ValueError("paired evaluations do not share one observed result")
+        if pair.challenger.capture_mode is not pair.champion.capture_mode:
+            raise ValueError("paired evaluations use different capture modes")
+        capture_modes.add(pair.challenger.capture_mode)
+    if len(capture_modes) != 1:
+        raise ValueError("evaluation comparison mixes capture modes")
+    capture_mode = next(iter(capture_modes))
+
+    brier_deltas = tuple(
+        pair.challenger.result_brier - pair.champion.result_brier for pair in pairs
+    )
+    log_loss_deltas = tuple(
+        pair.challenger.result_log_loss - pair.champion.result_log_loss for pair in pairs
+    )
+    brier_interval = _paired_bootstrap_interval(
+        brier_deltas,
+        confidence_level=comparison.confidence_level,
+        seed=comparison.bootstrap_seed,
+        resamples=comparison.bootstrap_resamples,
+    )
+    log_loss_interval = _paired_bootstrap_interval(
+        log_loss_deltas,
+        confidence_level=comparison.confidence_level,
+        seed=comparison.bootstrap_seed,
+        resamples=comparison.bootstrap_resamples,
+    )
+    subgroup_diagnostics = tuple(
+        _aggregate_subgroup(subgroup, pairs) for subgroup in comparison.subgroups
+    )
+    earliest = min(sample_as_of.values())
+    latest = max(sample_as_of.values())
+    observation_days = (latest.date() - earliest.date()).days + 1
+    challenger_reliability = _multiclass_reliability_error(tuple(pair.challenger for pair in pairs))
+    champion_reliability = _multiclass_reliability_error(tuple(pair.champion for pair in pairs))
+    promotion_eligible_capture = capture_mode is CaptureMode.CAPTURED and prospective_captured
+    return ChallengerEvidence(
+        capture_mode=capture_mode,
+        captured_samples=len(pairs) if capture_mode is CaptureMode.CAPTURED else 0,
+        observation_days=observation_days,
+        brier_delta_vs_champion=math.fsum(brier_deltas) / len(brier_deltas),
+        log_loss_delta_vs_champion=math.fsum(log_loss_deltas) / len(log_loss_deltas),
+        confidence_interval_passed=brier_interval[1] < 0 and log_loss_interval[1] < 0,
+        reliability_passed=challenger_reliability <= champion_reliability,
+        subgroup_diagnostics_passed=all(item.passed for item in subgroup_diagnostics),
+        model_run_ref=comparison.model_run_ref,
+        champion_model_ref=comparison.champion_model_ref,
+        evaluation_ref=comparison.content_id,
+        cohort_ref=comparison.cohort_ref,
+        sample_refs=comparison.sample_refs,
+        confidence_level=comparison.confidence_level,
+        confidence_interval=brier_interval,
+        confidence_method=comparison.confidence_method,
+        subgroup_diagnostics=subgroup_diagnostics,
+        prospective=promotion_eligible_capture,
+        evaluated_at=comparison.generated_at,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PromotionDecision:
     promoted: bool
@@ -494,6 +729,71 @@ def assess_promotion(
         rollback_artifact_ref=policy.rollback_artifact_ref,
         decided_at=effective_decided_at,
     )
+
+
+def _paired_bootstrap_interval(
+    deltas: tuple[float, ...],
+    *,
+    confidence_level: float,
+    seed: int,
+    resamples: int,
+) -> tuple[float, float]:
+    if not deltas:
+        raise ValueError("paired bootstrap requires at least one delta")
+    randomizer = random.Random(seed)
+    means = sorted(
+        math.fsum(deltas[randomizer.randrange(len(deltas))] for _ in deltas) / len(deltas)
+        for _ in range(resamples)
+    )
+    tail = (1.0 - confidence_level) / 2.0
+    lower_index = min(len(means) - 1, max(0, math.floor(tail * len(means))))
+    upper_index = min(
+        len(means) - 1,
+        max(0, math.ceil((1.0 - tail) * len(means)) - 1),
+    )
+    return means[lower_index], means[upper_index]
+
+
+def _aggregate_subgroup(
+    subgroup: EvaluationSubgroup,
+    pairs: tuple[PairedEvaluation, ...],
+) -> SubgroupDiagnostic:
+    selected = tuple(pair for pair in pairs if pair.sample_ref in subgroup.sample_refs)
+    brier_delta = math.fsum(
+        pair.challenger.result_brier - pair.champion.result_brier for pair in selected
+    ) / len(selected)
+    log_loss_delta = math.fsum(
+        pair.challenger.result_log_loss - pair.champion.result_log_loss for pair in selected
+    ) / len(selected)
+    return SubgroupDiagnostic(
+        subgroup=subgroup.subgroup,
+        sample_count=len(selected),
+        brier_delta=brier_delta,
+        log_loss_delta=log_loss_delta,
+        passed=brier_delta <= 0 and log_loss_delta <= 0,
+    )
+
+
+def _multiclass_reliability_error(records: tuple[EvaluationRecord, ...]) -> float:
+    outcomes = ("home", "draw", "away")
+    bins = 10
+    total = len(records) * len(outcomes)
+    error = 0.0
+    for outcome in outcomes:
+        buckets: list[list[tuple[float, float]]] = [[] for _ in range(bins)]
+        for record in records:
+            probabilities = dict(record.result_probabilities)
+            probability = probabilities[outcome]
+            bucket = min(bins - 1, int(probability * bins))
+            observed = 1.0 if record.actual_outcome == outcome else 0.0
+            buckets[bucket].append((probability, observed))
+        for bucket in buckets:
+            if not bucket:
+                continue
+            mean_probability = math.fsum(item[0] for item in bucket) / len(bucket)
+            mean_observed = math.fsum(item[1] for item in bucket) / len(bucket)
+            error += len(bucket) / total * abs(mean_probability - mean_observed)
+    return error
 
 
 def _require_text(value: str, field_name: str) -> None:

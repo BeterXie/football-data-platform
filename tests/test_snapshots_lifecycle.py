@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ from football_data_platform.domain.ids import (
     CompetitionId,
     MatchId,
     PlayerId,
+    RawAssetId,
     SeasonId,
     SnapshotId,
     TeamId,
@@ -31,6 +33,7 @@ from football_data_platform.domain.snapshots import (
     SnapshotSourceValidation,
     SnapshotType,
     build_snapshot,
+    parse_snapshot_payload,
     verify_snapshot,
 )
 from football_data_platform.features.lineup import (
@@ -43,15 +46,17 @@ from football_data_platform.features.team_baseline import (
     expected_goals_from_baseline,
     team_baseline_payload,
 )
+from football_data_platform.pipelines.official_lineup import (
+    ingest_official_lineup_json,
+    replay_official_lineup_contract,
+)
 from football_data_platform.sources.prematch import (
-    OfficialLineupDTO,
     SourceDescriptor,
     SourceKind,
     SourceRegistry,
 )
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
-from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import (
     ArchiveConflictError,
@@ -65,22 +70,6 @@ HOME = TeamId("team:home")
 AWAY = TeamId("team:away")
 MATCH = MatchId("match:test")
 ROOT = Path(__file__).parents[1]
-
-
-def _official_lineup_fact_store(canonical: CanonicalStore) -> CanonicalFactStore:
-    return CanonicalFactStore(
-        canonical,
-        source_registry=SourceRegistry(
-            (
-                SourceDescriptor(
-                    "official-lineup-test",
-                    SourceKind.OFFICIAL_LINEUP,
-                    "official-lineup-test",
-                    official=True,
-                ),
-            )
-        ),
-    )
 
 
 class _CompositeSnapshotValidator:
@@ -116,15 +105,15 @@ def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
     layout = DataLayout(tmp_path / "strict-data")
     observed_at = KICKOFF - timedelta(hours=1)
     raw = RawArchive(layout)
-    asset = raw.archive(
-        b"official lineup evidence",
-        source="official-lineup-test",
-        source_id="official-lineup",
-        url="fixture://official-lineup",
+    schedule_asset = raw.archive(
+        b"schedule evidence",
+        source="fbref",
+        source_id="strict-schedule",
+        url="fixture://strict-schedule",
         observed_at=observed_at,
-        target_event_time=KICKOFF,
+        target_event_time=None,
         collector_version="test/1",
-        media_type="application/json",
+        media_type="text/html",
     )
     canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
     canonical.initialize()
@@ -132,7 +121,7 @@ def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
         load_competition_registry(ROOT / "config" / "competitions.toml"),
         registered_at=observed_at,
     )
-    canonical.register_raw_asset(asset)
+    canonical.register_raw_asset(schedule_asset)
     teams = tuple(
         canonical.resolve_or_create_team(
             source="fbref",
@@ -140,7 +129,7 @@ def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
             canonical_name=f"Strict Team {index}",
             competition_id=CompetitionId("competition:eng.1"),
             observed_at=observed_at,
-            raw_asset_id=asset.id,
+            raw_asset_id=schedule_asset.id,
         )
         for index in range(2)
     )
@@ -154,32 +143,60 @@ def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
         kickoff_at=KICKOFF,
         status=MatchStatus.SCHEDULED,
         observed_at=observed_at,
-        raw_asset_id=asset.id,
+        raw_asset_id=schedule_asset.id,
     )
-    players = tuple(
-        canonical.resolve_or_create_player(
-            source="official-lineup-test",
-            source_id=f"strict-player-{index}",
-            canonical_name=f"Strict Player {index}",
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-        ).id
-        for index in range(11)
-    )
-    facts = _official_lineup_fact_store(canonical)
-    facts.append_official_lineup(
-        OfficialLineupDTO(
-            match_id=match.id,
-            match_version=version.version,
-            team_id=teams[0].id,
-            player_ids=players,
-            source="official-lineup-test",
-            published_at=observed_at,
-            observed_at=observed_at,
-            raw_asset_id=asset.id,
-            url="fixture://official-lineup",
+    content = json.dumps(
+        {
+            "schema_version": 2,
+            "source": "official-lineup-test",
+            "source_match_id": "strict-fixture",
+            "match_mapping_source": "fbref-schedule",
+            "team_mapping_source": "fbref",
+            "player_mapping_source": "official-lineup-test",
+            "published_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "teams": [
+                {
+                    "source_team_id": f"strict-team-{team_index}",
+                    "starters": [
+                        {
+                            "source_player_id": f"strict-player-{team_index}-{player_index}",
+                            "name": f"Strict Player {team_index}-{player_index}",
+                        }
+                        for player_index in range(11)
+                    ],
+                }
+                for team_index in range(2)
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    sources = SourceRegistry(
+        (
+            SourceDescriptor(
+                "official-lineup-test",
+                SourceKind.OFFICIAL_LINEUP,
+                "official-lineup-test",
+                official=True,
+            ),
         )
     )
+    ingest = ingest_official_lineup_json(
+        content,
+        source="official-lineup-test",
+        source_match_id="strict-fixture",
+        page_url="fixture://official-lineup",
+        observed_at=observed_at,
+        archive=raw,
+        canonical=canonical,
+        source_registry=sources,
+    )
+    contract = replay_official_lineup_contract(
+        ingest.contract_id,
+        archive=raw,
+        canonical=canonical,
+    )
+    asset = raw.load(RawAssetId(ingest.raw_asset_id))
+    players = dict(contract.team_lineups)[teams[0].id]
     if fact_count < len(players):
         with canonical.connect() as connection:
             placeholders = ",".join("?" for _ in players[fact_count:])
@@ -192,7 +209,17 @@ def _strict_official_lineup_context(tmp_path: Path, *, fact_count: int = 11):
                     *(player_id.value for player_id in players[fact_count:]),
                 ),
             )
-    return canonical, raw, DerivedArchive(layout), asset, teams, match, version, players
+    return (
+        canonical,
+        raw,
+        DerivedArchive(layout),
+        asset,
+        teams,
+        match,
+        version,
+        players,
+        contract,
+    )
 
 
 def _ready_delta_item(
@@ -231,9 +258,12 @@ def _source(derived: DerivedArchive, asset, value, transform: str) -> str:
 
 
 def test_official_lineup_v2_round_trips_exact_canonical_facts(tmp_path: Path) -> None:
-    _, _, derived, asset, teams, match, version, players = _strict_official_lineup_context(tmp_path)
+    _, _, derived, asset, teams, match, version, players, contract = (
+        _strict_official_lineup_context(tmp_path)
+    )
 
     source_ref = derived.write_official_lineup_source(
+        contract_id=contract.contract_id,
         match_id=match.id,
         match_version=version.version,
         team_id=teams[0].id,
@@ -247,6 +277,7 @@ def test_official_lineup_v2_round_trips_exact_canonical_facts(tmp_path: Path) ->
     assert validation.transform_version == "official-lineup-input/2"
     assert validation.value == [player_id.value for player_id in players]
     assert validation.source_context == {
+        "contract_id": contract.contract_id,
         "match_id": match.id.value,
         "match_version": version.version,
         "team_id": teams[0].id.value,
@@ -261,10 +292,11 @@ def test_official_lineup_v2_round_trips_exact_canonical_facts(tmp_path: Path) ->
     ("raw", "match", "version", "team", "players", "known_at", "observed_at"),
 )
 def test_official_lineup_v2_rejects_noncanonical_context(tmp_path: Path, mismatch: str) -> None:
-    canonical, raw, derived, asset, teams, match, version, players = (
+    canonical, raw, derived, asset, teams, match, version, players, contract = (
         _strict_official_lineup_context(tmp_path)
     )
     arguments = {
+        "contract_id": contract.contract_id,
         "match_id": match.id,
         "match_version": version.version,
         "team_id": teams[0].id,
@@ -299,17 +331,18 @@ def test_official_lineup_v2_rejects_noncanonical_context(tmp_path: Path, mismatc
     else:
         arguments["observed_at"] = asset.observed_at + timedelta(minutes=1)
 
-    with pytest.raises(ArchiveConflictError, match="canonical lineup facts"):
+    with pytest.raises(ArchiveConflictError, match="official[- ]lineup"):
         derived.write_official_lineup_source(**arguments)
 
 
 def test_official_lineup_v2_rejects_missing_canonical_starter_fact(tmp_path: Path) -> None:
-    _, _, derived, asset, teams, match, version, players = _strict_official_lineup_context(
-        tmp_path, fact_count=10
+    _, _, derived, asset, teams, match, version, players, contract = (
+        _strict_official_lineup_context(tmp_path, fact_count=10)
     )
 
-    with pytest.raises(ArchiveConflictError, match="canonical lineup facts"):
+    with pytest.raises(ArchiveConflictError, match="official[- ]lineup"):
         derived.write_official_lineup_source(
+            contract_id=contract.contract_id,
             match_id=match.id,
             match_version=version.version,
             team_id=teams[0].id,
@@ -323,35 +356,21 @@ def test_official_lineup_v2_rejects_missing_canonical_starter_fact(tmp_path: Pat
 def test_ready_lineup_snapshot_accepts_strict_official_sources_and_ready_delta(
     tmp_path: Path,
 ) -> None:
-    canonical, _, derived, asset, teams, match, version, home_players = (
+    canonical, _, derived, asset, teams, match, version, home_players, contract = (
         _strict_official_lineup_context(tmp_path)
     )
-    facts = _official_lineup_fact_store(canonical)
-    away_players = tuple(
-        canonical.resolve_or_create_player(
-            source="official-lineup-test",
-            source_id=f"strict-away-player-{index}",
-            canonical_name=f"Strict Away Player {index}",
-            observed_at=asset.observed_at,
-            raw_asset_id=asset.id,
-        ).id
-        for index in range(11)
-    )
-    facts.append_official_lineup(
-        OfficialLineupDTO(
-            match_id=match.id,
-            match_version=version.version,
-            team_id=teams[1].id,
-            player_ids=away_players,
-            source="official-lineup-test",
-            published_at=asset.observed_at,
-            observed_at=asset.observed_at,
-            raw_asset_id=asset.id,
-            url="fixture://official-lineup",
+    with canonical.connect() as connection:
+        away_players = tuple(
+            PlayerId(row["player_id"])
+            for row in connection.execute(
+                "SELECT player_id FROM lineup_facts WHERE match_id = ? AND team_id = ? "
+                "AND lineup_role = 'starter' AND official = 1 ORDER BY player_id",
+                (match.id.value, teams[1].id.value),
+            ).fetchall()
         )
-    )
     official_sources = {
         team.id.value: derived.write_official_lineup_source(
+            contract_id=contract.contract_id,
             match_id=match.id,
             match_version=version.version,
             team_id=team.id,
@@ -1000,6 +1019,24 @@ def test_snapshot_is_content_identified_and_idempotently_archived(tmp_path: Path
 
     assert derived.write_snapshot(snapshot) == derived.write_snapshot(snapshot)
     assert derived.load_snapshot_payload(snapshot)["capture_mode"] == "reconstructed"
+
+
+def test_persisted_snapshot_payload_round_trips_strictly(tmp_path: Path) -> None:
+    _, derived, asset = _stores(tmp_path)
+    snapshot = build_snapshot(
+        features=_t24_features(derived, asset),
+        **_snapshot_arguments(derived),
+    )
+    derived.write_snapshot(snapshot)
+    payload = derived.load_snapshot_payload(snapshot)
+
+    assert parse_snapshot_payload(payload, source_validator=derived) == snapshot
+
+    with pytest.raises(ValueError, match="canonical"):
+        parse_snapshot_payload(
+            {**payload, "unexpected": "forged"},
+            source_validator=derived,
+        )
 
 
 def test_snapshot_identity_is_independent_of_feature_input_order(tmp_path: Path) -> None:

@@ -5,13 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from football_data_platform.domain.ids import RawAssetId
 from football_data_platform.domain.models import require_utc
-from football_data_platform.domain.snapshots import CaptureMode
+from football_data_platform.domain.predictions import (
+    ScorePrediction,
+    parse_prediction_payload,
+)
+from football_data_platform.domain.snapshots import CaptureMode, parse_snapshot_payload
 from football_data_platform.domain.training import (
     MODEL_ARTIFACT_REF_PREFIX,
     MODEL_OUTPUT_REF_PREFIX,
@@ -23,17 +28,26 @@ from football_data_platform.domain.training import (
     verify_model_run_artifact,
     verify_training_dataset,
 )
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
     DerivedArchive,
     DerivedArtifactManifest,
 )
+from football_data_platform.storage.facts import load_verified_match_result
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
 
 class TrainingArtifactConflict(ArchiveConflictError):
     """Raised when a training artifact conflicts with immutable storage."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TrainingReferenceAvailability:
+    reference: str
+    available_at: datetime | None
+    semantic_known_at: datetime | None = None
 
 
 class TrainingArtifactStore:
@@ -45,8 +59,8 @@ class TrainingArtifactStore:
 
     def write_dataset(self, dataset: TrainingDatasetManifest) -> Path:
         verify_training_dataset(dataset)
-        self._validate_sample_references(dataset)
         self._validate_capture_evidence(dataset)
+        self._validate_sample_references(dataset)
         path = self._write_json(self.dataset_path(dataset.dataset_id), dataset.to_payload())
         self.derived.write_artifact_manifest(
             DerivedArtifactManifest.create(
@@ -85,8 +99,8 @@ class TrainingArtifactStore:
         dataset = parse_training_dataset_payload(payload)
         if dataset.dataset_id != dataset_id:
             raise TrainingArtifactConflict("training dataset path and ID disagree")
-        self._validate_sample_references(dataset)
         self._validate_capture_evidence(dataset)
+        self._validate_sample_references(dataset)
         return dataset
 
     def load_training_dataset(self, dataset_id: str) -> TrainingDatasetManifest:
@@ -153,6 +167,74 @@ class TrainingArtifactStore:
         dataset = self._load_dataset_for_run(artifact)
         verify_model_run_artifact(artifact, dataset=dataset)
         self._validate_model_bytes(artifact)
+
+    def load_verified_prediction(self, reference: str) -> ScorePrediction:
+        """Load a prediction by replaying its snapshot, model, and composition contracts."""
+
+        try:
+            payload = self._verify_json_artifact(
+                reference, "prediction:", "predictions", "prediction"
+            )
+            snapshot_ref = payload.get("snapshot_id")
+            if not isinstance(snapshot_ref, str):
+                raise TrainingArtifactConflict("prediction lacks a snapshot reference")
+            snapshot_document = self._verify_json_artifact(
+                snapshot_ref,
+                "snapshot:",
+                "snapshots",
+                "prematch-snapshot",
+            )
+            snapshot = parse_snapshot_payload(
+                snapshot_document,
+                source_validator=self.derived,
+            )
+            snapshot_manifest = self.derived._load_artifact_manifest_for_output_ref(snapshot_ref)
+            if (
+                snapshot_manifest.schema_version != snapshot.schema_version
+                or snapshot_manifest.transform_version != snapshot.feature_spec_version
+                or snapshot_manifest.generated_at != snapshot.observed_at
+                or snapshot_manifest.started_at != snapshot.observed_at
+                or snapshot_manifest.ended_at != snapshot.observed_at
+                or snapshot_manifest.input_refs != snapshot.input_refs
+                or snapshot_manifest.output_refs != (snapshot.id.value,)
+                or snapshot_manifest.error is not None
+                or snapshot_manifest.quality != snapshot.quality_status
+            ):
+                raise TrainingArtifactConflict(
+                    "prediction snapshot manifest does not match persisted bytes"
+                )
+            prediction = parse_prediction_payload(
+                payload,
+                snapshot=snapshot,
+                snapshot_validator=self.derived,
+                model_run_validator=self,
+            )
+            prediction_manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
+            expected_inputs = tuple(
+                sorted({*prediction.input_refs, prediction.composition_artifact_ref})
+            )
+            if (
+                prediction_manifest.schema_version != prediction.schema_version
+                or prediction_manifest.transform_version != prediction.model_version
+                or prediction_manifest.generated_at != prediction.generated_at
+                or prediction_manifest.started_at != prediction.generated_at
+                or prediction_manifest.ended_at != prediction.generated_at
+                or prediction_manifest.input_refs != expected_inputs
+                or prediction_manifest.output_refs != (prediction.id.value,)
+                or prediction_manifest.error is not None
+                or prediction_manifest.quality != prediction.snapshot_quality_status
+            ):
+                raise TrainingArtifactConflict(
+                    "prediction manifest does not match its domain contract"
+                )
+            self.derived.verify_score_grid_composition(prediction)
+        except TrainingArtifactConflict:
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
+            raise TrainingArtifactConflict(
+                f"prediction domain replay is unavailable or invalid: {error}"
+            ) from error
+        return prediction
 
     def write_model_artifact(self, payload: bytes) -> str:
         """Persist immutable model bytes and return their content reference."""
@@ -224,69 +306,226 @@ class TrainingArtifactStore:
     def _validate_sample_references(self, dataset: TrainingDatasetManifest) -> None:
         """Resolve every feature/label reference through an immutable store."""
 
-        references = {
-            reference
-            for sample in dataset.samples
-            for reference in (*sample.feature_refs, sample.label_ref)
-        }
-        for reference in sorted(references):
+        availabilities: dict[str, _TrainingReferenceAvailability] = {}
+        for reference in dataset.input_refs:
             try:
-                self._verify_training_reference(reference)
+                availabilities[reference] = self._verify_training_reference(reference)
             except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+                label_sample = next(
+                    (sample for sample in dataset.samples if sample.label_ref == reference),
+                    None,
+                )
+                if (
+                    label_sample is not None
+                    and dataset.task == "score-model"
+                    and dataset.label_version == "result-90/1"
+                ):
+                    raise TrainingArtifactConflict(
+                        "training sample reference is unavailable or invalid: "
+                        f"{reference}; score-model sample {label_sample.sample_id} "
+                        "result lineage is invalid"
+                    ) from error
                 raise TrainingArtifactConflict(
                     f"training sample reference is unavailable or invalid: {reference}"
                 ) from error
+        if dataset.status in {DatasetStatus.SUCCEEDED, DatasetStatus.PARTIAL}:
+            for reference, availability in availabilities.items():
+                if availability.available_at is None:
+                    raise TrainingArtifactConflict(
+                        f"training reference lacks an authoritative availability time: {reference}"
+                    )
+                if availability.available_at > dataset.generated_at:
+                    raise TrainingArtifactConflict(
+                        f"training dataset predates input availability: {reference}"
+                    )
+            for sample in dataset.samples:
+                for reference in sample.feature_refs:
+                    availability = availabilities[reference]
+                    if (
+                        sample.capture_mode is CaptureMode.CAPTURED
+                        and availability.available_at is not None
+                        and availability.available_at > sample.as_of
+                    ):
+                        raise TrainingArtifactConflict(
+                            f"captured training sample {sample.sample_id} feature input "
+                            f"follows as_of: {reference}"
+                        )
+                    semantic_known_at = availability.semantic_known_at
+                    if (
+                        semantic_known_at is not None
+                        and semantic_known_at > sample.feature_known_at
+                    ):
+                        raise TrainingArtifactConflict(
+                            f"training sample {sample.sample_id} feature_known_at predates "
+                            f"its source semantics: {reference}"
+                        )
+        self._validate_score_result_labels(dataset)
 
-    def _verify_training_reference(self, reference: str) -> None:
+    def _validate_score_result_labels(self, dataset: TrainingDatasetManifest) -> None:
+        if dataset.task != "score-model" or dataset.label_version != "result-90/1":
+            return
+
+        canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+        archive = RawArchive(self.layout)
+        for sample in dataset.samples:
+            try:
+                result, _ = self._load_result_reference_availability(
+                    sample.label_ref, archive=archive, canonical=canonical
+                )
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+                raise TrainingArtifactConflict(
+                    f"score-model sample {sample.sample_id} result lineage is invalid"
+                ) from error
+            if not isinstance(sample.label, dict):
+                raise TrainingArtifactConflict(
+                    f"score-model sample {sample.sample_id} label must be an object"
+                )
+            home_goals = sample.label.get("home_goals")
+            away_goals = sample.label.get("away_goals")
+            if (
+                type(home_goals) is not int
+                or type(away_goals) is not int
+                or home_goals != result.home_goals
+                or away_goals != result.away_goals
+            ):
+                raise TrainingArtifactConflict(
+                    f"score-model sample {sample.sample_id} label goals do not match its result"
+                )
+            if sample.label_known_at != result.known_at:
+                raise TrainingArtifactConflict(
+                    f"score-model sample {sample.sample_id} label_known_at "
+                    "does not match its result"
+                )
+
+    def _verify_training_reference(
+        self,
+        reference: str,
+        *,
+        _manifest_lineage: frozenset[str] = frozenset(),
+    ) -> _TrainingReferenceAvailability:
         if not isinstance(reference, str) or not reference or reference.strip() != reference:
             raise ValueError("reference must be non-empty text")
         if reference.startswith("raw-asset:"):
-            RawArchive(self.layout).verify(RawAssetId(reference))
-            return
+            raw = RawArchive(self.layout)
+            asset = raw.load(RawAssetId(reference))
+            raw.verify(asset)
+            return _TrainingReferenceAvailability(reference, asset.observed_at)
         if reference.startswith("derived-source:"):
             _require_digest_reference(reference, "derived-source:")
-            self.derived.validate_snapshot_source(reference)
-            return
+            source = self.derived.validate_snapshot_source(reference)
+            return _TrainingReferenceAvailability(reference, source.observed_at, source.known_at)
         if reference.startswith("team-baseline:"):
-            self.derived.load_team_baseline(reference)
-            self._verify_manifest_output(reference, "team-baseline")
-            return
+            baseline = self.derived.load_team_baseline(reference)
+            manifest = self._verify_manifest_output(reference, "team-baseline")
+            return _TrainingReferenceAvailability(reference, manifest.generated_at, baseline.as_of)
         if reference.startswith("snapshot:"):
-            self._verify_json_artifact(reference, "snapshot:", "snapshots", "prematch-snapshot")
-            return
+            payload = self._verify_json_artifact(
+                reference, "snapshot:", "snapshots", "prematch-snapshot"
+            )
+            snapshot = parse_snapshot_payload(payload, source_validator=self.derived)
+            manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
+            semantic_known_at = max(feature.known_at for feature in snapshot.features)
+            return _TrainingReferenceAvailability(
+                reference, manifest.generated_at, semantic_known_at
+            )
         if reference.startswith("prediction:"):
-            self._verify_prediction_reference(reference)
-            return
+            prediction = self.load_verified_prediction(reference)
+            return _TrainingReferenceAvailability(
+                reference, prediction.generated_at, prediction.generated_at
+            )
         if reference.startswith("score-grid-composition:"):
             self.derived.load_score_grid_composition_payload(reference)
-            self._verify_manifest_output(reference, "score-grid-composition")
-            return
+            manifest = self._verify_manifest_output(reference, "score-grid-composition")
+            return _TrainingReferenceAvailability(reference, manifest.generated_at)
         if reference.startswith("derived-artifact:"):
-            self.derived.load_artifact_manifest(reference)
-            return
+            return self._verify_derived_artifact_reference(
+                reference,
+                lineage=_manifest_lineage,
+            )
         if reference.startswith("training-dataset:"):
-            self.load_dataset(reference)
-            return
+            dataset = self.load_dataset(reference)
+            return _TrainingReferenceAvailability(reference, dataset.generated_at)
         if reference.startswith("model-run:"):
-            self.load_model_run(reference)
-            return
+            model_run = self.load_model_run(reference)
+            return _TrainingReferenceAvailability(reference, model_run.ended_at)
         if reference.startswith("model-artifact:"):
             self.verify_model_artifact(reference)
-            return
+            return _TrainingReferenceAvailability(reference, None)
         if reference.startswith("model-output:"):
             self.verify_model_output(reference)
-            return
+            return _TrainingReferenceAvailability(reference, None)
         if reference.startswith("fact:") or reference.startswith("canonical:"):
+            if reference.startswith("fact:match_results_90:"):
+                _, availability = self._load_result_reference_availability(reference)
+                return availability
             self._verify_canonical_reference(reference)
-            return
+            return _TrainingReferenceAvailability(reference, None)
         raise ValueError(f"unsupported training reference type: {reference}")
 
-    def _verify_manifest_output(self, reference: str, artifact_type: str) -> None:
+    def _verify_derived_artifact_reference(
+        self,
+        reference: str,
+        *,
+        lineage: frozenset[str],
+    ) -> _TrainingReferenceAvailability:
+        if reference in lineage:
+            raise TrainingArtifactConflict(
+                f"recursive derived artifact training lineage: {reference}"
+            )
+        manifest = self.derived.load_artifact_manifest(reference)
+        if manifest.status not in {"succeeded", "partial"}:
+            raise TrainingArtifactConflict(
+                f"training input derived artifact is not usable: {reference}"
+            )
+
+        nested_lineage = lineage | {reference}
+        for input_reference in manifest.input_refs:
+            availability = self._verify_training_reference(
+                input_reference,
+                _manifest_lineage=nested_lineage,
+            )
+            if availability.available_at is None:
+                raise TrainingArtifactConflict(
+                    "derived artifact input lacks an authoritative availability time: "
+                    f"{input_reference}"
+                )
+            if availability.available_at > manifest.generated_at:
+                raise TrainingArtifactConflict(
+                    "derived artifact generated_at predates input availability: "
+                    f"{reference} <- {input_reference}"
+                )
+        return _TrainingReferenceAvailability(reference, manifest.generated_at)
+
+    def _verify_manifest_output(
+        self, reference: str, artifact_type: str
+    ) -> DerivedArtifactManifest:
         manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
         if manifest.artifact_type != artifact_type or manifest.status != "succeeded":
             raise TrainingArtifactConflict(
                 f"reference {reference} does not resolve to a succeeded {artifact_type} artifact"
             )
+        return manifest
+
+    def _load_result_reference_availability(
+        self,
+        reference: str,
+        *,
+        archive: RawArchive | None = None,
+        canonical: CanonicalStore | None = None,
+    ) -> tuple[Any, _TrainingReferenceAvailability]:
+        raw = archive or RawArchive(self.layout)
+        facts = canonical or CanonicalStore(self.layout.canonical / "platform.sqlite3")
+        result = load_verified_match_result(reference, archive=raw, canonical=facts)
+        with facts.connect() as connection:
+            row = connection.execute(
+                "SELECT raw_asset_id FROM match_results_90 WHERE record_id = ?",
+                (reference,),
+            ).fetchone()
+        if row is None:
+            raise TrainingArtifactConflict("canonical result availability is unavailable")
+        asset = raw.load(RawAssetId(row["raw_asset_id"]))
+        raw.verify(asset)
+        return result, _TrainingReferenceAvailability(reference, asset.observed_at, result.known_at)
 
     def _verify_json_artifact(
         self,
@@ -314,21 +553,7 @@ class TrainingArtifactStore:
         return payload
 
     def _verify_prediction_reference(self, reference: str) -> None:
-        payload = self._verify_json_artifact(reference, "prediction:", "predictions", "prediction")
-        composition_ref = payload.get("composition_artifact_ref")
-        if not isinstance(composition_ref, str):
-            raise TrainingArtifactConflict("prediction lacks a composition artifact reference")
-        composition = self.derived.load_score_grid_composition_payload(composition_ref)
-        composition_manifest = self.derived._load_artifact_manifest_for_output_ref(composition_ref)
-        if (
-            composition_manifest.artifact_type != "score-grid-composition"
-            or composition_manifest.status != "succeeded"
-            or composition_manifest.payload != composition
-        ):
-            raise TrainingArtifactConflict("prediction composition manifest is invalid")
-        expected = _prediction_composition_payload(payload)
-        if composition != expected:
-            raise TrainingArtifactConflict("prediction composition does not match prediction")
+        self.load_verified_prediction(reference)
 
     def _verify_canonical_reference(self, reference: str) -> None:
         path = self.layout.canonical / "platform.sqlite3"
@@ -582,49 +807,6 @@ def _canonical_json(value: Any) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-
-
-def _prediction_composition_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    fields = (
-        "schema_version",
-        "artifact_type",
-        "match_id",
-        "snapshot_id",
-        "model_run_id",
-        "model_version",
-        "generated_at",
-        "snapshot_as_of",
-        "baseline_lambda_home",
-        "baseline_lambda_away",
-        "contribution_keys",
-        "contribution_multipliers",
-        "composition_version",
-        "calibration_versions",
-        "lambda_home",
-        "lambda_away",
-        "rho",
-        "max_goals",
-        "normalization_residual",
-        "score_cells",
-        "input_refs",
-    )
-    try:
-        projected = {name: payload[name] for name in fields}
-    except KeyError as error:
-        raise TrainingArtifactConflict(
-            f"prediction payload is missing composition field: {error.args[0]}"
-        ) from error
-    projected["schema_version"] = 1
-    projected["artifact_type"] = "score-grid-composition"
-    projected["grid"] = {
-        "lambda_home": projected["lambda_home"],
-        "lambda_away": projected["lambda_away"],
-        "rho": projected["rho"],
-        "max_goals": projected["max_goals"],
-        "normalization_residual": projected["normalization_residual"],
-        "score_cells": projected["score_cells"],
-    }
-    return projected
 
 
 def _manifest_status(status: DatasetStatus | ModelRunStatus) -> str:

@@ -10,23 +10,18 @@ from datetime import datetime
 from football_data_platform.config import CompetitionDefinition, SeasonDefinition
 from football_data_platform.domain.ids import MatchId
 from football_data_platform.domain.models import require_utc
-from football_data_platform.pipelines.match_report import (
-    PRODUCTION_REQUIRED_TABLES,
-    MatchReportCanonicalValidationError,
-    blocking_match_report_diagnostics,
-    validate_match_report_identity,
-    validate_match_report_result,
-)
+from football_data_platform.pipelines.match_report import PRODUCTION_REQUIRED_TABLES
 from football_data_platform.sources.fbref import (
     COLLECTOR_VERSION,
     ScheduleParseResult,
     parse_schedule,
 )
-from football_data_platform.sources.fbref_match_report import (
-    REPORT_PARSER_VERSION,
-    parse_match_report,
-)
+from football_data_platform.sources.fbref_match_report import REPORT_PARSER_VERSION
 from football_data_platform.storage.canonical import CanonicalStore, MatchReportContractEvidence
+from football_data_platform.storage.match_report_contracts import (
+    MatchReportContractReplayError,
+    verify_match_report_contract,
+)
 from football_data_platform.storage.raw import RawArchive
 
 
@@ -655,59 +650,18 @@ def _replay_match_report_contracts(
             diagnostics.append(f"match_report_contract_replay_unavailable:{contract.contract_id}")
             continue
         try:
-            raw_asset = archive.load(contract.raw_asset_id)
-            content = archive.read(raw_asset)
-            parsed = parse_match_report(content, required_tables=contract.required_tables)
-        except (OSError, RuntimeError, ValueError):
-            diagnostics.append(f"match_report_contract_replay_failed:{contract.contract_id}")
+            verified_contract = verify_match_report_contract(
+                contract.contract_id,
+                archive=archive,
+                canonical=canonical,
+            )
+        except MatchReportContractReplayError as error:
+            diagnostics.append(error.diagnostic(contract.contract_id))
             continue
-
-        replayed_team_tables = tuple(
-            sorted((team.source_team_id, team.tables_present) for team in parsed.teams)
-        )
-        source_match_id = parsed.identity.source_match_id
-        if (
-            parsed.parser_version != contract.parser_version
-            or raw_asset.source != "fbref"
-            or raw_asset.source_id != contract.source_match_id
-            or raw_asset.observed_at != contract.observed_at
-            or source_match_id is None
-            or source_match_id.casefold() != contract.source_match_id.casefold()
-            or parsed.required_tables != contract.required_tables
-            or replayed_team_tables != contract.team_tables
-            or parsed.missing_required_tables
-            or blocking_match_report_diagnostics(parsed)
-        ):
+        if verified_contract != contract:
             diagnostics.append(f"match_report_contract_replay_mismatch:{contract.contract_id}")
             continue
-        if raw_asset.target_event_time is None:
-            diagnostics.append(
-                f"match_report_contract_identity_mismatch:{contract.contract_id}:"
-                "report_known_at_missing"
-            )
-            continue
-        try:
-            validate_match_report_identity(
-                parsed,
-                source_match_id=contract.source_match_id,
-                match_id=contract.match_id,
-                match_version=contract.match_version,
-                canonical=canonical,
-            )
-            validate_match_report_result(
-                parsed,
-                match_id=contract.match_id,
-                match_version=contract.match_version,
-                known_at=raw_asset.target_event_time,
-                observed_at=contract.observed_at,
-                canonical=canonical,
-            )
-        except MatchReportCanonicalValidationError as error:
-            diagnostics.append(
-                f"match_report_contract_identity_mismatch:{contract.contract_id}:{error.code}"
-            )
-            continue
-        verified.append(contract)
+        verified.append(verified_contract)
     return tuple(verified), tuple(diagnostics)
 
 

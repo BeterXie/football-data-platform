@@ -293,7 +293,7 @@ def test_initialize_migrates_v1_match_versions_and_collection_attempts(
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 4
+            == 6
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(match_versions)")}
         assert "round_name" in columns
@@ -310,6 +310,10 @@ def test_initialize_migrates_v1_match_versions_and_collection_attempts(
         assert "match_version" in prematch_columns
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'match_report_contracts'"
+        ).fetchone()
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'official_lineup_contracts'"
         ).fetchone()
 
 
@@ -363,13 +367,174 @@ def test_initialize_migrates_v2_attempt_source_id_from_raw_asset(tmp_path: Path)
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 4
+            == 6
         )
         row = connection.execute(
             "SELECT source_id FROM collection_attempts "
             "WHERE collection_attempt_id = 'collection-attempt:legacy'"
         ).fetchone()
     assert row["source_id"] == "aaaaaaaa"
+
+
+def test_initialize_migrates_v4_to_official_lineup_contract_schema(tmp_path: Path) -> None:
+    path = tmp_path / "canonical-v4.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            );
+            INSERT INTO schema_meta(singleton, version) VALUES (1, 4);
+            """
+        )
+
+    store = CanonicalStore(path)
+    store.initialize()
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
+            == 6
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(official_lineup_contracts)")
+        }
+    assert {
+        "contract_id",
+        "raw_asset_id",
+        "match_id",
+        "match_version",
+        "parser_version",
+        "team_lineups_json",
+        "contract_version",
+        "source_bindings_json",
+        "fact_ids_json",
+    } <= columns
+
+
+def test_initialize_rebuilds_real_v5_official_contract_table_without_losing_legacy(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "canonical-v5.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            );
+            INSERT INTO schema_meta(singleton, version) VALUES (1, 5);
+            CREATE TABLE raw_assets (
+                raw_asset_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                target_event_time TEXT,
+                checksum TEXT NOT NULL,
+                collector_version TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0)
+            );
+            INSERT INTO raw_assets VALUES (
+                'raw-asset:legacy', 'official', 'source-match',
+                'https://official.example/source-match', '2026-07-16T02:00:00Z',
+                '2026-07-16T01:00:00Z', 'legacy-checksum',
+                'official-lineup/legacy', 'application/json', 2
+            );
+            CREATE TABLE match_versions (
+                match_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                PRIMARY KEY (match_id, version)
+            );
+            INSERT INTO match_versions VALUES ('match:legacy', 1);
+            CREATE TABLE official_lineup_contracts (
+                contract_id TEXT PRIMARY KEY,
+                raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id),
+                source TEXT NOT NULL,
+                source_match_id TEXT NOT NULL,
+                match_mapping_source TEXT NOT NULL,
+                team_mapping_source TEXT NOT NULL,
+                player_mapping_source TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                match_version INTEGER NOT NULL,
+                parser_version TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                team_lineups_json TEXT NOT NULL,
+                fact_ids_json TEXT NOT NULL,
+                UNIQUE (raw_asset_id, parser_version),
+                FOREIGN KEY (match_id, match_version)
+                    REFERENCES match_versions(match_id, version)
+            );
+            INSERT INTO official_lineup_contracts(
+                contract_id, raw_asset_id, source, source_match_id,
+                match_mapping_source, team_mapping_source, player_mapping_source,
+                match_id, match_version, parser_version, published_at, observed_at,
+                team_lineups_json, fact_ids_json
+            ) VALUES (
+                'official-lineup-contract:legacy', 'raw-asset:legacy', 'official',
+                'source-match', 'schedule', 'teams', 'players', 'match:legacy', 1,
+                'official-lineup/legacy', '2026-07-16T01:00:00Z',
+                '2026-07-16T02:00:00Z', '{}', '[]'
+            );
+            """
+        )
+
+    store = CanonicalStore(path)
+    store.initialize()
+    store.initialize()
+
+    with store.connect() as connection:
+        version = connection.execute(
+            "SELECT version FROM schema_meta WHERE singleton = 1"
+        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT contract_id, raw_asset_id, parser_version, contract_version, "
+            "source_bindings_json "
+            "FROM official_lineup_contracts WHERE contract_id = ?",
+            ("official-lineup-contract:legacy",),
+        ).fetchone()
+        unique_indexes = {
+            tuple(
+                column["name"]
+                for column in connection.execute(f"PRAGMA index_info({index['name']})").fetchall()
+            )
+            for index in connection.execute(
+                "PRAGMA index_list(official_lineup_contracts)"
+            ).fetchall()
+            if index["unique"]
+        }
+        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        connection.execute(
+            "INSERT INTO official_lineup_contracts("
+            "contract_id, contract_version, raw_asset_id, source, source_match_id, "
+            "match_mapping_source, team_mapping_source, player_mapping_source, match_id, "
+            "match_version, parser_version, published_at, observed_at, team_lineups_json, "
+            "source_bindings_json, fact_ids_json) VALUES ("
+            "'official-lineup-contract:v2', 2, 'raw-asset:legacy', 'official', "
+            "'source-match', 'schedule', 'teams', 'players', 'match:legacy', 1, "
+            "'official-lineup/legacy', '2026-07-16T01:00:00Z', "
+            "'2026-07-16T02:00:00Z', '{}', '[]', '[]')"
+        )
+        contract_count = connection.execute(
+            "SELECT COUNT(*) FROM official_lineup_contracts"
+        ).fetchone()[0]
+    assert version == 6
+    assert tuple(row) == (
+        "official-lineup-contract:legacy",
+        "raw-asset:legacy",
+        "official-lineup/legacy",
+        1,
+        None,
+    )
+    assert ("raw_asset_id", "parser_version", "contract_version") in unique_indexes
+    assert ("raw_asset_id", "parser_version") not in unique_indexes
+    assert foreign_key_violations == []
+    assert contract_count == 2
 
 
 def test_initialize_rebuilds_v3_prematch_events_with_v4_constraints(
@@ -477,7 +642,7 @@ def test_initialize_rebuilds_v3_prematch_events_with_v4_constraints(
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 4
+            == 6
         )
         rows = connection.execute(
             "SELECT record_id, match_id, match_version, team_id, player_id, event_type, "

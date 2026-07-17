@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -8,10 +9,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _prediction_forgery import forge_persisted_prediction
+from _training_refs import seed_training_references
+from test_snapshots_lifecycle import _strict_official_lineup_context
 
+import football_data_platform.domain.snapshots as snapshot_contract
 from football_data_platform.domain.ids import (
     MatchId,
     ModelRunId,
+    PlayerId,
     PredictionId,
     RawAssetId,
     SnapshotId,
@@ -33,7 +39,9 @@ from football_data_platform.domain.predictions import (
 )
 from football_data_platform.domain.snapshots import (
     CaptureMode,
+    PreMatchSnapshot,
     SnapshotFeature,
+    SnapshotSourceValidation,
     SnapshotType,
     build_snapshot,
 )
@@ -42,6 +50,8 @@ from football_data_platform.domain.training import (
     MODEL_OUTPUT_REF_PREFIX,
     ModelRunArtifact,
     ModelRunStatus,
+    TrainingDatasetManifest,
+    TrainingSample,
 )
 from football_data_platform.evaluation.governance import (
     ChallengerEvidence,
@@ -50,12 +60,17 @@ from football_data_platform.evaluation.governance import (
     assess_promotion,
 )
 from football_data_platform.evaluation.metrics import (
+    BenchmarkScore,
+    categorical_log_loss,
     evaluate_prediction,
+    evaluation_record_payload,
     multiclass_brier,
+    parse_evaluation_record_payload,
 )
 from football_data_platform.features.contributions import (
-    ExpectedGoalsContribution,
     compose_expected_goals,
+    context_contribution,
+    lineup_delta_contributions,
 )
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
@@ -66,6 +81,10 @@ from football_data_platform.features.team_baseline import (
 from football_data_platform.storage.derived import DerivedArchive
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
+from football_data_platform.storage.training import (
+    TrainingArtifactConflict,
+    TrainingArtifactStore,
+)
 
 MATCH = MatchId("match:prediction-test")
 HOME = TeamId("team:prediction-home")
@@ -176,18 +195,35 @@ def _prediction(
     model_run_validator=None,
 ):
     snapshot, validator = snapshot_with_validator
+    composition = _composition(snapshot)
     return build_score_prediction(
         snapshot=snapshot,
         snapshot_validator=validator,
         model_run_id=model_run_id,
         model_version=model_version,
         generated_at=generated_at,
-        lambda_home=1.7,
-        lambda_away=0.8,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
         rho=-0.12,
         max_goals=11,
-        input_refs=("snapshot:" + "a" * 64, "baseline:v1"),
+        input_refs=(),
         model_run_validator=model_run_validator,
+        expected_goals=composition,
+    )
+
+
+def _composition(snapshot, *, context_source_ref: str | None = None, coefficient: float = 0.02):
+    baseline = next(feature for feature in snapshot.features if feature.name == "team_baseline")
+    context = next(feature for feature in snapshot.features if feature.name == "match_context")
+    effect = context_contribution(
+        context.value,
+        source_ref=context_source_ref or context.source_ref,
+        coefficient=coefficient,
+    )
+    return compose_expected_goals(
+        baseline.value["lambda_home"],
+        baseline.value["lambda_away"],
+        (effect,),
     )
 
 
@@ -242,6 +278,358 @@ def _model_run(
         status=status,
         error="training failed" if status is ModelRunStatus.FAILED else None,
     )
+
+
+def _persisted_prediction_fixture(tmp_path: Path):
+    snapshot, archive = _snapshot(tmp_path)
+    archive.write_snapshot(snapshot)
+    label_known_at = GENERATED_AT - timedelta(minutes=30)
+    feature_ref, label_ref = seed_training_references(
+        archive.layout,
+        label_known_at=label_known_at,
+        observed_at=GENERATED_AT,
+        home_goals=1,
+        away_goals=0,
+        reference_key="persisted-prediction",
+    )
+    training_sample = TrainingSample(
+        sample_id="sample:prediction-train",
+        as_of=GENERATED_AT - timedelta(days=2),
+        feature_known_at=GENERATED_AT - timedelta(days=3),
+        label_known_at=label_known_at,
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        feature_refs=(feature_ref,),
+        label_ref=label_ref,
+        features={"strength": 1.0},
+        label={"home_goals": 1, "away_goals": 0},
+        split="train",
+    )
+    holdout_sample = replace(
+        training_sample,
+        sample_id="sample:prediction-holdout",
+        as_of=GENERATED_AT - timedelta(hours=1),
+        feature_known_at=GENERATED_AT - timedelta(hours=2),
+        split="test",
+    )
+    dataset = TrainingDatasetManifest.create(
+        dataset_version="prediction-dataset/1",
+        task="score-model",
+        qualification="score-model-ready",
+        qualification_ruleset_version="readiness/1",
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        as_of=GENERATED_AT,
+        split_strategy="forward-chaining/1",
+        samples=(training_sample, holdout_sample),
+        generated_at=GENERATED_AT,
+        transform_version="training-dataset/1",
+        code_version="git:test",
+    )
+    training = TrainingArtifactStore(archive.layout)
+    training.write_dataset(dataset)
+    model_ref = training.write_model_artifact(b"persisted prediction model")
+    output_ref = training.write_model_output(b"persisted prediction output")
+    model_run = ModelRunArtifact.create(
+        model_version="dixon-coles/1",
+        run_role="challenger",
+        task="score-model",
+        dataset_id=dataset.dataset_id,
+        feature_version=dataset.feature_version,
+        label_version=dataset.label_version,
+        algorithm="dixon-coles",
+        parameters={"rho": -0.12, "max_goals": 11},
+        code_version="git:test",
+        environment_version="python-3.11:test-lock",
+        started_at=GENERATED_AT,
+        ended_at=GENERATED_AT,
+        random_seed=17,
+        model_artifact_refs=(model_ref,),
+        evaluation_cohort=(holdout_sample.sample_id,),
+        evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
+        output_refs=(output_ref,),
+        output_hashes=(output_ref.removeprefix(MODEL_OUTPUT_REF_PREFIX),),
+    )
+    training.write_model_run(model_run)
+    archive.model_run_validator = training
+    prediction = _prediction(
+        (snapshot, archive),
+        model_run_id=ModelRunId(model_run.model_run_id),
+        model_run_validator=training,
+    )
+    return snapshot, archive, prediction, model_run
+
+
+def _persisted_ready_lineup_prediction_fixture(tmp_path: Path):
+    canonical, _, archive, lineup_asset, teams, match, version, home_players, contract = (
+        _strict_official_lineup_context(tmp_path)
+    )
+    with canonical.connect() as connection:
+        away_players = tuple(
+            PlayerId(row["player_id"])
+            for row in connection.execute(
+                "SELECT player_id FROM lineup_facts WHERE match_id = ? AND team_id = ? "
+                "AND lineup_role = 'starter' AND official = 1 ORDER BY player_id",
+                (match.id.value, teams[1].id.value),
+            ).fetchall()
+        )
+    player_objects_by_team = {
+        teams[0].id.value: home_players,
+        teams[1].id.value: away_players,
+    }
+    player_ids_by_team = {
+        team_id: tuple(player_id.value for player_id in player_ids)
+        for team_id, player_ids in player_objects_by_team.items()
+    }
+    observed_at = lineup_asset.observed_at
+    official_sources = {
+        team.id.value: archive.write_official_lineup_source(
+            contract_id=contract.contract_id,
+            match_id=match.id,
+            match_version=version.version,
+            team_id=team.id,
+            player_ids=player_objects_by_team[team.id.value],
+            known_at=observed_at,
+            observed_at=observed_at,
+            raw_asset_id=lineup_asset.id,
+        )
+        for team in teams
+    }
+    delta_value = {
+        team_id: {
+            "quality_status": "ready",
+            "dimension_deltas": {"attack": 0.1 if index == 0 else -0.1},
+            "missing_fields": [],
+        }
+        for index, team_id in enumerate(player_ids_by_team)
+    }
+    delta_ref = archive.write_snapshot_source(
+        value=delta_value,
+        input_refs=(lineup_asset.id,),
+        transform_version="lineup-delta-input/1",
+        generated_at=observed_at,
+    )
+
+    baseline_artifact = build_team_baseline(
+        (
+            TeamMatchProcess(
+                "ready-lineup-baseline",
+                teams[0].id.value,
+                teams[1].id.value,
+                observed_at - timedelta(days=30),
+                observed_at - timedelta(days=1),
+                1.7,
+                0.8,
+                lineup_asset.id.value,
+            ),
+        ),
+        as_of=observed_at,
+        half_life_days=90.0,
+        iterations=2,
+    ).artifact
+    archive.write_team_baseline(baseline_artifact)
+    lambda_home, lambda_away = expected_goals_from_baseline(
+        baseline_artifact,
+        home_team_id=teams[0].id.value,
+        away_team_id=teams[1].id.value,
+    )
+    baseline_value = {
+        "artifact_id": baseline_artifact.artifact_id,
+        "artifact": team_baseline_payload(baseline_artifact),
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+    }
+    baseline_ref = archive.write_snapshot_source(
+        value=baseline_value,
+        input_refs=(lineup_asset.id,),
+        transform_version="team-baseline-input/2",
+        generated_at=observed_at,
+    )
+    context_value = {"days_since_previous_match": 6.0}
+    context_ref = archive.write_snapshot_source(
+        value=context_value,
+        input_refs=(lineup_asset.id,),
+        transform_version="match-context-input/1",
+        generated_at=observed_at,
+    )
+    raw_features = (
+        SnapshotFeature("team_baseline", baseline_value, observed_at, baseline_ref, "baseline"),
+        SnapshotFeature("match_context", context_value, observed_at, context_ref, "context"),
+        SnapshotFeature("lineup_delta", delta_value, observed_at, delta_ref, "lineup"),
+        *(
+            SnapshotFeature(
+                "official_lineup_confirmed",
+                list(player_ids),
+                observed_at,
+                official_sources[team_id],
+                f"official-lineup:{team_id}",
+                team_id,
+            )
+            for team_id, player_ids in player_ids_by_team.items()
+        ),
+    )
+    features, source_observed_at, input_refs, missing_fields = snapshot_contract._validated_state(
+        match.id,
+        version.version,
+        SnapshotType.LINEUPS_CONFIRMED,
+        observed_at,
+        version.kickoff_at,
+        "prematch-features/1",
+        raw_features,
+        teams[0].id,
+        teams[1].id,
+        archive,
+    )
+    fields = {
+        "match_id": match.id,
+        "match_version": version.version,
+        "home_team_id": teams[0].id,
+        "away_team_id": teams[1].id,
+        "snapshot_type": SnapshotType.LINEUPS_CONFIRMED,
+        "capture_mode": CaptureMode.RECONSTRUCTED,
+        "as_of": observed_at,
+        "observed_at": source_observed_at,
+        "scheduled_kickoff_used": version.kickoff_at,
+        "feature_spec_version": "prematch-features/1",
+        "features": features,
+        "input_refs": input_refs,
+        "quality_status": "ready",
+        "missing_fields": missing_fields,
+    }
+    identity = snapshot_contract._snapshot_identity(**fields)
+    snapshot = PreMatchSnapshot(
+        id=SnapshotId(
+            "snapshot:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        ),
+        schema_version=snapshot_contract.SNAPSHOT_SCHEMA_VERSION,
+        **fields,
+    )
+    archive.write_snapshot(snapshot)
+
+    label_known_at = observed_at - timedelta(minutes=5)
+    feature_ref, label_ref = seed_training_references(
+        archive.layout,
+        label_known_at=label_known_at,
+        observed_at=observed_at,
+        home_goals=1,
+        away_goals=0,
+        reference_key="ready-lineup-prediction",
+    )
+    sample = TrainingSample(
+        sample_id="sample:ready-lineup",
+        as_of=observed_at - timedelta(hours=1),
+        feature_known_at=observed_at - timedelta(hours=2),
+        label_known_at=label_known_at,
+        capture_mode=CaptureMode.RECONSTRUCTED,
+        qualification="score-model-ready",
+        qualification_passed=True,
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        feature_refs=(feature_ref,),
+        label_ref=label_ref,
+        features={"strength": 1.0},
+        label={"home_goals": 1, "away_goals": 0},
+        split="train",
+    )
+    holdout = replace(
+        sample,
+        sample_id="sample:ready-lineup-holdout",
+        as_of=observed_at - timedelta(minutes=15),
+        feature_known_at=observed_at - timedelta(minutes=15),
+        split="test",
+    )
+    dataset = TrainingDatasetManifest.create(
+        dataset_version="prediction-dataset/ready-lineup",
+        task="score-model",
+        qualification="score-model-ready",
+        qualification_ruleset_version="readiness/1",
+        feature_version="score-features/1",
+        label_version="result-90/1",
+        as_of=observed_at,
+        split_strategy="forward-chaining/1",
+        samples=(sample, holdout),
+        generated_at=observed_at,
+        code_version="git:test",
+    )
+    training = TrainingArtifactStore(archive.layout)
+    training.write_dataset(dataset)
+    model_ref = training.write_model_artifact(b"ready lineup prediction model")
+    output_ref = training.write_model_output(b"ready lineup prediction output")
+    model_run = ModelRunArtifact.create(
+        model_version="dixon-coles/ready-lineup",
+        run_role="challenger",
+        task="score-model",
+        dataset_id=dataset.dataset_id,
+        feature_version=dataset.feature_version,
+        label_version=dataset.label_version,
+        algorithm="dixon-coles",
+        parameters={"rho": -0.12, "max_goals": 11},
+        code_version="git:test",
+        environment_version="python:test-lock",
+        started_at=observed_at,
+        ended_at=observed_at,
+        random_seed=17,
+        model_artifact_refs=(model_ref,),
+        evaluation_cohort=(holdout.sample_id,),
+        evaluation_capture_mode=CaptureMode.RECONSTRUCTED,
+        output_refs=(output_ref,),
+        output_hashes=(output_ref.removeprefix(MODEL_OUTPUT_REF_PREFIX),),
+    )
+    training.write_model_run(model_run)
+    context = context_contribution(context_value, source_ref=context_ref)
+
+    class _ContributionSourceValidator:
+        def validate_snapshot_source(self, source_ref: str) -> SnapshotSourceValidation:
+            return SnapshotSourceValidation(
+                source_ref=source_ref,
+                source_kind="derived",
+                transform_version="lineup-delta-input/3",
+                observed_at=observed_at,
+                value=delta_value,
+                input_refs=(lineup_asset.id.value,),
+            )
+
+    lineup = lineup_delta_contributions(
+        delta_value,
+        home_team_id=teams[0].id.value,
+        away_team_id=teams[1].id.value,
+        source_ref=delta_ref,
+        source_validator=_ContributionSourceValidator(),
+    )
+    composition = compose_expected_goals(
+        lambda_home,
+        lambda_away,
+        (context, *lineup),
+    )
+    prediction = build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=archive,
+        model_run_id=ModelRunId(model_run.model_run_id),
+        model_version=model_run.model_version,
+        generated_at=observed_at,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
+        rho=-0.12,
+        max_goals=11,
+        input_refs=(),
+        model_run_validator=training,
+        expected_goals=composition,
+    )
+    archive.model_run_validator = training
+    archive.write_prediction(prediction, snapshot=snapshot)
+    return snapshot, archive, prediction
 
 
 class _ModelRunRegistry:
@@ -313,7 +701,7 @@ def test_prediction_schema_has_one_coordinate_explicit_normalized_grid(tmp_path:
     prediction = _prediction(_snapshot(tmp_path))
     payload = prediction_payload(prediction)
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert len(payload["score_cells"]) == 144
     assert len({(cell["home_goals"], cell["away_goals"]) for cell in payload["score_cells"]}) == 144
     assert sum(cell["probability"] for cell in payload["score_cells"]) == pytest.approx(1.0)
@@ -321,51 +709,27 @@ def test_prediction_schema_has_one_coordinate_explicit_normalized_grid(tmp_path:
 
 
 def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_path: Path) -> None:
-    snapshot, validator = _snapshot(tmp_path)
+    snapshot, archive, prediction, model_run = _persisted_prediction_fixture(tmp_path)
     context_source_ref = next(
         feature.source_ref for feature in snapshot.features if feature.name == "match_context"
-    )
-    composition = compose_expected_goals(
-        1.7,
-        0.8,
-        (
-            ExpectedGoalsContribution(
-                contribution_key="context:rest-days:calibration/1",
-                lambda_home_multiplier=1.02,
-                lambda_away_multiplier=0.98,
-                source_ref=context_source_ref,
-                version="calibration/1",
-            ),
-        ),
-    )
-    prediction = build_score_prediction(
-        snapshot=snapshot,
-        snapshot_validator=validator,
-        model_run_id=DEFAULT_MODEL_RUN_ID,
-        model_version="dixon-coles/1",
-        generated_at=GENERATED_AT,
-        lambda_home=composition.lambda_home,
-        lambda_away=composition.lambda_away,
-        rho=-0.12,
-        max_goals=11,
-        input_refs=("derived-source:baseline",),
-        expected_goals=composition,
-        calibration_versions=("calibration/1",),
     )
 
     payload = prediction_payload(prediction)
     assert payload["baseline_lambda_home"] == pytest.approx(1.7)
     assert payload["baseline_lambda_away"] == pytest.approx(0.8)
-    assert payload["contribution_keys"] == ["context:rest-days:calibration/1"]
-    assert payload["contribution_multipliers"][0]["lambda_home_multiplier"] == pytest.approx(1.02)
-    assert payload["composition_version"] == composition.composition_version
-    assert payload["calibration_versions"] == ["calibration/1"]
+    assert payload["contribution_keys"] == ["context:rest-days:match-context-calibration/1"]
+    assert payload["contribution_multipliers"][0]["lambda_home_multiplier"] == pytest.approx(
+        math.exp(0.02)
+    )
+    assert payload["contribution_multipliers"][0]["calibration"][
+        "lambda_home_coefficient"
+    ] == pytest.approx(0.02)
+    assert payload["composition_version"] == prediction.composition_version
+    assert payload["calibration_versions"] == ["match-context-calibration/1"]
     assert prediction.composition_artifact_ref.startswith("score-grid-composition:")
-    assert DEFAULT_MODEL_RUN_ID.value in prediction.input_refs
+    assert model_run.model_run_id in prediction.input_refs
     assert context_source_ref in snapshot.input_refs
-    assert "derived-source:baseline" in prediction.input_refs
 
-    archive = validator
     composition_path = archive.write_score_grid_composition(prediction)
     assert composition_path == archive.score_grid_composition_path(
         prediction.composition_artifact_ref
@@ -379,24 +743,120 @@ def test_prediction_persists_expected_goals_provenance_and_grid_manifest(tmp_pat
     ] == pytest.approx(-0.12)
 
 
+def test_verified_prediction_loader_rejects_rehashed_baseline_forgery(
+    tmp_path: Path,
+) -> None:
+    snapshot, archive, prediction, _ = _persisted_prediction_fixture(tmp_path)
+    archive.write_prediction(prediction, snapshot=snapshot)
+
+    forged_ref = forge_persisted_prediction(
+        archive.layout,
+        prediction.id.value,
+        lambda payload: payload.__setitem__(
+            "baseline_lambda_home", payload["baseline_lambda_home"] * 2
+        ),
+    )
+
+    with pytest.raises(TrainingArtifactConflict, match="baseline.*snapshot"):
+        TrainingArtifactStore(archive.layout).load_verified_prediction(forged_ref)
+
+
+def test_verified_prediction_loader_rejects_rehashed_calibration_forgery(
+    tmp_path: Path,
+) -> None:
+    snapshot, archive, prediction, _ = _persisted_prediction_fixture(tmp_path)
+    archive.write_prediction(prediction, snapshot=snapshot)
+
+    def mutate(payload: dict) -> None:
+        payload["contribution_multipliers"][0]["calibration"]["lambda_home_coefficient"] = 0.03
+
+    forged_ref = forge_persisted_prediction(
+        archive.layout,
+        prediction.id.value,
+        mutate,
+    )
+
+    with pytest.raises(TrainingArtifactConflict, match="calibration policy"):
+        TrainingArtifactStore(archive.layout).load_verified_prediction(forged_ref)
+
+
+def test_verified_prediction_loader_rejects_rehashed_ready_lineup_omission(
+    tmp_path: Path,
+) -> None:
+    _, archive, prediction = _persisted_ready_lineup_prediction_fixture(tmp_path)
+    omitted_key = next(key for key in prediction.contribution_keys if key.startswith("lineup:"))
+
+    def mutate(payload: dict) -> None:
+        payload["contribution_multipliers"] = [
+            item
+            for item in payload["contribution_multipliers"]
+            if item["contribution_key"] != omitted_key
+        ]
+
+    forged_ref = forge_persisted_prediction(
+        archive.layout,
+        prediction.id.value,
+        mutate,
+    )
+
+    with pytest.raises(TrainingArtifactConflict, match="contribution set"):
+        TrainingArtifactStore(archive.layout).load_verified_prediction(forged_ref)
+
+
+def test_formal_prediction_rejects_legacy_inline_lambdas(tmp_path: Path) -> None:
+    snapshot, validator = _snapshot(tmp_path)
+
+    with pytest.raises(ValueError, match="legacy-inline/1 is read-only"):
+        build_score_prediction(
+            snapshot=snapshot,
+            snapshot_validator=validator,
+            model_run_id=DEFAULT_MODEL_RUN_ID,
+            model_version="dixon-coles/1",
+            generated_at=GENERATED_AT,
+            lambda_home=1.7,
+            lambda_away=0.8,
+            rho=-0.12,
+            max_goals=11,
+            input_refs=(),
+        )
+
+
+def test_calibration_version_rejects_unreviewed_parameter_change(tmp_path: Path) -> None:
+    snapshot, _ = _snapshot(tmp_path)
+
+    with pytest.raises(ValueError, match="coefficient|calibration"):
+        _composition(snapshot, coefficient=0.03)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("lambda_home_coefficient", 0.03),
+        ("reference_value", 4.0),
+        ("maximum_log_multiplier", 0.10),
+    ),
+)
+def test_prediction_loader_rejects_tampered_calibration_parameters(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    snapshot, validator = _snapshot(tmp_path)
+    payload = prediction_payload(_prediction((snapshot, validator)))
+    payload["contribution_multipliers"][0]["calibration"][field] = value
+
+    with pytest.raises(ValueError, match="calibration|composition_artifact_ref|canonical"):
+        parse_prediction_payload(
+            payload,
+            snapshot=snapshot,
+            snapshot_validator=validator,
+        )
+
+
 def test_prediction_rejects_contribution_source_outside_verified_snapshot(tmp_path: Path) -> None:
     snapshot, validator = _snapshot(tmp_path)
     feature_source_refs = {feature.source_ref for feature in snapshot.features}
     nested_raw_ref = next(ref for ref in snapshot.input_refs if ref not in feature_source_refs)
     for invalid_source_ref in (nested_raw_ref, "derived-source:" + "f" * 64):
-        composition = compose_expected_goals(
-            1.7,
-            0.8,
-            (
-                ExpectedGoalsContribution(
-                    contribution_key="context:rest-days:calibration/1",
-                    lambda_home_multiplier=1.02,
-                    lambda_away_multiplier=0.98,
-                    source_ref=invalid_source_ref,
-                    version="calibration/1",
-                ),
-            ),
-        )
+        composition = _composition(snapshot, context_source_ref=invalid_source_ref)
 
         with pytest.raises(ValueError, match="verified snapshot feature sources"):
             build_score_prediction(
@@ -416,33 +876,19 @@ def test_prediction_rejects_contribution_source_outside_verified_snapshot(tmp_pa
 
 def test_prediction_archive_rejects_forged_contribution_lineage(tmp_path: Path) -> None:
     snapshot, archive = _snapshot(tmp_path)
-    context_source_ref = next(
-        feature.source_ref for feature in snapshot.features if feature.name == "match_context"
-    )
+    composition = _composition(snapshot)
     prediction = build_score_prediction(
         snapshot=snapshot,
         snapshot_validator=archive,
         model_run_id=DEFAULT_MODEL_RUN_ID,
         model_version="dixon-coles/1",
         generated_at=GENERATED_AT,
-        lambda_home=1.7 * 1.02,
-        lambda_away=0.8 * 0.98,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
         rho=-0.12,
         max_goals=11,
         input_refs=("baseline:v1",),
-        expected_goals=compose_expected_goals(
-            1.7,
-            0.8,
-            (
-                ExpectedGoalsContribution(
-                    contribution_key="context:rest-days:calibration/1",
-                    lambda_home_multiplier=1.02,
-                    lambda_away_multiplier=0.98,
-                    source_ref=context_source_ref,
-                    version="calibration/1",
-                ),
-            ),
-        ),
+        expected_goals=composition,
     )
     feature_source_refs = {feature.source_ref for feature in snapshot.features}
     nested_raw_ref = next(ref for ref in snapshot.input_refs if ref not in feature_source_refs)
@@ -461,8 +907,7 @@ def test_prediction_archive_rejects_forged_contribution_lineage(tmp_path: Path) 
 
 
 def test_prediction_composition_bytes_are_tamper_evident(tmp_path: Path) -> None:
-    snapshot, archive = _snapshot(tmp_path)
-    prediction = _prediction((snapshot, archive))
+    snapshot, archive, prediction, _ = _persisted_prediction_fixture(tmp_path)
     archive.write_prediction(prediction, snapshot=snapshot)
     path = archive.score_grid_composition_path(prediction.composition_artifact_ref)
     tampered = json.loads(path.read_text(encoding="utf-8"))
@@ -667,9 +1112,68 @@ def test_brier_and_log_loss_use_known_toy_values(tmp_path: Path) -> None:
     )
 
 
+def test_evaluation_record_v2_is_replayable_and_rejects_synthetic_benchmark(
+    tmp_path: Path,
+) -> None:
+    prediction = _prediction(_snapshot(tmp_path))
+    evaluation = evaluate_prediction(
+        prediction,
+        MatchResult90(MATCH, 2, 1, GENERATED_AT, "canonical:result"),
+        evaluated_at=datetime(2025, 8, 17, tzinfo=UTC),
+        sample_ref="sample:test",
+    )
+    payload = evaluation_record_payload(evaluation)
+
+    assert payload["schema_version"] == 2
+    assert payload["record_type"] == "evaluation-record"
+    assert parse_evaluation_record_payload(payload) == evaluation
+
+    tampered_score = copy.deepcopy(payload)
+    tampered_score["result_brier"] += 0.1
+    with pytest.raises(ValueError, match="result_brier is not reproducible"):
+        parse_evaluation_record_payload(tampered_score)
+
+    synthetic = copy.deepcopy(payload)
+    probabilities = {"home": 0.5, "draw": 0.3, "away": 0.2}
+    synthetic["market_benchmark"] = {
+        "available": True,
+        "brier": multiclass_brier(probabilities, "home"),
+        "log_loss": categorical_log_loss(probabilities, "home"),
+        "reason": None,
+        "probabilities": [list(item) for item in probabilities.items()],
+        "data_kind": "synthetic",
+    }
+    with pytest.raises(ValueError, match="benchmark must be real"):
+        parse_evaluation_record_payload(synthetic)
+
+    real_without_lineage = replace(
+        evaluation,
+        market_benchmark=BenchmarkScore(
+            available=True,
+            brier=multiclass_brier(probabilities, "home"),
+            log_loss=categorical_log_loss(probabilities, "home"),
+            reason=None,
+            probabilities=tuple(probabilities.items()),
+            data_kind="real",
+        ),
+    )
+    with pytest.raises(ValueError, match="market snapshot and raw evidence refs"):
+        evaluation_record_payload(real_without_lineage)
+
+    archive = DerivedArchive(DataLayout(tmp_path / "invalid-evaluation-write"))
+    with pytest.raises(TypeError, match="EvaluationRecord"):
+        archive.write_evaluation(payload)
+    with pytest.raises(ValueError, match="result_brier is not reproducible"):
+        archive.write_evaluation(replace(evaluation, result_brier=evaluation.result_brier + 0.1))
+    with pytest.raises(ValueError, match="generated_at must equal evaluated_at"):
+        archive.write_evaluation(
+            evaluation,
+            generated_at=evaluation.evaluated_at + timedelta(seconds=1),
+        )
+
+
 def test_prediction_archive_never_mixes_batches_or_market_objects(tmp_path: Path) -> None:
-    snapshot, archive = _snapshot(tmp_path)
-    prediction = _prediction((snapshot, archive))
+    snapshot, archive, prediction, _ = _persisted_prediction_fixture(tmp_path)
 
     first = archive.write_prediction(prediction, snapshot=snapshot)
     second = archive.write_prediction(prediction, snapshot=snapshot)
@@ -680,15 +1184,7 @@ def test_prediction_archive_never_mixes_batches_or_market_objects(tmp_path: Path
 
 
 def test_prediction_archive_optionally_requires_a_valid_model_run(tmp_path: Path) -> None:
-    artifact = _model_run()
-    registry = _ModelRunRegistry(artifact)
-    snapshot, archive = _snapshot(tmp_path)
-    prediction = _prediction(
-        (snapshot, archive),
-        model_run_id=ModelRunId(artifact.model_run_id),
-        model_run_validator=registry,
-    )
-    archive.model_run_validator = registry
+    snapshot, archive, prediction, artifact = _persisted_prediction_fixture(tmp_path)
 
     archive.write_prediction(prediction, snapshot=snapshot)
     assert archive.load_prediction_payload(prediction)["model_run_id"] == artifact.model_run_id
@@ -949,22 +1445,7 @@ def test_prediction_loader_rejects_unknown_or_tampered_schema(tmp_path: Path) ->
 
 def test_prediction_loader_rejects_contribution_source_outside_snapshot(tmp_path: Path) -> None:
     snapshot, validator = _snapshot(tmp_path)
-    context_source_ref = next(
-        feature.source_ref for feature in snapshot.features if feature.name == "match_context"
-    )
-    composition = compose_expected_goals(
-        1.7,
-        0.8,
-        (
-            ExpectedGoalsContribution(
-                contribution_key="context:rest-days:calibration/1",
-                lambda_home_multiplier=1.02,
-                lambda_away_multiplier=0.98,
-                source_ref=context_source_ref,
-                version="calibration/1",
-            ),
-        ),
-    )
+    composition = _composition(snapshot)
     prediction = build_score_prediction(
         snapshot=snapshot,
         snapshot_validator=validator,
@@ -977,7 +1458,7 @@ def test_prediction_loader_rejects_contribution_source_outside_snapshot(tmp_path
         max_goals=11,
         input_refs=("baseline:v1",),
         expected_goals=composition,
-        calibration_versions=("calibration/1",),
+        calibration_versions=composition.calibration_versions,
     )
     payload = prediction_payload(prediction)
     unrelated_source_ref = "derived-source:" + "f" * 64

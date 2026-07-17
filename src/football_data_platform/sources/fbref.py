@@ -51,6 +51,7 @@ class ScheduleParseResult:
     matches: tuple[ScheduleMatch, ...]
     diagnostics: tuple[ParseDiagnostic, ...]
     rows_seen: int
+    fixture_known_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +123,7 @@ class _ScheduleTableParser(HTMLParser):
         self.current_cell: _Cell | None = None
         self.current_stat: str | None = None
         self.rows: list[dict[str, _Cell]] = []
+        self.fixture_known_at_values: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -129,6 +131,9 @@ class _ScheduleTableParser(HTMLParser):
             table_id = attributes.get("id") or ""
             if table_id.startswith("sched_"):
                 self.in_schedule_table = True
+                fixture_known_at = attributes.get("data-fdp-fixture-known-at")
+                if fixture_known_at:
+                    self.fixture_known_at_values.append(fixture_known_at)
         elif self.in_schedule_table and tag == "tr":
             self.current_row = {}
         elif self.in_schedule_table and self.current_row is not None and tag in {"td", "th"}:
@@ -302,7 +307,28 @@ def parse_schedule(
         diagnostics.append(
             ParseDiagnostic("schedule_table_missing", "no FBref schedule table found")
         )
-    return ScheduleParseResult(tuple(matches), tuple(diagnostics), len(table_parser.rows))
+    return ScheduleParseResult(
+        tuple(matches),
+        tuple(diagnostics),
+        len(table_parser.rows),
+        _fixture_known_at(table_parser.fixture_known_at_values),
+    )
+
+
+def _fixture_known_at(values: list[str]) -> datetime | None:
+    """Parse optional replay metadata carried by the bundled schedule fixture."""
+
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise ValueError("schedule fixture has conflicting known-at metadata")
+    try:
+        value = datetime.fromisoformat(values[0].replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("schedule fixture known-at metadata must be an ISO timestamp") from error
+    if value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0:
+        raise ValueError("schedule fixture known-at metadata must use UTC")
+    return value.astimezone(UTC)
 
 
 def _parse_row(

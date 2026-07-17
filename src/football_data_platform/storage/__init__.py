@@ -11,6 +11,7 @@ from football_data_platform.storage.governance import (
     GovernanceArtifactConflict,
     GovernanceArtifactStore,
     parse_challenger_evidence_payload,
+    parse_evaluation_comparison_payload,
     parse_promotion_decision_payload,
     parse_promotion_policy_payload,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "parse_training_dataset_payload",
     "parse_paper_bet_entry_payload",
     "parse_challenger_evidence_payload",
+    "parse_evaluation_comparison_payload",
     "parse_promotion_decision_payload",
     "parse_promotion_policy_payload",
 ]

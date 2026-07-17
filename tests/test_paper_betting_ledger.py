@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -7,9 +8,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _prediction_forgery import forge_persisted_prediction
 from _training_refs import seed_training_references
 
-from football_data_platform.domain.ids import MatchId, ModelRunId, RawAssetId, TeamId
+from football_data_platform.domain.ids import (
+    MatchId,
+    ModelRunId,
+    PredictionId,
+    RawAssetId,
+)
 from football_data_platform.domain.ledger import (
     CandidateDecision,
     PaperBetEntry,
@@ -17,6 +24,7 @@ from football_data_platform.domain.ledger import (
     SettlementOutcome,
     SettlementRules,
     compute_settlement,
+    paper_bet_entry_payload,
 )
 from football_data_platform.domain.predictions import (
     MarketDataKind,
@@ -37,32 +45,26 @@ from football_data_platform.domain.training import (
     TrainingDatasetManifest,
     TrainingSample,
 )
-from football_data_platform.features.contributions import compose_expected_goals
+from football_data_platform.features.contributions import (
+    compose_expected_goals,
+    context_contribution,
+)
 from football_data_platform.features.team_baseline import (
     TeamMatchProcess,
     build_team_baseline,
     team_baseline_payload,
 )
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive
+from football_data_platform.storage.facts import load_verified_match_result
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.ledger import LedgerConflictError, PaperBetLedger
 from football_data_platform.storage.raw import RawArchive
 from football_data_platform.storage.training import TrainingArtifactStore
 
 MATCH = MatchId("match:paper-ledger")
-HOME = TeamId("team:paper-ledger-home")
-AWAY = TeamId("team:paper-ledger-away")
 KICKOFF = datetime(2025, 8, 17, 12, tzinfo=UTC)
 AS_OF = KICKOFF - timedelta(hours=24)
-
-
-class _ResultRegistry:
-    def __init__(self, expected: MatchResult90) -> None:
-        self.expected = expected
-
-    def verify_match_result(self, result: MatchResult90) -> None:
-        if result != self.expected:
-            raise ValueError("unknown canonical result")
 
 
 class _MissingModelRunRegistry:
@@ -74,6 +76,20 @@ def _fixture(tmp_path: Path):
     layout = DataLayout(tmp_path / "data")
     raw = RawArchive(layout)
     derived = DerivedArchive(layout)
+    _, settlement_result_ref = seed_training_references(
+        layout,
+        label_known_at=AS_OF + timedelta(days=1),
+        home_goals=2,
+        away_goals=1,
+        reference_key="paper-ledger-settlement",
+    )
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    settlement_result = load_verified_match_result(
+        settlement_result_ref,
+        archive=raw,
+        canonical=canonical,
+    )
+    canonical_match = canonical.match(settlement_result.match_id)
     evidence = raw.archive(
         b"paper ledger baseline evidence",
         source="test-source",
@@ -88,8 +104,8 @@ def _fixture(tmp_path: Path):
         (
             TeamMatchProcess(
                 "paper-ledger-match",
-                HOME.value,
-                AWAY.value,
+                canonical_match.home_team_id.value,
+                canonical_match.away_team_id.value,
                 AS_OF - timedelta(days=30),
                 AS_OF - timedelta(days=1),
                 1.7,
@@ -122,7 +138,7 @@ def _fixture(tmp_path: Path):
         generated_at=AS_OF,
     )
     snapshot = build_snapshot(
-        match_id=MATCH,
+        match_id=settlement_result.match_id,
         match_version=1,
         snapshot_type=SnapshotType.T24H,
         as_of=AS_OF,
@@ -144,13 +160,28 @@ def _fixture(tmp_path: Path):
                 "context:rest-days",
             ),
         ),
-        home_team_id=HOME,
-        away_team_id=AWAY,
+        home_team_id=canonical_match.home_team_id,
+        away_team_id=canonical_match.away_team_id,
         source_validator=derived,
     )
     derived.write_snapshot(snapshot)
     training = TrainingArtifactStore(layout)
-    _, label_ref = seed_training_references(layout)
+    _, training_label_ref = seed_training_references(
+        layout,
+        label_known_at=AS_OF - timedelta(days=1),
+        observed_at=AS_OF,
+        home_goals=1,
+        away_goals=0,
+        reference_key="paper-ledger-training",
+    )
+    _, holdout_label_ref = seed_training_references(
+        layout,
+        label_known_at=AS_OF - timedelta(hours=1),
+        observed_at=AS_OF,
+        home_goals=2,
+        away_goals=1,
+        reference_key="paper-ledger-holdout",
+    )
     train_sample = TrainingSample(
         sample_id="sample:paper-ledger-train",
         as_of=AS_OF - timedelta(days=2),
@@ -161,24 +192,24 @@ def _fixture(tmp_path: Path):
         qualification_passed=True,
         feature_version="score-features/1",
         label_version="result-90/1",
-        feature_refs=tuple(sorted((baseline.artifact_id, evidence.id.value))),
-        label_ref=label_ref,
+        feature_refs=(evidence.id.value,),
+        label_ref=training_label_ref,
         features={"home_strength": 1.7, "away_strength": 0.8},
         label={"home_goals": 1, "away_goals": 0},
         split="train",
     )
     holdout_sample = TrainingSample(
         sample_id="sample:paper-ledger-holdout",
-        as_of=AS_OF,
-        feature_known_at=AS_OF - timedelta(hours=1),
-        label_known_at=AS_OF + timedelta(days=1),
+        as_of=AS_OF - timedelta(hours=2),
+        feature_known_at=AS_OF - timedelta(hours=3),
+        label_known_at=AS_OF - timedelta(hours=1),
         capture_mode=CaptureMode.RECONSTRUCTED,
         qualification="score-model-ready",
         qualification_passed=True,
         feature_version="score-features/1",
         label_version="result-90/1",
-        feature_refs=tuple(sorted((baseline.artifact_id, snapshot.id.value))),
-        label_ref=label_ref,
+        feature_refs=(evidence.id.value,),
+        label_ref=holdout_label_ref,
         features={"home_strength": 1.7, "away_strength": 0.8},
         label={"home_goals": 2, "away_goals": 1},
         split="holdout",
@@ -193,7 +224,7 @@ def _fixture(tmp_path: Path):
         as_of=AS_OF,
         split_strategy="forward-chaining/1",
         samples=(train_sample, holdout_sample),
-        generated_at=AS_OF + timedelta(days=1),
+        generated_at=AS_OF,
         code_version="git:test",
     )
     training.write_dataset(dataset)
@@ -210,8 +241,8 @@ def _fixture(tmp_path: Path):
         parameters={"rho": -0.1, "max_goals": 11},
         code_version="git:test",
         environment_version="python:test-lock",
-        started_at=AS_OF - timedelta(seconds=2),
-        ended_at=AS_OF - timedelta(seconds=1),
+        started_at=AS_OF,
+        ended_at=AS_OF,
         random_seed=17,
         model_artifact_refs=(model_ref,),
         evaluation_cohort=(holdout_sample.sample_id,),
@@ -221,18 +252,26 @@ def _fixture(tmp_path: Path):
     )
     training.write_model_run(model_run)
     derived.model_run_validator = training
+    context_feature = next(
+        feature for feature in snapshot.features if feature.name == "match_context"
+    )
+    composition = compose_expected_goals(
+        1.7,
+        0.8,
+        (context_contribution(context_feature.value, source_ref=context_feature.source_ref),),
+    )
     prediction = build_score_prediction(
         snapshot=snapshot,
         snapshot_validator=derived,
         model_run_id=ModelRunId(model_run.model_run_id),
         model_version="dixon-coles/paper-ledger",
         generated_at=AS_OF,
-        lambda_home=1.7,
-        lambda_away=0.8,
+        lambda_home=composition.lambda_home,
+        lambda_away=composition.lambda_away,
         rho=-0.1,
         max_goals=11,
         input_refs=(),
-        expected_goals=compose_expected_goals(1.7, 0.8),
+        expected_goals=composition,
     )
     derived.write_prediction(prediction, snapshot=snapshot)
     market_asset = raw.archive(
@@ -246,7 +285,7 @@ def _fixture(tmp_path: Path):
         media_type="application/json",
     )
     market = build_market_snapshot(
-        match_id=MATCH,
+        match_id=settlement_result.match_id,
         market_type="result_90",
         status=MarketStatus.OPEN,
         data_kind=MarketDataKind.REAL,
@@ -257,7 +296,7 @@ def _fixture(tmp_path: Path):
         ),
         raw_asset=market_asset,
     )
-    return layout, raw, prediction, market
+    return layout, raw, prediction, market, settlement_result
 
 
 def test_settlement_rules_compute_all_supported_outcomes() -> None:
@@ -328,10 +367,10 @@ def test_settlement_rules_compute_all_supported_outcomes() -> None:
 def test_invalid_market_is_recorded_as_zero_stake_and_retry_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     asset = raw.load(RawAssetId(market.raw_asset_ref))
     synthetic = build_market_snapshot(
-        match_id=MATCH,
+        match_id=prediction.match_id,
         market_type="result_90",
         status=MarketStatus.OPEN,
         data_kind=MarketDataKind.SYNTHETIC,
@@ -367,7 +406,7 @@ def test_future_non_open_or_incomplete_market_never_creates_a_position(
     tmp_path: Path,
     invalid_kind: str,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     asset = raw.load(RawAssetId(market.raw_asset_ref))
     status = MarketStatus.OPEN
     quotes = market.quotes
@@ -387,7 +426,7 @@ def test_future_non_open_or_incomplete_market_never_creates_a_position(
     else:
         quotes = market.quotes[:2]
     invalid_market = build_market_snapshot(
-        match_id=MATCH,
+        match_id=prediction.match_id,
         market_type="result_90",
         status=status,
         data_kind=MarketDataKind.REAL,
@@ -415,7 +454,7 @@ def test_future_non_open_or_incomplete_market_never_creates_a_position(
 
 
 def test_exposure_is_recomputed_and_cannot_be_underreported(tmp_path: Path) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     ledger = PaperBetLedger(layout, market_source_validator=raw)
     common = {
         "prediction": prediction,
@@ -448,13 +487,13 @@ def test_exposure_is_recomputed_and_cannot_be_underreported(tmp_path: Path) -> N
         candidate_id="third-candidate",
     )
     assert correct.decision is CandidateDecision.ACCEPTED
-    assert ledger.recompute().match_exposure_map() == {MATCH.value: 20}
+    assert ledger.recompute().match_exposure_map() == {prediction.match_id.value: 20}
 
 
 def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
     tmp_path: Path,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, result = _fixture(tmp_path)
     ledger = PaperBetLedger(layout, market_source_validator=raw)
     entry = PaperBetEntry.accepted(
         prediction=prediction,
@@ -474,11 +513,11 @@ def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
     open_summary = ledger.recompute(initial_bankroll=100)
     assert open_summary.balance == 90
     assert open_summary.open_stake == 10
-    assert open_summary.match_exposure_map() == {MATCH.value: 10}
+    assert open_summary.match_exposure_map() == {prediction.match_id.value: 10}
 
     settled = ledger.settle(
         entry,
-        MatchResult90(MATCH, 2, 1, AS_OF + timedelta(days=1), "canonical:result"),
+        result,
         settled_at=AS_OF + timedelta(days=1, hours=1),
     )
     assert settled.revision == 2
@@ -513,7 +552,7 @@ def test_accepted_entry_settlement_is_an_append_only_revision_and_recomputable(
 def test_retry_repairs_entry_when_derived_registration_failed_after_append(
     tmp_path: Path,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     ledger = PaperBetLedger(layout, market_source_validator=raw)
     entry = PaperBetEntry.accepted(
         prediction=prediction,
@@ -545,21 +584,14 @@ def test_retry_repairs_entry_when_derived_registration_failed_after_append(
     assert (layout.paper_ledger / "latest.json").is_file()
 
 
-def test_ledger_can_require_canonical_result_evidence_for_settlement_and_load(
+def test_default_ledger_requires_canonical_result_evidence_for_settlement_and_load(
     tmp_path: Path,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
-    result = MatchResult90(
-        MATCH,
-        2,
-        1,
-        AS_OF + timedelta(days=1),
-        "fact:match_results_90:" + "a" * 64,
-    )
+    layout, raw, prediction, market, result = _fixture(tmp_path)
     ledger = PaperBetLedger(
         layout,
         market_source_validator=raw,
-        result_validator=_ResultRegistry(result),
+        result_validator=None,
     )
     entry = PaperBetEntry.accepted(
         prediction=prediction,
@@ -575,12 +607,18 @@ def test_ledger_can_require_canonical_result_evidence_for_settlement_and_load(
     )
     ledger.append(entry)
 
-    with pytest.raises(ValueError, match="result source evidence"):
-        ledger.settle(
-            entry,
-            replace(result, source_ref="canonical:forged"),
-            settled_at=AS_OF + timedelta(days=1, hours=1),
-        )
+    tampers = (
+        replace(result, source_ref="canonical:forged"),
+        replace(result, home_goals=result.home_goals + 1),
+        replace(result, known_at=result.known_at + timedelta(seconds=1)),
+    )
+    for tampered in tampers:
+        with pytest.raises(ValueError, match="result source evidence"):
+            ledger.settle(
+                entry,
+                tampered,
+                settled_at=AS_OF + timedelta(days=1, hours=1),
+            )
 
     settled = ledger.settle(
         entry,
@@ -589,18 +627,51 @@ def test_ledger_can_require_canonical_result_evidence_for_settlement_and_load(
     )
     assert ledger.load(settled.entry_id) == settled
 
+    canonical = CanonicalStore(layout.canonical / "platform.sqlite3")
+    with canonical.connect() as connection:
+        row = connection.execute(
+            "SELECT raw_asset_id FROM match_results_90 WHERE record_id = ?",
+            (result.source_ref,),
+        ).fetchone()
+    assert row is not None
+    result_asset = raw.load(RawAssetId(row["raw_asset_id"]))
+    layout.raw_object_path(result_asset.checksum).unlink()
     with pytest.raises(ValueError, match="result source evidence"):
-        PaperBetLedger(
-            layout,
-            market_source_validator=raw,
-            result_validator=_ResultRegistry(replace(result, home_goals=3)),
-        ).load(settled.entry_id)
+        PaperBetLedger(layout, market_source_validator=raw).load(settled.entry_id)
+
+
+def test_default_ledger_allows_void_settlement_without_a_result(tmp_path: Path) -> None:
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
+    ledger = PaperBetLedger(layout, market_source_validator=raw)
+    entry = PaperBetEntry.accepted(
+        prediction=prediction,
+        market_snapshot=market,
+        market_source_validator=raw,
+        selection="home",
+        risk_config=RiskConfig(),
+        stake=10,
+        match_exposure=10,
+        daily_exposure=10,
+        placed_at=AS_OF,
+        settlement_rules=SettlementRules(selection="home", void_if_no_result=True),
+    )
+    ledger.append(entry)
+
+    settled = ledger.settle(
+        entry,
+        None,
+        settled_at=AS_OF + timedelta(days=1, hours=1),
+    )
+
+    assert settled.result is None
+    assert settled.settlement_outcome is SettlementOutcome.VOID
+    assert PaperBetLedger(layout).load(settled.entry_id) == settled
 
 
 def test_ledger_rejects_entries_that_reference_an_unavailable_model_run(
     tmp_path: Path,
 ) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     accepted_arguments = {
         "prediction": prediction,
         "market_snapshot": market,
@@ -638,7 +709,7 @@ def test_ledger_rejects_entries_that_reference_an_unavailable_model_run(
 
 
 def test_default_ledger_rejects_missing_prediction_or_model_bytes(tmp_path: Path) -> None:
-    layout, raw, prediction, market = _fixture(tmp_path)
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
     entry = PaperBetEntry.accepted(
         prediction=prediction,
         market_snapshot=market,
@@ -652,12 +723,15 @@ def test_default_ledger_rejects_missing_prediction_or_model_bytes(tmp_path: Path
         settlement_rules=SettlementRules(selection="home"),
     )
     ledger = PaperBetLedger(layout, market_source_validator=raw)
-    prediction_path = ledger._prediction_path(prediction.id.value)
+    prediction_digest = prediction.id.value.removeprefix("prediction:")
+    prediction_path = (
+        layout.derived / "predictions" / prediction_digest[:2] / f"{prediction_digest}.json"
+    )
     prediction_path.unlink()
     with pytest.raises(ValueError, match="prediction artifact"):
         ledger.append(entry)
 
-    layout, raw, prediction, market = _fixture(tmp_path / "model")
+    layout, raw, prediction, market, _result = _fixture(tmp_path / "model")
     entry = PaperBetEntry.accepted(
         prediction=prediction,
         market_snapshot=market,
@@ -673,12 +747,53 @@ def test_default_ledger_rejects_missing_prediction_or_model_bytes(tmp_path: Path
     model_store = TrainingArtifactStore(layout)
     run = model_store.load_model_run(prediction.model_run_id.value)
     model_store.model_artifact_path(run.model_artifact_refs[0]).unlink()
-    with pytest.raises(ValueError, match="model artifact"):
+    with pytest.raises(ValueError, match="prediction artifact"):
         PaperBetLedger(layout, market_source_validator=raw).append(entry)
 
 
+def test_ledger_rejects_rehashed_semantic_prediction_forgery(tmp_path: Path) -> None:
+    layout, raw, prediction, market, _result = _fixture(tmp_path)
+    forged_ref = forge_persisted_prediction(
+        layout,
+        prediction.id.value,
+        lambda payload: payload.__setitem__(
+            "baseline_lambda_home", payload["baseline_lambda_home"] * 2
+        ),
+    )
+    entry = PaperBetEntry.accepted(
+        prediction=prediction,
+        market_snapshot=market,
+        market_source_validator=raw,
+        selection="home",
+        risk_config=RiskConfig(),
+        stake=10,
+        match_exposure=10,
+        daily_exposure=10,
+        placed_at=AS_OF,
+        settlement_rules=SettlementRules(selection="home"),
+    )
+    forged_entry = replace(entry, prediction_id=PredictionId(forged_ref))
+    identity = paper_bet_entry_payload(forged_entry, include_id=False)
+    entry_id = (
+        "paper-bet-entry:"
+        + hashlib.sha256(
+            json.dumps(
+                identity,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    forged_entry = replace(forged_entry, entry_id=entry_id)
+
+    with pytest.raises(ValueError, match="prediction artifact"):
+        PaperBetLedger(layout, market_source_validator=raw).append(forged_entry)
+
+
 def test_ledger_parser_rejects_bool_schema_version(tmp_path: Path) -> None:
-    layout, raw, prediction, _market = _fixture(tmp_path)
+    layout, raw, prediction, _market, _result = _fixture(tmp_path)
     ledger = PaperBetLedger(layout, market_source_validator=raw)
     entry = PaperBetEntry.rejected(
         prediction=prediction,

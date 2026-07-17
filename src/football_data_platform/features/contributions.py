@@ -14,12 +14,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from football_data_platform.domain.contributions import (
+    EXPECTED_GOALS_COMPOSITION_VERSION,
+    LINEUP_ATTACK_DIMENSIONS,
+    LINEUP_DEFENSE_DIMENSIONS,
+    LINEUP_DELTA_CALIBRATION_VERSION,
+    MATCH_CONTEXT_CALIBRATION_VERSION,
+    ContributionCalibration,
+    calibrated_multipliers,
+    validate_contribution_calibration_policy,
+    validate_generator_calibration_policy,
+)
 from football_data_platform.features.lineup import LINEUP_DELTA_INPUT_TRANSFORM_V3
 
-EXPECTED_GOALS_COMPOSITION_VERSION = "expected-goals-composition/1"
-EXPECTED_GOALS_CONTRIBUTION_VERSION = "expected-goals-contribution/1"
-LINEUP_CALIBRATION_VERSION = "lineup-delta-calibration/1"
-CONTEXT_CALIBRATION_VERSION = "match-context-calibration/1"
+EXPECTED_GOALS_CONTRIBUTION_VERSION = "expected-goals-contribution/2"
+LINEUP_CALIBRATION_VERSION = LINEUP_DELTA_CALIBRATION_VERSION
+CONTEXT_CALIBRATION_VERSION = MATCH_CONTEXT_CALIBRATION_VERSION
 
 
 class LineupDeltaSourceValidator(Protocol):
@@ -32,6 +42,7 @@ class ExpectedGoalsContribution:
     lambda_home_multiplier: float
     lambda_away_multiplier: float
     source_ref: str
+    calibration: ContributionCalibration
     version: str = EXPECTED_GOALS_CONTRIBUTION_VERSION
 
     def __post_init__(self) -> None:
@@ -47,6 +58,14 @@ class ExpectedGoalsContribution:
             raise ValueError("source_ref must be non-empty text")
         if not self.version or self.version.strip() != self.version:
             raise ValueError("version must be non-empty text")
+        validate_contribution_calibration_policy(self)
+        expected_home, expected_away = calibrated_multipliers(self.calibration)
+        if not math.isclose(
+            self.lambda_home_multiplier, expected_home, rel_tol=1e-12, abs_tol=1e-12
+        ) or not math.isclose(
+            self.lambda_away_multiplier, expected_away, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError("contribution multipliers do not match calibration parameters")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +107,7 @@ def apply_expected_goals_contributions(
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate expected-goals contribution key")
     for contribution in ordered:
+        validate_contribution_calibration_policy(contribution)
         lambda_home *= contribution.lambda_home_multiplier
         lambda_away *= contribution.lambda_away_multiplier
         if not math.isfinite(lambda_home) or not math.isfinite(lambda_away):
@@ -121,6 +141,10 @@ def compose_expected_goals(
     result = apply_expected_goals_contributions(
         baseline_lambda_home, baseline_lambda_away, contributions
     )
+    contribution_versions = tuple(sorted({item.version for item in result.contributions}))
+    requested_versions = tuple(sorted(set(calibration_versions)))
+    if requested_versions and requested_versions != contribution_versions:
+        raise ValueError("calibration_versions must match contribution calibration versions")
     return ExpectedGoals(
         lambda_home=result.lambda_home,
         lambda_away=result.lambda_away,
@@ -130,7 +154,7 @@ def compose_expected_goals(
         baseline_lambda_away=baseline_lambda_away,
         composition_version=EXPECTED_GOALS_COMPOSITION_VERSION,
         contributions=result.contributions,
-        calibration_versions=tuple(sorted(set(calibration_versions))),
+        calibration_versions=contribution_versions,
     )
 
 
@@ -159,6 +183,12 @@ def lineup_delta_contributions(
         raise ValueError("lineup contribution requires distinct match teams")
     _require_version(version)
     _require_source(source_ref)
+    policy = validate_generator_calibration_policy(
+        version,
+        source_feature_name="lineup_delta",
+        reference_value=0.0,
+        coefficient=coefficient,
+    )
     ready_payloads = tuple(
         payload
         for payload in deltas.values()
@@ -176,14 +206,6 @@ def lineup_delta_contributions(
         ):
             raise ValueError("ready lineup delta does not match its validated source")
     contributions: list[ExpectedGoalsContribution] = []
-    attack_dimensions = {"attack", "goals", "xg", "shots", "shots_on_target", "key_passes"}
-    defense_dimensions = {
-        "saves",
-        "defensive_actions",
-        "tackles",
-        "interceptions",
-        "clearances",
-    }
     for team_id, payload in sorted(deltas.items()):
         if team_id not in {home_team_id, away_team_id}:
             raise ValueError(f"lineup delta contains unknown team {team_id!r}")
@@ -201,26 +223,39 @@ def lineup_delta_contributions(
                 raise ValueError(f"lineup dimension {dimension!r} must be numeric")
             if not math.isfinite(float(raw_delta)):
                 raise ValueError(f"lineup dimension {dimension!r} must be finite")
-            if dimension in attack_dimensions:
-                home_multiplier, away_multiplier = (1.0, 1.0)
+            if dimension in LINEUP_ATTACK_DIMENSIONS:
+                home_coefficient, away_coefficient = (0.0, 0.0)
                 if team_id == home_team_id:
-                    home_multiplier = _bounded_exp(coefficient * float(raw_delta))
+                    home_coefficient = coefficient
                 else:
-                    away_multiplier = _bounded_exp(coefficient * float(raw_delta))
-            elif dimension in defense_dimensions:
-                home_multiplier, away_multiplier = (1.0, 1.0)
+                    away_coefficient = coefficient
+            elif dimension in LINEUP_DEFENSE_DIMENSIONS:
+                home_coefficient, away_coefficient = (0.0, 0.0)
                 if team_id == home_team_id:
-                    away_multiplier = _bounded_exp(-coefficient * float(raw_delta))
+                    away_coefficient = -coefficient
                 else:
-                    home_multiplier = _bounded_exp(-coefficient * float(raw_delta))
+                    home_coefficient = -coefficient
             else:
                 raise ValueError(f"unsupported lineup contribution dimension {dimension!r}")
+            calibration = ContributionCalibration(
+                source_feature_name="lineup_delta",
+                source_path=(team_id, "dimension_deltas", dimension),
+                source_value=float(raw_delta),
+                reference_value=0.0,
+                lambda_home_coefficient=home_coefficient,
+                lambda_away_coefficient=away_coefficient,
+                minimum_log_multiplier=policy.minimum_log_multiplier,
+                maximum_log_multiplier=policy.maximum_log_multiplier,
+                formula_version=policy.formula_version,
+            )
+            home_multiplier, away_multiplier = calibrated_multipliers(calibration)
             contributions.append(
                 ExpectedGoalsContribution(
                     contribution_key=f"lineup:{team_id}:{dimension}:{version}",
                     lambda_home_multiplier=home_multiplier,
                     lambda_away_multiplier=away_multiplier,
                     source_ref=source_ref,
+                    calibration=calibration,
                     version=version,
                 )
             )
@@ -249,24 +284,37 @@ def context_contribution(
         raise ValueError("coefficient must be finite and positive")
     if not math.isfinite(reference_rest_days) or reference_rest_days < 0:
         raise ValueError("reference_rest_days must be finite and non-negative")
+    policy = validate_generator_calibration_policy(
+        version,
+        source_feature_name="match_context",
+        reference_value=reference_rest_days,
+        coefficient=coefficient,
+    )
     raw_days = context.get("days_since_previous_match")
     if not isinstance(raw_days, (int, float)) or isinstance(raw_days, bool):
         raise ValueError("context requires numeric days_since_previous_match")
     if not math.isfinite(float(raw_days)) or float(raw_days) < 0:
         raise ValueError("days_since_previous_match must be finite and non-negative")
-    multiplier = _bounded_exp(coefficient * (float(raw_days) - reference_rest_days))
+    calibration = ContributionCalibration(
+        source_feature_name="match_context",
+        source_path=("days_since_previous_match",),
+        source_value=float(raw_days),
+        reference_value=reference_rest_days,
+        lambda_home_coefficient=coefficient,
+        lambda_away_coefficient=coefficient,
+        minimum_log_multiplier=policy.minimum_log_multiplier,
+        maximum_log_multiplier=policy.maximum_log_multiplier,
+        formula_version=policy.formula_version,
+    )
+    home_multiplier, away_multiplier = calibrated_multipliers(calibration)
     return ExpectedGoalsContribution(
         contribution_key=f"context:rest-days:{version}",
-        lambda_home_multiplier=multiplier,
-        lambda_away_multiplier=multiplier,
+        lambda_home_multiplier=home_multiplier,
+        lambda_away_multiplier=away_multiplier,
         source_ref=source_ref,
+        calibration=calibration,
         version=version,
     )
-
-
-def _bounded_exp(value: float) -> float:
-    # Keep the first calibrated layer intentionally conservative and finite.
-    return math.exp(max(-0.25, min(0.25, value)))
 
 
 def _require_version(value: str) -> None:

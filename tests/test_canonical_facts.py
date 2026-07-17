@@ -13,7 +13,7 @@ from football_data_platform.domain.models import MatchStatus
 from football_data_platform.domain.predictions import MatchResult90
 from football_data_platform.sources.prematch import SourceDescriptor, SourceKind, SourceRegistry
 from football_data_platform.storage.canonical import CanonicalStore
-from football_data_platform.storage.facts import CanonicalFactStore
+from football_data_platform.storage.facts import CanonicalFactStore, load_verified_match_result
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import RawArchive
 
@@ -124,6 +124,36 @@ def test_canonical_result_validator_matches_source_ref_and_payload(fact_context)
         facts.verify_match_result(replace(result, source_ref="canonical:forged"))
     with pytest.raises(ValueError, match="canonical fact"):
         facts.verify_match_result(replace(result, home_goals=3))
+
+
+def test_verified_result_rejects_backdated_fact_observation(fact_context) -> None:
+    canonical, facts, asset, _, match, version = fact_context
+    stored = facts.append_result_90(
+        match_id=match.id,
+        match_version=version.version,
+        home_goals=2,
+        away_goals=1,
+        known_at=NOW,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    backdated = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE match_results_90 SET observed_at = ? WHERE record_id = ?",
+            (backdated, stored.record_id),
+        )
+        connection.execute(
+            "UPDATE fact_evidence SET observed_at = ? WHERE record_id = ?",
+            (backdated, stored.record_id),
+        )
+
+    with pytest.raises(ValueError, match="observed_at does not match"):
+        load_verified_match_result(
+            stored.record_id,
+            archive=RawArchive(DataLayout(canonical.path.parents[1])),
+            canonical=canonical,
+        )
 
 
 def test_missing_is_preserved_and_readiness_explains_it(fact_context) -> None:

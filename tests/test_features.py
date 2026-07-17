@@ -8,7 +8,6 @@ import pytest
 
 from football_data_platform.features import player_profiles as profile_contract
 from football_data_platform.features.contributions import (
-    ExpectedGoalsContribution,
     apply_expected_goals_contributions,
     compose_expected_goals,
     context_contribution,
@@ -403,14 +402,16 @@ def test_profiles_do_not_mix_transfers_or_roles_and_exclude_future_facts() -> No
 
 
 def test_expected_goals_contributions_reject_double_counting() -> None:
-    injury = ExpectedGoalsContribution("player-x-unavailable", 0.9, 1.0, "event:1")
+    rest = context_contribution(
+        {"days_since_previous_match": 3.0}, source_ref="derived-source:context"
+    )
 
     with pytest.raises(ValueError, match="duplicate"):
-        apply_expected_goals_contributions(1.5, 1.0, (injury, injury))
+        apply_expected_goals_contributions(1.5, 1.0, (rest, rest))
 
-    expected = apply_expected_goals_contributions(1.5, 1.0, (injury,))
-    assert expected.lambda_home == pytest.approx(1.35)
-    assert expected.lambda_away == 1.0
+    expected = apply_expected_goals_contributions(1.5, 1.0, (rest,))
+    assert expected.lambda_home < 1.5
+    assert expected.lambda_away < 1.0
 
 
 def test_team_baseline_uses_neutral_coordinate_and_applies_home_advantage_once() -> None:

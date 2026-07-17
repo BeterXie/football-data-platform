@@ -11,26 +11,49 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from football_data_platform.domain.ids import RawAssetId
+from football_data_platform.domain.ids import MatchId, RawAssetId
 from football_data_platform.domain.models import require_utc
+from football_data_platform.domain.predictions import (
+    MatchResult90,
+    ScorePrediction,
+    exact_score_probability,
+    result_probabilities,
+)
 from football_data_platform.domain.snapshots import CaptureMode
+from football_data_platform.domain.training import ModelRunStatus
 from football_data_platform.evaluation.governance import (
+    EVALUATION_COMPARISON_SCHEMA_VERSION,
+    EVALUATION_COMPARISON_TYPE,
     ChallengerEvidence,
+    EvaluationComparison,
+    EvaluationPairReference,
+    EvaluationSubgroup,
+    PairedEvaluation,
     PromotionDecision,
     PromotionPolicy,
     SubgroupDiagnostic,
+    aggregate_challenger_evidence,
     assess_promotion,
 )
+from football_data_platform.evaluation.metrics import (
+    EvaluationRecord,
+    evaluation_record_payload,
+    parse_evaluation_record_payload,
+)
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
     DerivedArchive,
     DerivedArtifactManifest,
 )
+from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 from football_data_platform.storage.training import TrainingArtifactStore
@@ -38,6 +61,9 @@ from football_data_platform.storage.training import TrainingArtifactStore
 
 class GovernanceArtifactConflict(ArchiveConflictError):
     """Raised when a governance artifact or one of its references is invalid."""
+
+
+_TRUSTED_CAPTURE_RUN_VALIDATION_AVAILABLE = False
 
 
 class GovernanceArtifactStore:
@@ -123,6 +149,38 @@ class GovernanceArtifactStore:
     def load_challenger_evidence(self, evidence_id: str) -> ChallengerEvidence:
         return self.load_evidence(evidence_id)
 
+    # ---- paired evaluation comparison ---------------------------------
+    def write_comparison(self, comparison: EvaluationComparison) -> Path:
+        if not isinstance(comparison, EvaluationComparison):
+            raise TypeError("comparison must be an EvaluationComparison")
+        self._aggregate_comparison(comparison)
+        path = self._write_json(
+            self.comparison_path(comparison.content_id), comparison.to_payload()
+        )
+        self._write_manifest(
+            artifact_type="evaluation-comparison",
+            artifact_id=comparison.content_id,
+            payload=comparison.to_payload(),
+            generated_at=comparison.generated_at,
+            input_refs=_comparison_refs(comparison),
+            quality="ready",
+            schema_version=EVALUATION_COMPARISON_SCHEMA_VERSION,
+        )
+        return path
+
+    def load_comparison(self, comparison_id: str) -> EvaluationComparison:
+        comparison = self._load_comparison_document(comparison_id)
+        self._aggregate_comparison(comparison)
+        return comparison
+
+    def _load_comparison_document(self, comparison_id: str) -> EvaluationComparison:
+        payload = self._read_json(self.comparison_path(comparison_id), "evaluation comparison")
+        comparison = parse_evaluation_comparison_payload(payload)
+        if comparison.content_id != comparison_id:
+            raise GovernanceArtifactConflict("evaluation comparison path and ID disagree")
+        self._verify_comparison_manifest(comparison)
+        return comparison
+
     # ---- decisions ------------------------------------------------------
     def write_decision(self, decision: PromotionDecision) -> Path:
         if not isinstance(decision, PromotionDecision):
@@ -182,7 +240,17 @@ class GovernanceArtifactStore:
                 self.load_decision(reference)
             elif reference.startswith("prediction:"):
                 self._verify_prediction_ref(reference)
-            elif reference.startswith("evaluation:") or reference.startswith("cohort:"):
+            elif reference.startswith("evaluation:"):
+                manifest = self._find_manifest_output_ref(reference)
+                if manifest.artifact_type == "evaluation-comparison":
+                    self.load_comparison(reference)
+                elif manifest.artifact_type == "evaluation":
+                    self._load_evaluation_record(reference)
+                else:
+                    raise GovernanceArtifactConflict(
+                        "evaluation reference has an unsupported artifact type"
+                    )
+            elif reference.startswith("cohort:"):
                 self._verify_manifest_output_ref(reference)
             elif reference.startswith("sample:"):
                 self._verify_sample_ref(reference)
@@ -227,101 +295,123 @@ class GovernanceArtifactStore:
         digest = _digest_id(decision_id, "promotion-decision:")
         return self.layout.derived / "governance" / "decisions" / digest[:2] / f"{digest}.json"
 
+    def comparison_path(self, comparison_id: str) -> Path:
+        digest = _digest_id(comparison_id, "evaluation:")
+        return self.layout.derived / "governance" / "comparisons" / digest[:2] / f"{digest}.json"
+
     def _verify_evidence_references(self, evidence: ChallengerEvidence) -> None:
-        refs = _evidence_refs(evidence)
-        if not evidence.model_run_ref:
-            raise GovernanceArtifactConflict("challenger evidence requires model_run_ref")
         if not evidence.evaluation_ref:
             raise GovernanceArtifactConflict("challenger evidence requires evaluation_ref")
-        if not evidence.cohort_ref:
-            raise GovernanceArtifactConflict("challenger evidence requires cohort_ref")
-        if not evidence.sample_refs:
-            raise GovernanceArtifactConflict("challenger evidence requires sample_refs")
-        if evidence.evaluated_at is None:
-            raise GovernanceArtifactConflict("challenger evidence requires evaluated_at")
-        if evidence.confidence_method is None or evidence.confidence_level is None:
+        try:
+            comparison = self._load_comparison_document(evidence.evaluation_ref)
+            computed = self._aggregate_comparison(comparison)
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise GovernanceArtifactConflict(
-                "challenger evidence requires confidence method and level"
-            )
-        if not evidence.confidence_interval:
-            raise GovernanceArtifactConflict("challenger evidence requires confidence interval")
-        if not evidence.subgroup_diagnostics:
-            raise GovernanceArtifactConflict("challenger evidence requires subgroup diagnostics")
-        for reference in refs:
-            # sample IDs are checked against the cohort below; all other refs
-            # are resolved directly by the existing registries.
-            if reference.startswith("sample:"):
-                continue
-            self.verify_reference(reference)
-        evaluation_manifest = self._load_evaluation_manifest(evidence.evaluation_ref)
-        evaluation_payload = evaluation_manifest.payload
-        if not isinstance(evaluation_payload, Mapping):
-            raise GovernanceArtifactConflict("evaluation artifact payload must be an object")
-        if evaluation_payload.get("model_run_ref") != evidence.model_run_ref:
-            raise GovernanceArtifactConflict("evaluation model reference does not match evidence")
-        if evaluation_payload.get("champion_model_ref") != evidence.champion_model_ref:
+                "challenger evidence inputs are unavailable or invalid"
+            ) from error
+        if computed.to_payload() != evidence.to_payload():
             raise GovernanceArtifactConflict(
-                "evaluation champion reference does not match evidence"
+                "challenger evidence does not match recomputed evaluation records"
             )
-        if evaluation_payload.get("cohort_ref") != evidence.cohort_ref:
-            raise GovernanceArtifactConflict("evaluation cohort reference does not match evidence")
-        raw_evaluation_samples = evaluation_payload.get("sample_refs")
-        if not isinstance(raw_evaluation_samples, (list, tuple)) or isinstance(
-            raw_evaluation_samples, (str, bytes)
-        ):
-            raise GovernanceArtifactConflict("evaluation sample_refs must be a sequence")
-        if any(not isinstance(item, str) for item in raw_evaluation_samples):
-            raise GovernanceArtifactConflict("evaluation sample_refs must contain text")
-        evaluation_samples = tuple(raw_evaluation_samples)
-        if set(evaluation_samples) != set(evidence.sample_refs):
-            raise GovernanceArtifactConflict("evaluation samples do not match evidence")
-        if not evidence.cohort_ref.startswith("training-dataset:"):
+
+    def _aggregate_comparison(self, comparison: EvaluationComparison) -> ChallengerEvidence:
+        if not comparison.cohort_ref.startswith("training-dataset:"):
             raise GovernanceArtifactConflict("cohort_ref must reference a training dataset")
-        if evidence.cohort_ref.startswith("training-dataset:"):
-            dataset = self.training.load_dataset(evidence.cohort_ref)
-            by_id = {sample.sample_id: sample for sample in dataset.samples}
-            missing = sorted(set(evidence.sample_refs) - set(by_id))
-            if missing:
-                raise GovernanceArtifactConflict(
-                    f"challenger evidence references unknown samples: {', '.join(missing)}"
-                )
-            samples = [by_id[item] for item in evidence.sample_refs]
-            challenger = self.training.load_model_run(evidence.model_run_ref)
-            champion = self.training.load_model_run(evidence.champion_model_ref)
-            for name, artifact in (("challenger", challenger), ("champion", champion)):
-                if artifact.dataset_id != evidence.cohort_ref:
-                    raise GovernanceArtifactConflict(
-                        f"{name} model run dataset does not match cohort_ref"
-                    )
-                if set(artifact.evaluation_cohort) != set(evidence.sample_refs):
-                    raise GovernanceArtifactConflict(
-                        f"{name} model run evaluation cohort does not match sample_refs"
-                    )
-                if artifact.evaluation_capture_mode is not evidence.capture_mode:
-                    raise GovernanceArtifactConflict(
-                        f"{name} model run capture mode does not match evidence"
-                    )
-            if evidence.captured_samples != len(evidence.sample_refs):
-                raise GovernanceArtifactConflict(
-                    "captured_samples must equal the verified sample_refs count"
-                )
-            if evidence.capture_mode is CaptureMode.CAPTURED:
-                if any(sample.capture_mode is not CaptureMode.CAPTURED for sample in samples):
-                    raise GovernanceArtifactConflict(
-                        "captured promotion evidence cannot include reconstructed samples"
-                    )
-                if any(sample.capture_evidence_ref is None for sample in samples):
-                    raise GovernanceArtifactConflict(
-                        "captured promotion evidence requires raw capture evidence"
-                    )
-                # TrainingArtifactStore already verifies raw bytes and timing
-                # while loading the dataset.  Re-run the check here so a custom
-                # store cannot silently downgrade captured evidence.
-                self.training._validate_capture_evidence(dataset)
-        if evidence.capture_mode is CaptureMode.CAPTURED and not evidence.is_prospective_captured:
+        try:
+            dataset = self.training.load_dataset(comparison.cohort_ref)
+            challenger = self.training.load_model_run(comparison.model_run_ref)
+            champion = self.training.load_model_run(comparison.champion_model_ref)
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise GovernanceArtifactConflict(
-                "captured promotion evidence must be marked prospective"
+                "evaluation comparison model cohort is unavailable or invalid"
+            ) from error
+
+        by_id = {sample.sample_id: sample for sample in dataset.samples}
+        if set(comparison.sample_refs) != set(challenger.evaluation_cohort) or set(
+            comparison.sample_refs
+        ) != set(champion.evaluation_cohort):
+            raise GovernanceArtifactConflict(
+                "evaluation comparison samples do not match both model cohorts"
             )
+        for name, artifact in (("challenger", challenger), ("champion", champion)):
+            if artifact.dataset_id != comparison.cohort_ref:
+                raise GovernanceArtifactConflict(
+                    f"{name} model run dataset does not match comparison cohort"
+                )
+        missing = sorted(set(comparison.sample_refs) - set(by_id))
+        if missing:
+            raise GovernanceArtifactConflict(
+                f"evaluation comparison references unknown samples: {', '.join(missing)}"
+            )
+        samples = {sample_ref: by_id[sample_ref] for sample_ref in comparison.sample_refs}
+        if any(not sample.eligible for sample in samples.values()):
+            raise GovernanceArtifactConflict("evaluation comparison contains excluded samples")
+        if any(
+            sample.capture_mode is not challenger.evaluation_capture_mode
+            or sample.capture_mode is not champion.evaluation_capture_mode
+            for sample in samples.values()
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation comparison capture mode does not match model cohorts"
+            )
+
+        pairs: list[PairedEvaluation] = []
+        prospective_timing = True
+        for pair_ref in comparison.pairs:
+            challenger_record = self._load_evaluation_record(pair_ref.challenger_evaluation_ref)
+            champion_record = self._load_evaluation_record(pair_ref.champion_evaluation_ref)
+            sample = samples[pair_ref.sample_ref]
+            challenger_generated_at = self._verify_evaluation_sources(
+                challenger_record,
+                sample=sample,
+                expected_model_ref=comparison.model_run_ref,
+            )
+            champion_generated_at = self._verify_evaluation_sources(
+                champion_record,
+                sample=sample,
+                expected_model_ref=comparison.champion_model_ref,
+            )
+            prospective_timing = prospective_timing and all(
+                generated_at < sample.label_known_at <= record.evaluated_at
+                for generated_at, record in (
+                    (challenger_generated_at, challenger_record),
+                    (champion_generated_at, champion_record),
+                )
+            )
+            pairs.append(PairedEvaluation(pair_ref.sample_ref, challenger_record, champion_record))
+        if comparison.generated_at < max(
+            max(pair.challenger.evaluated_at, pair.champion.evaluated_at) for pair in pairs
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation comparison predates one of its evaluation records"
+            )
+
+        captured = all(
+            sample.capture_mode is CaptureMode.CAPTURED
+            and sample.capture_evidence_ref is not None
+            and sample.capture_observed_at is not None
+            and sample.capture_observed_at <= sample.as_of < sample.label_known_at
+            for sample in samples.values()
+        )
+        if captured:
+            self.training._validate_capture_evidence(dataset)
+        # Raw sample evidence does not attest that the prediction snapshot itself came from a
+        # trusted capture run. Keep captured comparisons in shadow governance until R01 has an
+        # authoritative capture-run validator.
+        prospective_captured = (
+            captured and prospective_timing and _TRUSTED_CAPTURE_RUN_VALIDATION_AVAILABLE
+        )
+        try:
+            return aggregate_challenger_evidence(
+                comparison,
+                pairs,
+                sample_as_of={key: value.as_of for key, value in samples.items()},
+                prospective_captured=prospective_captured,
+            )
+        except (TypeError, ValueError) as error:
+            raise GovernanceArtifactConflict(
+                "evaluation comparison cannot be aggregated"
+            ) from error
 
     def _verify_decision_references(self, decision: PromotionDecision) -> None:
         if not decision.policy_ref or not decision.evidence_ref:
@@ -361,78 +451,215 @@ class GovernanceArtifactStore:
                 "promotion decision does not match recomputed governance result"
             )
 
-    def _verify_prediction_ref(self, reference: str) -> None:
-        digest = _digest_id(reference, "prediction:")
-        path = self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
-        payload = self._read_json(path, "prediction")
-        if payload.get("id") != reference:
-            raise GovernanceArtifactConflict("prediction reference ID does not match stored bytes")
-        if payload.get("schema_version") != 3:
-            raise GovernanceArtifactConflict("unsupported prediction schema version")
-        identity = dict(payload)
-        identity.pop("id", None)
-        calculated = hashlib.sha256(_canonical_json(identity)).hexdigest()
-        if calculated != digest:
-            raise GovernanceArtifactConflict("prediction content hash does not match its ID")
-
-        composition_ref = payload.get("composition_artifact_ref")
-        if not isinstance(composition_ref, str):
-            raise GovernanceArtifactConflict("prediction lacks a composition artifact reference")
+    def _verify_prediction_ref(self, reference: str) -> ScorePrediction:
         try:
-            composition = self.derived.load_score_grid_composition_payload(composition_ref)
-            composition_manifest = self.derived._load_artifact_manifest_for_output_ref(
-                composition_ref
-            )
-            prediction_manifest = self.derived._load_artifact_manifest_for_output_ref(reference)
+            return self.training.load_verified_prediction(reference)
         except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise GovernanceArtifactConflict(
-                "prediction composition or manifest is unavailable or invalid"
+                f"prediction domain replay is unavailable or invalid: {error}"
             ) from error
 
-        expected_composition = _prediction_composition_payload(payload)
-        if composition != expected_composition:
+    def _load_evaluation_record(self, reference: str) -> EvaluationRecord:
+        manifest = self._find_manifest_output_ref(reference)
+        if manifest.artifact_type != "evaluation" or manifest.status != "succeeded":
+            raise GovernanceArtifactConflict("reference is not a successful evaluation record")
+        if not isinstance(manifest.payload, Mapping):
+            raise GovernanceArtifactConflict("evaluation record payload must be an object")
+        try:
+            record = parse_evaluation_record_payload(manifest.payload)
+        except (TypeError, ValueError) as error:
+            raise GovernanceArtifactConflict("evaluation record payload is invalid") from error
+        canonical_payload = evaluation_record_payload(record)
+        expected_ref = (
+            "evaluation:" + hashlib.sha256(_canonical_json(canonical_payload)).hexdigest()
+        )
+        if reference != expected_ref:
             raise GovernanceArtifactConflict(
-                "prediction composition does not match prediction payload"
+                "evaluation record reference does not match canonical payload"
             )
         if (
-            composition_manifest.artifact_type != "score-grid-composition"
-            or composition_manifest.status != "succeeded"
-            or composition_manifest.payload != composition
+            manifest.schema_version != record.schema_version
+            or manifest.transform_version != "evaluation/2"
+            or manifest.payload != canonical_payload
+            or manifest.input_refs != record.input_refs
+            or manifest.output_refs != (reference,)
+            or manifest.generated_at != record.evaluated_at
         ):
-            raise GovernanceArtifactConflict("prediction composition manifest does not match bytes")
-        if (
-            prediction_manifest.artifact_type != "prediction"
-            or prediction_manifest.status != "succeeded"
-            or prediction_manifest.payload != payload
-        ):
-            raise GovernanceArtifactConflict("prediction manifest does not match bytes")
+            raise GovernanceArtifactConflict(
+                "evaluation manifest does not match its persisted record"
+            )
+        return record
 
-    def _load_evaluation_manifest(self, reference: str) -> DerivedArtifactManifest:
-        if reference.startswith("derived-artifact:"):
-            manifest = self.derived.load_artifact_manifest(reference)
-        else:
-            manifest = self._find_manifest_output_ref(reference)
-        if manifest.artifact_type != "evaluation":
-            raise GovernanceArtifactConflict("reference is not an evaluation artifact")
-        return manifest
+    def _verify_comparison_manifest(self, comparison: EvaluationComparison) -> None:
+        manifest = self._find_manifest_output_ref(comparison.content_id)
+        if (
+            manifest.artifact_type != "evaluation-comparison"
+            or manifest.schema_version != EVALUATION_COMPARISON_SCHEMA_VERSION
+            or manifest.status != "succeeded"
+            or manifest.payload != comparison.to_payload()
+            or manifest.input_refs != _comparison_refs(comparison)
+            or manifest.output_refs != (comparison.content_id,)
+            or manifest.generated_at != comparison.generated_at
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation comparison manifest does not match persisted bytes"
+            )
+
+    def _verify_evaluation_sources(
+        self,
+        record: EvaluationRecord,
+        *,
+        sample: Any,
+        expected_model_ref: str,
+    ) -> datetime:
+        if record.market_benchmark.available:
+            raise GovernanceArtifactConflict(
+                "governance evidence requires a persisted real market snapshot; "
+                "available market benchmarks are unsupported by this store"
+            )
+        if record.sample_ref != sample.sample_id:
+            raise GovernanceArtifactConflict("evaluation record sample does not match cohort")
+        if record.model_run_ref != expected_model_ref:
+            raise GovernanceArtifactConflict("evaluation record model run does not match pair")
+        if record.capture_mode is not sample.capture_mode:
+            raise GovernanceArtifactConflict("evaluation capture mode does not match sample")
+
+        prediction = self._verify_prediction_ref(record.prediction_id)
+        model_run = self.training.load_model_run(expected_model_ref)
+        if (
+            prediction.model_run_id.value != expected_model_ref
+            or prediction.match_id.value != record.match_id
+            or prediction.capture_mode is not record.capture_mode
+            or expected_model_ref not in prediction.input_refs
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation prediction does not match its model, match, or capture mode"
+            )
+        snapshot_as_of = prediction.snapshot_as_of
+        generated_at = prediction.generated_at
+        if snapshot_as_of != sample.as_of:
+            raise GovernanceArtifactConflict(
+                "evaluation prediction snapshot does not match sample as_of"
+            )
+        if generated_at > record.evaluated_at:
+            raise GovernanceArtifactConflict("evaluation predates its prediction")
+        if (
+            model_run.status is not ModelRunStatus.SUCCEEDED
+            or model_run.task != "score-model"
+            or model_run.model_version != prediction.model_version
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation prediction cites an unusable score model run"
+            )
+        if model_run.ended_at > generated_at:
+            raise GovernanceArtifactConflict(
+                "evaluation prediction predates its model run completion"
+            )
+
+        result = self._load_canonical_result(record)
+        if sample.label_ref != result.source_ref:
+            raise GovernanceArtifactConflict("evaluation result does not match sample label_ref")
+        if sample.label_known_at != result.known_at:
+            raise GovernanceArtifactConflict(
+                "evaluation result known_at does not match sample label_known_at"
+            )
+        if not isinstance(sample.label, Mapping) or (
+            sample.label.get("home_goals") != result.home_goals
+            or sample.label.get("away_goals") != result.away_goals
+        ):
+            raise GovernanceArtifactConflict("evaluation result does not match sample label")
+        if result.known_at > record.evaluated_at:
+            raise GovernanceArtifactConflict("evaluation predates the canonical result")
+
+        probabilities = tuple(result_probabilities(prediction).items())
+        if not _probabilities_equal(record.result_probabilities, probabilities):
+            raise GovernanceArtifactConflict(
+                "evaluation probabilities do not match the persisted prediction"
+            )
+        home_goals, away_goals = (int(item) for item in record.actual_score.split(":"))
+        score_probability = exact_score_probability(prediction, home_goals, away_goals)
+        expected_score_log_loss = -math.log(max(score_probability, 1e-15))
+        if not math.isclose(
+            record.score_log_loss,
+            expected_score_log_loss,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation score log loss does not match the persisted prediction"
+            )
+        return generated_at
+
+    def _read_prediction_payload(self, reference: str) -> dict[str, Any]:
+        digest = _digest_id(reference, "prediction:")
+        path = self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
+        return self._read_json(path, "prediction")
+
+    def _load_canonical_result(self, record: EvaluationRecord) -> MatchResult90:
+        result_refs = tuple(
+            reference
+            for reference in record.input_refs
+            if reference.startswith("fact:match_results_90:")
+        )
+        if len(result_refs) != 1:
+            raise GovernanceArtifactConflict(
+                "evaluation record must cite exactly one canonical 90-minute result"
+            )
+        result_ref = result_refs[0]
+        canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+        try:
+            with canonical.connect() as connection:
+                row = connection.execute(
+                    "SELECT match_id, home_goals, away_goals, known_at, raw_asset_id "
+                    "FROM match_results_90 WHERE record_id = ?",
+                    (result_ref,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise GovernanceArtifactConflict("canonical result store is unavailable") from error
+        if row is None:
+            raise GovernanceArtifactConflict("evaluation canonical result is unavailable")
+        result = MatchResult90(
+            match_id=MatchId(str(row["match_id"])),
+            home_goals=int(row["home_goals"]),
+            away_goals=int(row["away_goals"]),
+            known_at=_parse_datetime(row["known_at"], "canonical result known_at"),
+            source_ref=result_ref,
+        )
+        try:
+            self.raw.verify(RawAssetId(str(row["raw_asset_id"])))
+            CanonicalFactStore(canonical).verify_match_result(result)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise GovernanceArtifactConflict(
+                "evaluation canonical result evidence is unavailable or invalid"
+            ) from error
+        expected_score = f"{result.home_goals}:{result.away_goals}"
+        expected_outcome = (
+            "home"
+            if result.home_goals > result.away_goals
+            else "away"
+            if result.home_goals < result.away_goals
+            else "draw"
+        )
+        if (
+            result.match_id.value != record.match_id
+            or record.actual_score != expected_score
+            or record.actual_outcome != expected_outcome
+        ):
+            raise GovernanceArtifactConflict(
+                "evaluation outcome does not match the canonical result"
+            )
+        return result
 
     def _verify_manifest_output_ref(self, reference: str) -> None:
         self._find_manifest_output_ref(reference)
 
     def _find_manifest_output_ref(self, reference: str) -> DerivedArtifactManifest:
-        root = self.layout.derived / "manifests" / "artifacts"
-        if not root.exists():
-            raise GovernanceArtifactConflict(f"no derived manifests found for {reference}")
-        for path in root.glob("**/*.json"):
-            try:
-                manifest = self.derived.load_artifact_manifest(_manifest_id_from_path(path))
-            except (OSError, ValueError, ArchiveConflictError):
-                continue
-            if reference in manifest.output_refs:
-                return manifest
-        raise GovernanceArtifactConflict(
-            f"no immutable manifest contains output reference: {reference}"
-        )
+        try:
+            return self.derived._load_artifact_manifest_for_output_ref(reference)
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
+            raise GovernanceArtifactConflict(
+                f"no immutable manifest contains output reference: {reference}"
+            ) from error
 
     def _verify_sample_ref(self, reference: str) -> None:
         root = self.layout.derived / "training-datasets"
@@ -456,10 +683,12 @@ class GovernanceArtifactStore:
         generated_at: datetime,
         input_refs: tuple[str, ...],
         quality: str,
+        schema_version: int = 1,
     ) -> None:
         self.derived.write_artifact_manifest(
             DerivedArtifactManifest.create(
                 artifact_type=artifact_type,
+                schema_version=schema_version,
                 payload=dict(payload),
                 generated_at=generated_at,
                 started_at=generated_at,
@@ -504,6 +733,67 @@ class GovernanceArtifactStore:
         if not isinstance(payload, dict):
             raise GovernanceArtifactConflict(f"{kind} must be an object: {path}")
         return payload
+
+
+def parse_evaluation_comparison_payload(
+    payload: Mapping[str, Any],
+) -> EvaluationComparison:
+    if not isinstance(payload, Mapping):
+        raise GovernanceArtifactConflict("evaluation comparison must be an object")
+    try:
+        if (
+            _strict_int(payload["schema_version"], "schema_version")
+            != EVALUATION_COMPARISON_SCHEMA_VERSION
+            or _strict_text(payload["record_type"], "record_type") != EVALUATION_COMPARISON_TYPE
+        ):
+            raise ValueError("unsupported evaluation comparison schema")
+        raw_pairs = payload["pairs"]
+        raw_subgroups = payload["subgroups"]
+        if not isinstance(raw_pairs, list) or not all(
+            isinstance(item, Mapping) for item in raw_pairs
+        ):
+            raise ValueError("pairs must be a list of objects")
+        if not isinstance(raw_subgroups, list) or not all(
+            isinstance(item, Mapping) for item in raw_subgroups
+        ):
+            raise ValueError("subgroups must be a list of objects")
+        comparison = EvaluationComparison(
+            model_run_ref=_strict_text(payload["model_run_ref"], "model_run_ref"),
+            champion_model_ref=_strict_text(payload["champion_model_ref"], "champion_model_ref"),
+            cohort_ref=_strict_text(payload["cohort_ref"], "cohort_ref"),
+            pairs=tuple(
+                EvaluationPairReference(
+                    sample_ref=_strict_text(item["sample_ref"], "sample_ref"),
+                    challenger_evaluation_ref=_strict_text(
+                        item["challenger_evaluation_ref"], "challenger_evaluation_ref"
+                    ),
+                    champion_evaluation_ref=_strict_text(
+                        item["champion_evaluation_ref"], "champion_evaluation_ref"
+                    ),
+                )
+                for item in raw_pairs
+            ),
+            subgroups=tuple(
+                EvaluationSubgroup(
+                    subgroup=_strict_text(item["subgroup"], "subgroup"),
+                    sample_refs=tuple(
+                        _strict_text(reference, "subgroup sample_ref")
+                        for reference in item["sample_refs"]
+                    ),
+                )
+                for item in raw_subgroups
+            ),
+            confidence_method=_strict_text(payload["confidence_method"], "confidence_method"),
+            confidence_level=_strict_float(payload["confidence_level"], "confidence_level"),
+            bootstrap_seed=_strict_int(payload["bootstrap_seed"], "bootstrap_seed"),
+            bootstrap_resamples=_strict_int(payload["bootstrap_resamples"], "bootstrap_resamples"),
+            generated_at=_parse_datetime(payload["generated_at"], "generated_at"),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise GovernanceArtifactConflict(f"invalid evaluation comparison: {error}") from error
+    if dict(payload) != comparison.to_payload():
+        raise GovernanceArtifactConflict("evaluation comparison is not canonical")
+    return comparison
 
 
 def parse_promotion_policy_payload(payload: Mapping[str, Any]) -> PromotionPolicy:
@@ -658,6 +948,27 @@ def _evidence_refs(evidence: ChallengerEvidence) -> tuple[str, ...]:
     )
 
 
+def _comparison_refs(comparison: EvaluationComparison) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                comparison.model_run_ref,
+                comparison.champion_model_ref,
+                comparison.cohort_ref,
+                *comparison.sample_refs,
+                *(
+                    reference
+                    for pair in comparison.pairs
+                    for reference in (
+                        pair.challenger_evaluation_ref,
+                        pair.champion_evaluation_ref,
+                    )
+                ),
+            }
+        )
+    )
+
+
 def _decision_refs(decision: PromotionDecision) -> tuple[str, ...]:
     return tuple(
         sorted(
@@ -693,49 +1004,17 @@ def _manifest_id_from_path(path: Path) -> str:
     return f"derived-artifact:{path.stem}"
 
 
-def _prediction_composition_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a persisted prediction onto its canonical grid composition payload."""
-
-    fields = (
-        "schema_version",
-        "artifact_type",
-        "match_id",
-        "snapshot_id",
-        "model_run_id",
-        "model_version",
-        "generated_at",
-        "snapshot_as_of",
-        "baseline_lambda_home",
-        "baseline_lambda_away",
-        "contribution_keys",
-        "contribution_multipliers",
-        "composition_version",
-        "calibration_versions",
-        "lambda_home",
-        "lambda_away",
-        "rho",
-        "max_goals",
-        "normalization_residual",
-        "score_cells",
-        "input_refs",
+def _probabilities_equal(
+    left: tuple[tuple[str, float], ...],
+    right: tuple[tuple[str, float], ...],
+) -> bool:
+    return len(left) == len(right) and all(
+        left_outcome == right_outcome
+        and math.isclose(left_value, right_value, rel_tol=1e-12, abs_tol=1e-12)
+        for (left_outcome, left_value), (right_outcome, right_value) in zip(
+            left, right, strict=True
+        )
     )
-    try:
-        projected = {name: payload[name] for name in fields}
-    except KeyError as error:
-        raise GovernanceArtifactConflict(
-            f"prediction payload is missing composition field: {error.args[0]}"
-        ) from error
-    projected["schema_version"] = 1
-    projected["artifact_type"] = "score-grid-composition"
-    projected["grid"] = {
-        "lambda_home": projected["lambda_home"],
-        "lambda_away": projected["lambda_away"],
-        "rho": projected["rho"],
-        "max_goals": projected["max_goals"],
-        "normalization_residual": projected["normalization_residual"],
-        "score_cells": projected["score_cells"],
-    }
-    return projected
 
 
 def _canonical_json(value: Any) -> bytes:

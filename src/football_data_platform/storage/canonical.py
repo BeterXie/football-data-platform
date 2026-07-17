@@ -34,7 +34,9 @@ from football_data_platform.domain.models import (
     require_utc,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
+OFFICIAL_LINEUP_CONTRACT_VERSION = 2
+LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION = 1
 _ID_NAMESPACE = uuid.UUID("c62a4fc0-2e72-4d9c-b4b3-113b31c31982")
 
 
@@ -104,6 +106,127 @@ class MatchReportContractEvidence:
         require_utc(self.observed_at, "observed_at")
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class OfficialLineupSourceBinding:
+    source_team_id: str
+    source_player_id: str
+    team_id: TeamId
+    player_id: PlayerId
+
+    def __post_init__(self) -> None:
+        _require_text(self.source_team_id, "source_team_id")
+        _require_text(self.source_player_id, "source_player_id")
+        if not isinstance(self.team_id, TeamId):
+            raise TypeError("official lineup binding team_id must be a TeamId")
+        if not isinstance(self.player_id, PlayerId):
+            raise TypeError("official lineup binding player_id must be a PlayerId")
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "source_team_id": self.source_team_id,
+            "source_player_id": self.source_player_id,
+            "team_id": self.team_id.value,
+            "player_id": self.player_id.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialLineupContractEvidence:
+    contract_version: int
+    contract_id: str
+    raw_asset_id: RawAssetId
+    source: str
+    source_match_id: str
+    match_mapping_source: str
+    team_mapping_source: str
+    player_mapping_source: str
+    match_id: MatchId
+    match_version: int
+    parser_version: str
+    published_at: datetime
+    observed_at: datetime
+    team_lineups: tuple[tuple[TeamId, tuple[PlayerId, ...]], ...]
+    source_bindings: tuple[OfficialLineupSourceBinding, ...]
+    fact_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.contract_id, "contract_id"),
+            (self.source, "source"),
+            (self.source_match_id, "source_match_id"),
+            (self.match_mapping_source, "match_mapping_source"),
+            (self.team_mapping_source, "team_mapping_source"),
+            (self.player_mapping_source, "player_mapping_source"),
+            (self.parser_version, "parser_version"),
+        ):
+            _require_text(value, field_name)
+        if isinstance(self.contract_version, bool) or self.contract_version not in {
+            LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION,
+            OFFICIAL_LINEUP_CONTRACT_VERSION,
+        }:
+            raise ValueError("unsupported official lineup contract version")
+        if isinstance(self.match_version, bool) or self.match_version < 1:
+            raise ValueError("match_version must be a positive integer")
+        require_utc(self.published_at, "published_at")
+        require_utc(self.observed_at, "observed_at")
+        if self.published_at > self.observed_at:
+            raise ValueError("official lineup publication cannot follow observation")
+        if len(self.team_lineups) != 2:
+            raise ValueError("official lineup contract requires exactly two teams")
+        team_ids = [team_id for team_id, _ in self.team_lineups]
+        if len(set(team_ids)) != 2:
+            raise ValueError("official lineup contract team IDs must be unique")
+        all_players: list[PlayerId] = []
+        for team_id, player_ids in self.team_lineups:
+            if not isinstance(team_id, TeamId):
+                raise TypeError("official lineup contract teams must use TeamId")
+            if (
+                len(player_ids) != 11
+                or len(set(player_ids)) != 11
+                or any(not isinstance(player_id, PlayerId) for player_id in player_ids)
+            ):
+                raise ValueError("official lineup contract requires 11 unique players per team")
+            all_players.extend(player_ids)
+        if len(set(all_players)) != len(all_players):
+            raise ValueError("official lineup players must be unique across both teams")
+        if len(self.fact_ids) != 22 or len(set(self.fact_ids)) != 22:
+            raise ValueError("official lineup contract requires 22 unique fact references")
+        if any(not fact_id.startswith("fact:lineup:") for fact_id in self.fact_ids):
+            raise ValueError("official lineup contract fact references are invalid")
+        normalized_bindings = _normalize_official_lineup_source_bindings(self.source_bindings)
+        if self.source_bindings != normalized_bindings:
+            raise ValueError("official lineup source bindings must use canonical order")
+        if self.contract_version == LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION:
+            if self.source_bindings:
+                raise ValueError("legacy official lineup contracts cannot contain source bindings")
+        else:
+            _validate_official_lineup_source_bindings(
+                self.source_bindings,
+                team_lineups=self.team_lineups,
+            )
+        expected_id = _official_lineup_contract_id(
+            contract_version=self.contract_version,
+            raw_asset_id=self.raw_asset_id,
+            source=self.source,
+            source_match_id=self.source_match_id,
+            match_mapping_source=self.match_mapping_source,
+            team_mapping_source=self.team_mapping_source,
+            player_mapping_source=self.player_mapping_source,
+            match_id=self.match_id,
+            match_version=self.match_version,
+            parser_version=self.parser_version,
+            published_at=self.published_at,
+            observed_at=self.observed_at,
+            team_lineups=self.team_lineups,
+            source_bindings=self.source_bindings,
+            fact_ids=self.fact_ids,
+        )
+        if self.contract_id != expected_id:
+            raise CanonicalConflictError(
+                "official lineup contract content ID does not match payload"
+            )
+
+
 class CanonicalStore:
     """Own the normalized identity catalog and versioned fixture facts."""
 
@@ -126,11 +249,22 @@ class CanonicalStore:
                 _migrate_v1_to_v2(connection)
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
+                _migrate_v5_to_v6(connection)
             elif row["version"] == 2:
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
+                _migrate_v5_to_v6(connection)
             elif row["version"] == 3:
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
+                _migrate_v5_to_v6(connection)
+            elif row["version"] == 4:
+                _migrate_v4_to_v5(connection)
+                _migrate_v5_to_v6(connection)
+            elif row["version"] == 5:
+                _migrate_v5_to_v6(connection)
             elif row["version"] != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"canonical schema {row['version']} is not supported by "
@@ -370,39 +504,60 @@ class CanonicalStore:
         observed_at: datetime,
         raw_asset_id: RawAssetId,
     ) -> ResolvedPlayer:
-        _require_text(canonical_name, "canonical_name")
-        require_utc(observed_at, "observed_at")
         with self.connect() as connection:
-            _require_raw_asset(connection, raw_asset_id)
-            entity_id = _current_mapping(connection, source, "player", source_id)
-            if entity_id is not None:
-                row = connection.execute(
-                    "SELECT canonical_name FROM players WHERE player_id = ?",
-                    (entity_id,),
-                ).fetchone()
-                if row is None:
-                    raise CanonicalConflictError(f"mapped player does not exist: {entity_id}")
-                return ResolvedPlayer(PlayerId(entity_id), row["canonical_name"])
-
-            player_id = PlayerId(_stable_id("player", source, source_id))
-            _insert_entity(connection, player_id, "player", _timestamp(observed_at))
-            connection.execute(
-                "INSERT INTO players(player_id, canonical_name) VALUES (?, ?)",
-                (player_id.value, canonical_name),
-            )
-            self._add_mapping(
+            return self._resolve_or_create_player(
                 connection,
                 source=source,
                 source_id=source_id,
-                entity_id=player_id,
-                entity_type="player",
-                valid_from=observed_at,
-                match_rule=MappingRule.SOURCE_ID,
-                confidence=1.0,
-                created_at=observed_at,
-                audit_note=f"first observed as {canonical_name}",
+                canonical_name=canonical_name,
+                observed_at=observed_at,
+                raw_asset_id=raw_asset_id,
             )
-            return ResolvedPlayer(player_id, canonical_name)
+
+    def _resolve_or_create_player(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source: str,
+        source_id: str,
+        canonical_name: str,
+        observed_at: datetime,
+        raw_asset_id: RawAssetId,
+    ) -> ResolvedPlayer:
+        """Resolve a player inside a caller-owned canonical transaction."""
+
+        _require_text(canonical_name, "canonical_name")
+        require_utc(observed_at, "observed_at")
+        _require_raw_asset(connection, raw_asset_id)
+        entity_id = _current_mapping(connection, source, "player", source_id)
+        if entity_id is not None:
+            row = connection.execute(
+                "SELECT canonical_name FROM players WHERE player_id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                raise CanonicalConflictError(f"mapped player does not exist: {entity_id}")
+            return ResolvedPlayer(PlayerId(entity_id), row["canonical_name"])
+
+        player_id = PlayerId(_stable_id("player", source, source_id))
+        _insert_entity(connection, player_id, "player", _timestamp(observed_at))
+        connection.execute(
+            "INSERT INTO players(player_id, canonical_name) VALUES (?, ?)",
+            (player_id.value, canonical_name),
+        )
+        self._add_mapping(
+            connection,
+            source=source,
+            source_id=source_id,
+            entity_id=player_id,
+            entity_type="player",
+            valid_from=observed_at,
+            match_rule=MappingRule.SOURCE_ID,
+            confidence=1.0,
+            created_at=observed_at,
+            audit_note=f"first observed as {canonical_name}",
+        )
+        return ResolvedPlayer(player_id, canonical_name)
 
     def resolve_or_create_match(
         self,
@@ -866,6 +1021,37 @@ class CanonicalStore:
                 valid.append(evidence)
         return tuple(valid), tuple(diagnostics)
 
+    def match_report_contract(self, contract_id: str) -> MatchReportContractEvidence:
+        """Load and lineage-verify one persisted match-report parser contract."""
+
+        _require_text(contract_id, "contract_id")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM match_report_contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"match report contract {contract_id!r} does not exist")
+            evidence = _match_report_contract_from_row(row)
+            _validate_match_report_contract_lineage(connection, evidence)
+        return evidence
+
+    def official_lineup_contract(
+        self,
+        contract_id: str,
+    ) -> OfficialLineupContractEvidence:
+        """Load and content-verify one persisted official-lineup parser contract."""
+
+        _require_text(contract_id, "contract_id")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM official_lineup_contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"official lineup contract {contract_id!r} does not exist")
+        return _official_lineup_contract_from_row(row)
+
     def match_ids_for_season(self, season_id: SeasonId) -> tuple[MatchId, ...]:
         """Return persisted canonical fixture IDs for one registered season."""
 
@@ -999,7 +1185,69 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     )
     connection.execute("DROP TABLE prematch_events")
     connection.execute("ALTER TABLE prematch_events_v4 RENAME TO prematch_events")
-    connection.execute("UPDATE schema_meta SET version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
+    connection.execute("UPDATE schema_meta SET version = 4 WHERE singleton = 1")
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    connection.execute("UPDATE schema_meta SET version = 5 WHERE singleton = 1")
+
+
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(official_lineup_contracts)").fetchall()
+    }
+    contract_version_value = "contract_version" if "contract_version" in columns else "1"
+    source_bindings_value = "source_bindings_json" if "source_bindings_json" in columns else "NULL"
+    connection.execute("DROP TABLE IF EXISTS official_lineup_contracts_v6")
+    connection.execute(
+        """
+        CREATE TABLE official_lineup_contracts_v6 (
+            contract_id TEXT PRIMARY KEY,
+            contract_version INTEGER NOT NULL CHECK (contract_version IN (1, 2)),
+            raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id),
+            source TEXT NOT NULL,
+            source_match_id TEXT NOT NULL,
+            match_mapping_source TEXT NOT NULL,
+            team_mapping_source TEXT NOT NULL,
+            player_mapping_source TEXT NOT NULL,
+            match_id TEXT NOT NULL,
+            match_version INTEGER NOT NULL,
+            parser_version TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            team_lineups_json TEXT NOT NULL,
+            source_bindings_json TEXT,
+            fact_ids_json TEXT NOT NULL,
+            CHECK (
+                (contract_version = 1 AND source_bindings_json IS NULL)
+                OR (contract_version = 2 AND source_bindings_json IS NOT NULL)
+            ),
+            UNIQUE (raw_asset_id, parser_version, contract_version),
+            FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version)
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO official_lineup_contracts_v6("
+        "contract_id, contract_version, raw_asset_id, source, source_match_id, "
+        "match_mapping_source, team_mapping_source, player_mapping_source, match_id, "
+        "match_version, parser_version, published_at, observed_at, team_lineups_json, "
+        "source_bindings_json, fact_ids_json) "
+        f"SELECT contract_id, {contract_version_value}, raw_asset_id, source, source_match_id, "
+        "match_mapping_source, team_mapping_source, player_mapping_source, match_id, "
+        "match_version, parser_version, published_at, observed_at, team_lineups_json, "
+        f"{source_bindings_value}, fact_ids_json FROM official_lineup_contracts"
+    )
+    connection.execute("DROP TABLE official_lineup_contracts")
+    connection.execute(
+        "ALTER TABLE official_lineup_contracts_v6 RENAME TO official_lineup_contracts"
+    )
+    connection.execute(
+        "CREATE INDEX official_lineup_contracts_match "
+        "ON official_lineup_contracts(match_id, match_version)"
+    )
+    connection.execute("UPDATE schema_meta SET version = 6 WHERE singleton = 1")
 
 
 def _ensure_competition_team(
@@ -1286,6 +1534,230 @@ def _match_report_contract_id(
     return f"match-report-contract:{digest}"
 
 
+def build_official_lineup_contract(
+    *,
+    raw_asset_id: RawAssetId,
+    source: str,
+    source_match_id: str,
+    match_mapping_source: str,
+    team_mapping_source: str,
+    player_mapping_source: str,
+    match_id: MatchId,
+    match_version: int,
+    parser_version: str,
+    published_at: datetime,
+    observed_at: datetime,
+    team_lineups: Sequence[tuple[TeamId, Sequence[PlayerId]]],
+    source_bindings: Sequence[OfficialLineupSourceBinding],
+    fact_ids: Sequence[str],
+) -> OfficialLineupContractEvidence:
+    """Normalize and identify one verified paired-XI parser contract."""
+
+    normalized_lineups = tuple(
+        sorted(
+            (
+                team_id,
+                tuple(sorted(player_ids, key=lambda player_id: player_id.value)),
+            )
+            for team_id, player_ids in team_lineups
+        )
+    )
+    normalized_bindings = _normalize_official_lineup_source_bindings(source_bindings)
+    normalized_fact_ids = tuple(sorted(fact_ids))
+    contract_id = _official_lineup_contract_id(
+        contract_version=OFFICIAL_LINEUP_CONTRACT_VERSION,
+        raw_asset_id=raw_asset_id,
+        source=source,
+        source_match_id=source_match_id,
+        match_mapping_source=match_mapping_source,
+        team_mapping_source=team_mapping_source,
+        player_mapping_source=player_mapping_source,
+        match_id=match_id,
+        match_version=match_version,
+        parser_version=parser_version,
+        published_at=published_at,
+        observed_at=observed_at,
+        team_lineups=normalized_lineups,
+        source_bindings=normalized_bindings,
+        fact_ids=normalized_fact_ids,
+    )
+    return OfficialLineupContractEvidence(
+        contract_version=OFFICIAL_LINEUP_CONTRACT_VERSION,
+        contract_id=contract_id,
+        raw_asset_id=raw_asset_id,
+        source=source,
+        source_match_id=source_match_id,
+        match_mapping_source=match_mapping_source,
+        team_mapping_source=team_mapping_source,
+        player_mapping_source=player_mapping_source,
+        match_id=match_id,
+        match_version=match_version,
+        parser_version=parser_version,
+        published_at=published_at,
+        observed_at=observed_at,
+        team_lineups=normalized_lineups,
+        source_bindings=normalized_bindings,
+        fact_ids=normalized_fact_ids,
+    )
+
+
+def _official_lineup_contract_id(
+    *,
+    contract_version: int,
+    raw_asset_id: RawAssetId,
+    source: str,
+    source_match_id: str,
+    match_mapping_source: str,
+    team_mapping_source: str,
+    player_mapping_source: str,
+    match_id: MatchId,
+    match_version: int,
+    parser_version: str,
+    published_at: datetime,
+    observed_at: datetime,
+    team_lineups: tuple[tuple[TeamId, tuple[PlayerId, ...]], ...],
+    source_bindings: tuple[OfficialLineupSourceBinding, ...],
+    fact_ids: tuple[str, ...],
+) -> str:
+    payload = {
+        "raw_asset_id": raw_asset_id.value,
+        "source": source,
+        "source_match_id": source_match_id,
+        "match_mapping_source": match_mapping_source,
+        "team_mapping_source": team_mapping_source,
+        "player_mapping_source": player_mapping_source,
+        "match_id": match_id.value,
+        "match_version": match_version,
+        "parser_version": parser_version,
+        "published_at": _timestamp(published_at),
+        "observed_at": _timestamp(observed_at),
+        "team_lineups": {
+            team_id.value: [player_id.value for player_id in player_ids]
+            for team_id, player_ids in team_lineups
+        },
+        "fact_ids": fact_ids,
+    }
+    if contract_version == OFFICIAL_LINEUP_CONTRACT_VERSION:
+        payload = {
+            "contract_version": contract_version,
+            **payload,
+            "source_bindings": [binding.to_payload() for binding in source_bindings],
+        }
+    elif contract_version != LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION:
+        raise ValueError("unsupported official lineup contract version")
+    digest = hashlib.sha256(_json_text(payload).encode("utf-8")).hexdigest()
+    return f"official-lineup-contract:{digest}"
+
+
+def _normalize_official_lineup_source_bindings(
+    bindings: Sequence[OfficialLineupSourceBinding],
+) -> tuple[OfficialLineupSourceBinding, ...]:
+    return tuple(
+        sorted(
+            bindings,
+            key=lambda binding: (
+                binding.source_team_id,
+                binding.source_player_id,
+                binding.team_id.value,
+                binding.player_id.value,
+            ),
+        )
+    )
+
+
+def _validate_official_lineup_source_bindings(
+    bindings: tuple[OfficialLineupSourceBinding, ...],
+    *,
+    team_lineups: tuple[tuple[TeamId, tuple[PlayerId, ...]], ...],
+) -> None:
+    if len(bindings) != 22:
+        raise ValueError("official lineup contract requires 22 source-player bindings")
+    if len({binding.source_player_id for binding in bindings}) != len(bindings):
+        raise ValueError("official lineup source player IDs must be unique")
+    source_teams: dict[str, TeamId] = {}
+    source_team_counts: dict[str, int] = {}
+    for binding in bindings:
+        mapped_team = source_teams.setdefault(binding.source_team_id, binding.team_id)
+        if mapped_team != binding.team_id:
+            raise ValueError("one official source team cannot bind multiple platform teams")
+        source_team_counts[binding.source_team_id] = (
+            source_team_counts.get(binding.source_team_id, 0) + 1
+        )
+    lineup_assignments = {
+        (team_id, player_id) for team_id, player_ids in team_lineups for player_id in player_ids
+    }
+    if (
+        len(source_teams) != 2
+        or set(source_teams.values()) != {team_id for team_id, _ in team_lineups}
+        or set(source_team_counts.values()) != {11}
+        or {(binding.team_id, binding.player_id) for binding in bindings} != lineup_assignments
+    ):
+        raise ValueError("official lineup source bindings do not match paired platform XIs")
+
+
+def _official_lineup_contract_from_row(
+    row: sqlite3.Row,
+) -> OfficialLineupContractEvidence:
+    lineup_value = json.loads(row["team_lineups_json"])
+    fact_value = json.loads(row["fact_ids_json"])
+    binding_text = row["source_bindings_json"]
+    binding_value = None if binding_text is None else json.loads(binding_text)
+    if not isinstance(lineup_value, dict) or not isinstance(fact_value, list):
+        raise ValueError("official lineup contract JSON fields are invalid")
+    lineups: list[tuple[TeamId, tuple[PlayerId, ...]]] = []
+    for team_id, players in lineup_value.items():
+        if (
+            not isinstance(team_id, str)
+            or not isinstance(players, list)
+            or not all(isinstance(player_id, str) for player_id in players)
+        ):
+            raise ValueError("official lineup contract team lineups are invalid")
+        lineups.append((TeamId(team_id), tuple(PlayerId(player_id) for player_id in players)))
+    if not all(isinstance(fact_id, str) for fact_id in fact_value):
+        raise ValueError("official lineup contract fact references are invalid")
+    bindings: list[OfficialLineupSourceBinding] = []
+    if binding_value is not None:
+        if not isinstance(binding_value, list):
+            raise ValueError("official lineup contract source bindings are invalid")
+        expected_fields = {
+            "source_team_id",
+            "source_player_id",
+            "team_id",
+            "player_id",
+        }
+        for item in binding_value:
+            if not isinstance(item, dict) or set(item) != expected_fields:
+                raise ValueError("official lineup contract source binding is invalid")
+            if any(not isinstance(item[field], str) for field in expected_fields):
+                raise ValueError("official lineup contract source binding values are invalid")
+            bindings.append(
+                OfficialLineupSourceBinding(
+                    source_team_id=item["source_team_id"],
+                    source_player_id=item["source_player_id"],
+                    team_id=TeamId(item["team_id"]),
+                    player_id=PlayerId(item["player_id"]),
+                )
+            )
+    return OfficialLineupContractEvidence(
+        contract_version=int(row["contract_version"]),
+        contract_id=str(row["contract_id"]),
+        raw_asset_id=RawAssetId(row["raw_asset_id"]),
+        source=str(row["source"]),
+        source_match_id=str(row["source_match_id"]),
+        match_mapping_source=str(row["match_mapping_source"]),
+        team_mapping_source=str(row["team_mapping_source"]),
+        player_mapping_source=str(row["player_mapping_source"]),
+        match_id=MatchId(row["match_id"]),
+        match_version=int(row["match_version"]),
+        parser_version=str(row["parser_version"]),
+        published_at=_parse_timestamp(row["published_at"]),
+        observed_at=_parse_timestamp(row["observed_at"]),
+        team_lineups=tuple(sorted(lineups)),
+        source_bindings=tuple(bindings),
+        fact_ids=tuple(fact_value),
+    )
+
+
 def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
@@ -1540,6 +2012,34 @@ CREATE TABLE IF NOT EXISTS match_report_contracts (
 
 CREATE INDEX IF NOT EXISTS match_report_contracts_match
 ON match_report_contracts(match_id, match_version);
+
+CREATE TABLE IF NOT EXISTS official_lineup_contracts (
+    contract_id TEXT PRIMARY KEY,
+    contract_version INTEGER NOT NULL CHECK (contract_version IN (1, 2)),
+    raw_asset_id TEXT NOT NULL REFERENCES raw_assets(raw_asset_id),
+    source TEXT NOT NULL,
+    source_match_id TEXT NOT NULL,
+    match_mapping_source TEXT NOT NULL,
+    team_mapping_source TEXT NOT NULL,
+    player_mapping_source TEXT NOT NULL,
+    match_id TEXT NOT NULL,
+    match_version INTEGER NOT NULL,
+    parser_version TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    team_lineups_json TEXT NOT NULL,
+    source_bindings_json TEXT,
+    fact_ids_json TEXT NOT NULL,
+    CHECK (
+        (contract_version = 1 AND source_bindings_json IS NULL)
+        OR (contract_version = 2 AND source_bindings_json IS NOT NULL)
+    ),
+    UNIQUE (raw_asset_id, parser_version, contract_version),
+    FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS official_lineup_contracts_match
+ON official_lineup_contracts(match_id, match_version);
 
 CREATE TABLE IF NOT EXISTS match_results_90 (
     record_id TEXT PRIMARY KEY,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -205,6 +206,83 @@ def snapshot_payload(
 ) -> dict[str, Any]:
     verify_snapshot(snapshot, source_validator=source_validator)
     return {"id": snapshot.id.value, **_snapshot_identity_from(snapshot)}
+
+
+def parse_snapshot_payload(
+    payload: Mapping[str, Any],
+    *,
+    source_validator: SnapshotSourceValidator,
+) -> PreMatchSnapshot:
+    """Rebuild and fully verify one canonical persisted snapshot payload."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("snapshot payload must be an object")
+    try:
+        raw_features = payload["features"]
+        raw_input_refs = payload["input_refs"]
+        raw_missing_fields = payload["missing_fields"]
+        if not isinstance(raw_features, list) or not all(
+            isinstance(item, Mapping) for item in raw_features
+        ):
+            raise ValueError("snapshot features must be a list of objects")
+        if not isinstance(raw_input_refs, list) or not all(
+            isinstance(item, str) for item in raw_input_refs
+        ):
+            raise ValueError("snapshot input_refs must be a list of text")
+        if not isinstance(raw_missing_fields, list) or not all(
+            isinstance(item, str) for item in raw_missing_fields
+        ):
+            raise ValueError("snapshot missing_fields must be a list of text")
+        schema_version = payload["schema_version"]
+        match_version = payload["match_version"]
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise ValueError("snapshot schema_version must be an integer")
+        if not isinstance(match_version, int) or isinstance(match_version, bool):
+            raise ValueError("snapshot match_version must be an integer")
+        snapshot = PreMatchSnapshot(
+            id=SnapshotId(_payload_text(payload["id"], "id")),
+            schema_version=schema_version,
+            match_id=MatchId(_payload_text(payload["match_id"], "match_id")),
+            match_version=match_version,
+            home_team_id=TeamId(_payload_text(payload["home_team_id"], "home_team_id")),
+            away_team_id=TeamId(_payload_text(payload["away_team_id"], "away_team_id")),
+            snapshot_type=SnapshotType(_payload_text(payload["snapshot_type"], "snapshot_type")),
+            capture_mode=CaptureMode(_payload_text(payload["capture_mode"], "capture_mode")),
+            as_of=_parse_payload_datetime(payload["as_of"], "as_of"),
+            observed_at=_parse_payload_datetime(payload["observed_at"], "observed_at"),
+            scheduled_kickoff_used=_parse_payload_datetime(
+                payload["scheduled_kickoff_used"], "scheduled_kickoff_used"
+            ),
+            feature_spec_version=_payload_text(
+                payload["feature_spec_version"], "feature_spec_version"
+            ),
+            features=tuple(
+                SnapshotFeature(
+                    name=_payload_text(item["name"], "feature name"),
+                    value=item["value"],
+                    known_at=_parse_payload_datetime(item["known_at"], "feature known_at"),
+                    source_ref=_payload_text(item["source_ref"], "feature source_ref"),
+                    contribution_key=_payload_text(
+                        item["contribution_key"], "feature contribution_key"
+                    ),
+                    entity_id=(
+                        None
+                        if item.get("entity_id") is None
+                        else _payload_text(item["entity_id"], "feature entity_id")
+                    ),
+                )
+                for item in raw_features
+            ),
+            input_refs=tuple(raw_input_refs),
+            quality_status=_payload_text(payload["quality_status"], "quality_status"),
+            missing_fields=tuple(raw_missing_fields),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"invalid snapshot payload: {error}") from error
+    verify_snapshot(snapshot, source_validator=source_validator)
+    if dict(payload) != snapshot_payload(snapshot, source_validator=source_validator):
+        raise ValueError("snapshot payload is not canonical")
+    return snapshot
 
 
 def _validated_state(
@@ -635,6 +713,23 @@ def _feature_payload(feature: SnapshotFeature) -> dict[str, Any]:
         "contribution_key": feature.contribution_key,
         "entity_id": feature.entity_id,
     }
+
+
+def _payload_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(f"snapshot {field_name} must be non-empty text")
+    return value
+
+
+def _parse_payload_datetime(value: Any, field_name: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"snapshot {field_name} must be an ISO-8601 string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        require_utc(parsed, field_name)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid snapshot {field_name}") from error
+    return parsed
 
 
 def _timestamp(value: datetime) -> str:

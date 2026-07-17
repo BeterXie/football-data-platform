@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -16,6 +17,7 @@ from typing import Any
 from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.models import require_utc
 from football_data_platform.domain.predictions import (
+    SCORE_GRID_COMPOSITION_SCHEMA_VERSION,
     ModelRunValidator,
     ScorePrediction,
     prediction_payload,
@@ -45,13 +47,79 @@ from football_data_platform.features.team_baseline import (
     parse_team_baseline_payload,
     team_baseline_payload,
 )
+from football_data_platform.storage.canonical import CanonicalStore
+from football_data_platform.storage.facts import (
+    load_verified_match_result,
+    verify_official_lineup_contract,
+)
 from football_data_platform.storage.layout import DataLayout
+from football_data_platform.storage.match_report_contracts import verify_match_report_contract
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
 DERIVED_MANIFEST_VERSION = 1
 DERIVED_CODE_VERSION = "football-data-platform/0.1.0"
 _SUCCESS_STATUSES = frozenset({"succeeded", "partial"})
 _KNOWN_STATUSES = frozenset({"running", "succeeded", "partial", "failed"})
+_REFERENCE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_REFERENCE_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_REFERENCE_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_DIGEST_REFERENCE_NAMESPACES = frozenset(
+    {
+        "challenger-evidence",
+        "cohort",
+        "derived-artifact",
+        "derived-source",
+        "evaluation",
+        "file-sha256",
+        "market-snapshot",
+        "match-report-contract",
+        "model-artifact",
+        "model-output",
+        "model-run",
+        "official-lineup-contract",
+        "paper-bet-entry",
+        "paper-ledger-recompute",
+        "paper-ledger-summary",
+        "player-profile",
+        "prediction",
+        "promotion-decision",
+        "promotion-policy",
+        "raw-asset",
+        "run",
+        "score-grid-composition",
+        "snapshot",
+        "team-baseline",
+        "training-dataset",
+        "vertical-slice-report",
+        "vertical-slice-summary",
+    }
+)
+_CANONICAL_RECORD_NAMESPACES = frozenset({"canonical", "event", "fact", "lineup"})
+_ENTITY_REFERENCE_NAMESPACES = frozenset({"competition", "match", "player", "season", "team"})
+_MANIFEST_OUTPUT_REFERENCE_NAMESPACES = frozenset(
+    {
+        "cohort",
+        "evaluation",
+        "paper-ledger-recompute",
+        "paper-ledger-summary",
+        "vertical-slice-report",
+        "vertical-slice-summary",
+    }
+)
+_TRAINING_REFERENCE_NAMESPACES = frozenset(
+    {
+        "derived-source",
+        "model-artifact",
+        "model-output",
+        "model-run",
+        "score-grid-composition",
+        "snapshot",
+        "team-baseline",
+        "training-dataset",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +556,11 @@ class DerivedArchive:
         """Write one immutable derived artifact manifest and recheck its identity."""
 
         _verify_artifact_manifest(manifest)
+        _ManifestReferenceResolver(self).verify(
+            input_refs=manifest.input_refs,
+            output_refs=manifest.output_refs,
+            status=manifest.status,
+        )
         return self._write_json(
             self.artifact_manifest_path(manifest.artifact_id), manifest.to_payload()
         )
@@ -502,6 +575,11 @@ class DerivedArchive:
         if manifest.artifact_id != artifact_id:
             raise ArchiveConflictError("derived artifact manifest ID does not match path")
         _verify_artifact_manifest(manifest)
+        _ManifestReferenceResolver(self).verify(
+            input_refs=manifest.input_refs,
+            output_refs=manifest.output_refs,
+            status=manifest.status,
+        )
         return manifest
 
     def write_derived_artifact(self, **kwargs: Any) -> DerivedArtifactManifest:
@@ -519,6 +597,11 @@ class DerivedArchive:
         """Persist a successful, partial, running, or failed run immutably."""
 
         _verify_run_manifest(manifest)
+        _ManifestReferenceResolver(self).verify(
+            input_refs=manifest.input_refs,
+            output_refs=manifest.output_refs,
+            status=manifest.status,
+        )
         return self._write_json(self.run_manifest_path(manifest.run_id), manifest.to_payload())
 
     def load_run_manifest(self, run_id: str) -> RunManifest:
@@ -531,6 +614,11 @@ class DerivedArchive:
         if manifest.run_id != run_id:
             raise ArchiveConflictError("run manifest ID does not match path")
         _verify_run_manifest(manifest)
+        _ManifestReferenceResolver(self).verify(
+            input_refs=manifest.input_refs,
+            output_refs=manifest.output_refs,
+            status=manifest.status,
+        )
         return manifest
 
     def write_run(self, **kwargs: Any) -> RunManifest:
@@ -648,6 +736,7 @@ class DerivedArchive:
     def write_official_lineup_source(
         self,
         *,
+        contract_id: str,
         match_id: MatchId,
         match_version: int,
         team_id: TeamId,
@@ -660,6 +749,14 @@ class DerivedArchive:
 
         if not isinstance(match_id, MatchId) or not isinstance(team_id, TeamId):
             raise TypeError("official lineup match_id and team_id must be platform IDs")
+        if (
+            not isinstance(contract_id, str)
+            or not contract_id.startswith("official-lineup-contract:")
+            or not _REFERENCE_DIGEST.fullmatch(
+                contract_id.removeprefix("official-lineup-contract:")
+            )
+        ):
+            raise ValueError("official lineup contract_id is invalid")
         if (
             not isinstance(match_version, int)
             or isinstance(match_version, bool)
@@ -677,6 +774,7 @@ class DerivedArchive:
         require_utc(known_at, "known_at")
         require_utc(observed_at, "observed_at")
         source_context = {
+            "contract_id": contract_id,
             "match_id": match_id.value,
             "match_version": match_version,
             "team_id": team_id.value,
@@ -686,7 +784,7 @@ class DerivedArchive:
         }
         return self._write_snapshot_source(
             value=[player_id.value for player_id in player_ids],
-            input_refs=(raw_asset_id,),
+            input_refs=(raw_asset_id, contract_id),
             transform_version="official-lineup-input/2",
             generated_at=observed_at,
             known_at=known_at,
@@ -876,7 +974,7 @@ class DerivedArchive:
         self._write_json(composition_path, {"id": output_ref, **payload})
         manifest = DerivedArtifactManifest.create(
             artifact_type="score-grid-composition",
-            schema_version=1,
+            schema_version=SCORE_GRID_COMPOSITION_SCHEMA_VERSION,
             payload=payload,
             generated_at=prediction.generated_at,
             started_at=prediction.generated_at,
@@ -1178,20 +1276,27 @@ class DerivedArchive:
     ) -> Path:
         """Archive one evaluation record without making market data implicit."""
 
-        payload = _json_safe(evaluation)
-        if not isinstance(payload, dict):
-            raise ValueError("evaluation must serialize to an object")
-        input_refs = tuple(str(item) for item in getattr(evaluation, "input_refs", ()))
-        evaluated_at = generated_at or getattr(evaluation, "evaluated_at", None)
-        if not isinstance(evaluated_at, datetime):
-            raise ValueError("evaluation requires evaluated_at or generated_at")
+        from football_data_platform.evaluation.metrics import (
+            EvaluationRecord,
+            evaluation_record_payload,
+            verify_evaluation_record,
+        )
+
+        if not isinstance(evaluation, EvaluationRecord):
+            raise TypeError("evaluation must be an EvaluationRecord")
+        verify_evaluation_record(evaluation)
+        if generated_at is not None and generated_at != evaluation.evaluated_at:
+            raise ValueError("evaluation generated_at must equal evaluated_at")
+        payload = evaluation_record_payload(evaluation)
+        input_refs = evaluation.input_refs
+        evaluated_at = evaluation.evaluated_at
         digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
         manifest = DerivedArtifactManifest.create(
             artifact_type="evaluation",
-            schema_version=int(payload.get("schema_version", 1)),
+            schema_version=evaluation.schema_version,
             payload=payload,
             generated_at=evaluated_at,
-            transform_version="evaluation/1",
+            transform_version="evaluation/2",
             code_version=code_version,
             input_refs=input_refs,
             output_refs=(f"evaluation:{digest}",),
@@ -1221,20 +1326,28 @@ class DerivedArchive:
         for path in (self.layout.derived / "manifests" / "artifacts").rglob("*.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                manifest = _parse_artifact_manifest(payload)
-            except (OSError, json.JSONDecodeError, ArchiveConflictError):
+            except (OSError, json.JSONDecodeError):
                 continue
-            if output_ref in manifest.output_refs:
-                matches.append(manifest)
+            if not isinstance(payload, dict):
+                continue
+            raw_output_refs = payload.get("output_refs")
+            if (
+                not isinstance(raw_output_refs, (list, tuple))
+                or any(not isinstance(item, str) for item in raw_output_refs)
+                or output_ref not in raw_output_refs
+            ):
+                continue
+            manifest = _parse_artifact_manifest(payload)
+            matches.append(self.load_artifact_manifest(manifest.artifact_id))
         if not matches:
             raise ArchiveConflictError(f"no derived manifest exposes output ref {output_ref}")
         if len(matches) > 1:
-            identities = {item.artifact_id for item in matches}
-            if len(identities) > 1:
+            semantic_identities = {_artifact_output_semantic_identity(item) for item in matches}
+            if len(semantic_identities) > 1:
                 raise ArchiveConflictError(
                     f"output ref {output_ref} resolves to conflicting manifests"
                 )
-        return matches[0]
+        return min(matches, key=lambda item: item.artifact_id)
 
     def run_manifest_path(self, run_id: str) -> Path:
         digest = _manifest_digest(run_id, "run")
@@ -1262,6 +1375,8 @@ class DerivedArchive:
             raw = RawArchive(self.layout)
             raw.verify(asset_id)
             return raw.load(asset_id).observed_at
+        if reference.startswith("official-lineup-contract:"):
+            return self._replay_official_lineup_contract(reference).observed_at
         try:
             if reference.startswith("player-profile:"):
                 _, manifest = self._load_player_profile_with_manifest(reference)
@@ -1284,6 +1399,7 @@ class DerivedArchive:
         source_context: dict[str, Any],
     ) -> None:
         expected_fields = {
+            "contract_id",
             "match_id",
             "match_version",
             "team_id",
@@ -1300,10 +1416,23 @@ class DerivedArchive:
             or source_context.get("player_ids") != value
             or source_context.get("known_at") != _timestamp(known_at)
             or source_context.get("observed_at") != _timestamp(generated_at)
-            or len(input_refs) != 1
-            or not input_refs[0].startswith("raw-asset:")
         ):
             raise ArchiveConflictError("official-lineup-input/2 source context is invalid")
+        raw_refs = tuple(
+            reference for reference in input_refs if reference.startswith("raw-asset:")
+        )
+        contract_refs = tuple(
+            reference
+            for reference in input_refs
+            if reference.startswith("official-lineup-contract:")
+        )
+        if (
+            len(raw_refs) != 1
+            or len(contract_refs) != 1
+            or len(input_refs) != 2
+            or source_context.get("contract_id") != contract_refs[0]
+        ):
+            raise ArchiveConflictError("official-lineup-input/2 lineage is invalid")
         try:
             MatchId(source_context["match_id"])
             TeamId(source_context["team_id"])
@@ -1319,34 +1448,32 @@ class DerivedArchive:
             or match_version < 1
         ):
             raise ArchiveConflictError("official-lineup-input/2 match_version is invalid")
-        canonical_path = self.layout.canonical / "platform.sqlite3"
-        if not canonical_path.exists():
-            raise ArchiveConflictError("canonical store is unavailable for official lineup source")
-        try:
-            with sqlite3.connect(canonical_path) as connection:
-                rows = connection.execute(
-                    "SELECT player_id, raw_asset_id FROM lineup_facts "
-                    "WHERE match_id = ? AND match_version = ? AND team_id = ? "
-                    "AND lineup_role = 'starter' AND official = 1 "
-                    "AND known_at = ? AND observed_at = ?",
-                    (
-                        source_context["match_id"],
-                        match_version,
-                        source_context["team_id"],
-                        source_context["known_at"],
-                        source_context["observed_at"],
-                    ),
-                ).fetchall()
-        except sqlite3.Error as error:
-            raise ArchiveConflictError("cannot query canonical official lineup facts") from error
+        contract = self._replay_official_lineup_contract(contract_refs[0])
+        contract_lineup = dict(contract.team_lineups).get(TeamId(source_context["team_id"]))
         if (
-            len(rows) != 11
-            or {row[0] for row in rows} != players
-            or {row[1] for row in rows} != set(input_refs)
+            contract.raw_asset_id.value != raw_refs[0]
+            or contract.match_id.value != source_context["match_id"]
+            or contract.match_version != match_version
+            or contract.published_at != known_at
+            or contract.observed_at != generated_at
+            or contract_lineup is None
+            or {player_id.value for player_id in contract_lineup} != players
         ):
             raise ArchiveConflictError(
-                "official-lineup-input/2 does not match canonical lineup facts"
+                "official-lineup-input/2 does not match its verified contract"
             )
+
+    def _replay_official_lineup_contract(self, contract_id: str):
+        try:
+            return verify_official_lineup_contract(
+                contract_id,
+                archive=RawArchive(self.layout),
+                canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+            )
+        except (OSError, KeyError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ArchiveConflictError(
+                "official lineup contract replay is unavailable or invalid"
+            ) from error
 
     def _validate_lineup_delta_source(
         self,
@@ -1547,6 +1674,251 @@ class DerivedArchive:
         return path
 
 
+class _ManifestReferenceResolver:
+    """Validate typed manifest refs and resolve successful input lineage."""
+
+    def __init__(self, archive: DerivedArchive) -> None:
+        self.archive = archive
+
+    def verify(
+        self,
+        *,
+        input_refs: tuple[str, ...],
+        output_refs: tuple[str, ...],
+        status: str,
+    ) -> None:
+        for reference in output_refs:
+            namespace = self._validate_syntax(reference)
+            if namespace in {"command", "missing-file", "source-url"}:
+                raise ArchiveConflictError(
+                    f"manifest output reference cannot be a diagnostic or locator: {reference}"
+                )
+            if namespace in {"market-snapshot", "sample"}:
+                raise ArchiveConflictError(
+                    f"manifest output reference has no authoritative standalone store: {reference}"
+                )
+
+        resolved_inputs = 0
+        for reference in input_refs:
+            namespace = self._validate_syntax(reference)
+            if namespace in {"command", "missing-file"}:
+                if status != "failed":
+                    raise ArchiveConflictError(
+                        f"{namespace}: references are only allowed in failed manifests"
+                    )
+                continue
+            if namespace == "source-url":
+                continue
+            if status not in _SUCCESS_STATUSES:
+                continue
+            try:
+                self._resolve_input(reference, namespace)
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError, sqlite3.Error) as error:
+                raise ArchiveConflictError(
+                    f"manifest input reference is unavailable or invalid: {reference}"
+                ) from error
+            resolved_inputs += 1
+
+        if status in _SUCCESS_STATUSES and resolved_inputs == 0:
+            raise ArchiveConflictError(
+                "successful and partial manifests require resolvable input lineage"
+            )
+
+    @staticmethod
+    def _validate_syntax(reference: str) -> str:
+        if not isinstance(reference, str) or not reference or reference.strip() != reference:
+            raise ArchiveConflictError("manifest reference must be non-empty canonical text")
+        namespace, separator, suffix = reference.partition(":")
+        if not separator or not suffix:
+            raise ArchiveConflictError(f"malformed manifest reference: {reference}")
+        if namespace in _DIGEST_REFERENCE_NAMESPACES:
+            if not _REFERENCE_DIGEST.fullmatch(suffix):
+                raise ArchiveConflictError(f"malformed {namespace} manifest reference: {reference}")
+            return namespace
+        if namespace == "collection-attempt":
+            if not _REFERENCE_UUID.fullmatch(suffix):
+                raise ArchiveConflictError(f"malformed collection-attempt reference: {reference}")
+            return namespace
+        if namespace == "fact":
+            kind, kind_separator, digest = suffix.partition(":")
+            if (
+                not kind_separator
+                or not _REFERENCE_TOKEN.fullmatch(kind)
+                or not _REFERENCE_DIGEST.fullmatch(digest)
+            ):
+                raise ArchiveConflictError(f"malformed canonical fact reference: {reference}")
+            return namespace
+        if namespace in _ENTITY_REFERENCE_NAMESPACES or namespace in {"command", "source-url"}:
+            if not _REFERENCE_TOKEN.fullmatch(suffix):
+                raise ArchiveConflictError(f"malformed {namespace} manifest reference: {reference}")
+            return namespace
+        if namespace in _CANONICAL_RECORD_NAMESPACES | {"sample"}:
+            if any(character.isspace() for character in suffix):
+                raise ArchiveConflictError(f"malformed {namespace} manifest reference: {reference}")
+            return namespace
+        if namespace == "missing-file":
+            return namespace
+        raise ArchiveConflictError(
+            f"unsupported manifest reference namespace {namespace!r}: {reference}"
+        )
+
+    def _resolve_input(self, reference: str, namespace: str) -> None:
+        if namespace == "file-sha256":
+            return
+        if namespace == "raw-asset":
+            RawArchive(self.archive.layout).verify(RawAssetId(reference))
+            return
+        if namespace == "prediction":
+            self._resolve_prediction_reference(reference)
+            return
+        if namespace in _TRAINING_REFERENCE_NAMESPACES:
+            self._resolve_training_reference(reference)
+            return
+        if namespace == "derived-artifact":
+            self.archive.load_artifact_manifest(reference)
+            return
+        if namespace == "run":
+            self.archive.load_run_manifest(reference)
+            return
+        if namespace == "player-profile":
+            self.archive.load_player_profile(reference)
+            return
+        if namespace in _MANIFEST_OUTPUT_REFERENCE_NAMESPACES:
+            self.archive._load_artifact_manifest_for_output_ref(reference)
+            return
+        if (
+            namespace in _CANONICAL_RECORD_NAMESPACES | _ENTITY_REFERENCE_NAMESPACES
+            or namespace
+            in {
+                "collection-attempt",
+                "match-report-contract",
+                "official-lineup-contract",
+            }
+        ):
+            self._resolve_canonical_reference(reference, namespace)
+            return
+        if namespace == "sample":
+            self._resolve_sample_reference(reference)
+            return
+        if namespace == "paper-bet-entry":
+            from football_data_platform.storage.ledger import PaperBetLedger
+
+            PaperBetLedger(self.archive.layout).load(reference)
+            return
+        if namespace in {"challenger-evidence", "promotion-decision", "promotion-policy"}:
+            from football_data_platform.storage.governance import GovernanceArtifactStore
+
+            GovernanceArtifactStore(self.archive.layout).verify_reference(reference)
+            return
+        if namespace == "market-snapshot":
+            raise ArchiveConflictError(
+                "market-snapshot references require an authoritative persisted snapshot store"
+            )
+        raise ArchiveConflictError(f"manifest reference has no resolver: {reference}")
+
+    def _resolve_training_reference(self, reference: str) -> None:
+        from football_data_platform.storage.training import TrainingArtifactStore
+
+        store = TrainingArtifactStore(self.archive.layout)
+        store._verify_training_reference(reference)
+
+    def _resolve_prediction_reference(self, reference: str) -> None:
+        digest = reference.removeprefix("prediction:")
+        path = self.archive.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ArchiveConflictError("prediction artifact must be an object")
+        identity = dict(payload)
+        stored_id = identity.pop("id", None)
+        if (
+            stored_id != reference
+            or hashlib.sha256(_canonical_json(identity)).hexdigest() != digest
+        ):
+            raise ArchiveConflictError("prediction artifact identity failed")
+        manifest = self.archive._load_artifact_manifest_for_output_ref(reference)
+        composition_ref = payload.get("composition_artifact_ref")
+        if (
+            manifest.artifact_type != "prediction"
+            or manifest.status != "succeeded"
+            or manifest.payload != payload
+            or not isinstance(composition_ref, str)
+            or composition_ref not in manifest.input_refs
+        ):
+            raise ArchiveConflictError("prediction artifact does not match its manifest")
+        self.archive.load_score_grid_composition_payload(composition_ref)
+
+    def _resolve_sample_reference(self, reference: str) -> None:
+        from football_data_platform.storage.training import TrainingArtifactStore
+
+        store = TrainingArtifactStore(self.archive.layout)
+        root = self.archive.layout.derived / "training-datasets"
+        for path in root.rglob("*.json"):
+            if not _REFERENCE_DIGEST.fullmatch(path.stem):
+                continue
+            try:
+                dataset = store.load_dataset(f"training-dataset:{path.stem}")
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+                continue
+            if any(sample.sample_id == reference for sample in dataset.samples):
+                return
+        raise ArchiveConflictError(f"training sample reference does not exist: {reference}")
+
+    def _resolve_canonical_reference(self, reference: str, namespace: str) -> None:
+        if namespace == "official-lineup-contract":
+            self.archive._replay_official_lineup_contract(reference)
+            return
+        if namespace == "match-report-contract":
+            verify_match_report_contract(
+                reference,
+                archive=RawArchive(self.archive.layout),
+                canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+            )
+            return
+        if namespace == "fact" and reference.startswith("fact:match_results_90:"):
+            load_verified_match_result(
+                reference,
+                archive=RawArchive(self.archive.layout),
+                canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+            )
+            return
+        path = self.archive.layout.canonical / "platform.sqlite3"
+        if not path.is_file():
+            raise ArchiveConflictError("canonical store is unavailable")
+        with sqlite3.connect(path) as connection:
+            if namespace in _ENTITY_REFERENCE_NAMESPACES:
+                row = connection.execute(
+                    "SELECT 1 FROM entities WHERE entity_id = ? AND entity_type = ? LIMIT 1",
+                    (reference, namespace),
+                ).fetchone()
+            elif namespace == "collection-attempt":
+                row = connection.execute(
+                    "SELECT 1 FROM collection_attempts WHERE collection_attempt_id = ? LIMIT 1",
+                    (reference,),
+                ).fetchone()
+            else:
+                row = self._canonical_record_reference(connection, reference)
+        if row is None:
+            raise ArchiveConflictError(f"canonical reference does not exist: {reference}")
+
+    @staticmethod
+    def _canonical_record_reference(
+        connection: sqlite3.Connection, reference: str
+    ) -> tuple[Any, ...] | None:
+        tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        for (table_name,) in tables:
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+            if "record_id" not in columns:
+                continue
+            row = connection.execute(
+                f"SELECT 1 FROM {table_name} WHERE record_id = ? LIMIT 1", (reference,)
+            ).fetchone()
+            if row is not None:
+                return row
+        return None
+
+
 def _verify_artifact_manifest(manifest: DerivedArtifactManifest) -> None:
     if not isinstance(manifest, DerivedArtifactManifest):
         raise TypeError("manifest must be a DerivedArtifactManifest")
@@ -1741,6 +2113,31 @@ def _validate_score_grid_composition_ref(value: str) -> None:
     digest = value.removeprefix(marker)
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError("invalid score-grid-composition reference digest")
+
+
+def _artifact_output_semantic_identity(manifest: DerivedArtifactManifest) -> bytes:
+    return _canonical_json(
+        {
+            "manifest_version": manifest.manifest_version,
+            "schema_version": manifest.schema_version,
+            "artifact_type": manifest.artifact_type,
+            "generated_at": _timestamp(manifest.generated_at),
+            "started_at": _timestamp(manifest.started_at),
+            "ended_at": _timestamp(manifest.ended_at),
+            "transform_version": manifest.transform_version,
+            "input_refs": list(manifest.input_refs),
+            "output_refs": list(manifest.output_refs),
+            "status": manifest.status,
+            "error": manifest.error,
+            "quality": manifest.quality,
+            "parameters": (
+                manifest.payload.get("parameters")
+                if isinstance(manifest.payload, Mapping)
+                else None
+            ),
+            "payload": manifest.payload,
+        }
+    )
 
 
 def _canonical_json(value: Any) -> bytes:

@@ -37,14 +37,15 @@ from football_data_platform.domain.predictions import (
     MarketStatus,
     MatchResult90,
     ScorePrediction,
-    prediction_payload,
 )
+from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import (
     DERIVED_CODE_VERSION,
     DerivedArchive,
     DerivedArtifactManifest,
     RunManifest,
 )
+from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 from football_data_platform.storage.training import TrainingArtifactStore
@@ -92,6 +93,13 @@ class PaperBetLedger:
     ) -> None:
         self.layout = layout.ensure()
         self.market_source_validator = market_source_validator or RawArchive(self.layout)
+        if result_validator is None:
+            canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+            canonical.initialize()
+            result_validator = CanonicalFactStore(
+                canonical,
+                raw_archive=RawArchive(self.layout),
+            )
         self.result_validator = result_validator
         self.persisted_model_runs = TrainingArtifactStore(self.layout)
         self.model_run_validator = model_run_validator or self.persisted_model_runs
@@ -383,77 +391,31 @@ class PaperBetLedger:
         return self.market_source_validator
 
     def _verify_persisted_prediction(self, prediction: ScorePrediction) -> None:
-        path = self._prediction_path(prediction.id.value)
         try:
-            stored = _read_object(path)
-        except LedgerConflictError as error:
+            stored = self.persisted_model_runs.load_verified_prediction(prediction.id.value)
+        except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise ValueError(
                 "paper ledger prediction artifact is unavailable or invalid"
             ) from error
-        if stored != prediction_payload(prediction):
+        if stored != prediction:
             raise ValueError("paper ledger prediction does not match its persisted artifact")
 
     def _verify_persisted_prediction_entry(self, entry: PaperBetEntry) -> None:
-        path = self._prediction_path(entry.prediction_id.value)
         try:
-            payload = _read_object(path)
-            stored_id = str(payload["id"])
-            identity = dict(payload)
-            identity.pop("id")
-            calculated = "prediction:" + hashlib.sha256(_canonical_json(identity)).hexdigest()
-            generated_at = _parse_datetime(payload["generated_at"], "prediction generated_at")
-            snapshot_as_of = _parse_datetime(payload["snapshot_as_of"], "prediction snapshot_as_of")
-        except (KeyError, TypeError, ValueError, LedgerConflictError) as error:
-            raise ValueError(
-                "paper ledger prediction artifact is unavailable or invalid"
-            ) from error
-        if stored_id != entry.prediction_id.value or calculated != entry.prediction_id.value:
-            raise ValueError("paper ledger prediction artifact identity is invalid")
-        composition_ref = payload.get("composition_artifact_ref")
-        if not isinstance(composition_ref, str):
-            raise ValueError("paper ledger prediction lacks a composition artifact reference")
-        try:
-            composition = self.derived.load_score_grid_composition_payload(composition_ref)
-            composition_manifest = self.derived._load_artifact_manifest_for_output_ref(
-                composition_ref
-            )
-            prediction_manifest = self.derived._load_artifact_manifest_for_output_ref(
+            prediction = self.persisted_model_runs.load_verified_prediction(
                 entry.prediction_id.value
             )
         except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
             raise ValueError(
-                "paper ledger prediction provenance is unavailable or invalid"
+                "paper ledger prediction artifact is unavailable or invalid"
             ) from error
         if (
-            composition_manifest.artifact_type != "score-grid-composition"
-            or composition_manifest.status != "succeeded"
-            or composition_manifest.payload != composition
-            or prediction_manifest.artifact_type != "prediction"
-            or prediction_manifest.status != "succeeded"
-            or prediction_manifest.payload != payload
-        ):
-            raise ValueError("paper ledger prediction provenance does not match its artifacts")
-        if (
-            payload.get("match_id") != entry.match_id.value
-            or payload.get("model_run_id") != entry.model_run_id.value
-            or generated_at != entry.prediction_generated_at
-            or snapshot_as_of != entry.prediction_snapshot_as_of
+            prediction.match_id != entry.match_id
+            or prediction.model_run_id != entry.model_run_id
+            or prediction.generated_at != entry.prediction_generated_at
+            or prediction.snapshot_as_of != entry.prediction_snapshot_as_of
         ):
             raise ValueError("paper ledger entry does not match its prediction artifact")
-        try:
-            artifact = self.persisted_model_runs.load_model_run(entry.model_run_id.value)
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            raise ValueError("paper ledger model artifact is unavailable or invalid") from error
-        if artifact.model_run_id != entry.model_run_id.value:
-            raise ValueError("paper ledger model artifact identity is invalid")
-
-    def _prediction_path(self, prediction_id: str) -> Path:
-        if not isinstance(prediction_id, str) or not prediction_id.startswith("prediction:"):
-            raise ValueError("invalid prediction ID")
-        digest = prediction_id.removeprefix("prediction:")
-        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-            raise ValueError("invalid prediction ID")
-        return self.layout.derived / "predictions" / digest[:2] / f"{digest}.json"
 
     def _validate_revision_parent(self, entry: PaperBetEntry) -> None:
         assert entry.prior_entry_id is not None
