@@ -157,8 +157,11 @@ class VerificationSession:
         self._sidecar_snapshots: dict[Path, tuple[Path, ...]] = {}
         self._artifact_manifests: dict[str, Any] = {}
         self._team_observations: dict[str, Any] = {}
+        self._player_observations: dict[tuple[str | None, str], Any] = {}
+        self._actual_lineup_facts: dict[tuple[str | None, str], Any] = {}
         self._match_results: dict[str, Any] = {}
         self._match_report_replays: dict[str, Any] = {}
+        self._match_report_player_batches: dict[str, Any] = {}
         self._resolving_manifests: set[str] = set()
 
     def __enter__(self) -> VerificationSession:
@@ -367,6 +370,38 @@ class VerificationSession:
         self._ensure_open()
         self._team_observations[source_ref] = observation
 
+    def cached_player_observation(
+        self, source_ref: str, *, contract_id: str | None = None
+    ) -> Any | None:
+        self._ensure_open()
+        return self._player_observations.get((contract_id, source_ref))
+
+    def remember_player_observation(
+        self,
+        source_ref: str,
+        observation: Any,
+        *,
+        contract_id: str | None = None,
+    ) -> None:
+        self._ensure_open()
+        self._player_observations[(contract_id, source_ref)] = observation
+
+    def cached_actual_lineup_fact(
+        self, source_ref: str, *, contract_id: str | None = None
+    ) -> Any | None:
+        self._ensure_open()
+        return self._actual_lineup_facts.get((contract_id, source_ref))
+
+    def remember_actual_lineup_fact(
+        self,
+        source_ref: str,
+        fact: Any,
+        *,
+        contract_id: str | None = None,
+    ) -> None:
+        self._ensure_open()
+        self._actual_lineup_facts[(contract_id, source_ref)] = fact
+
     def cached_match_result(self, source_ref: str) -> Any | None:
         self._ensure_open()
         return self._match_results.get(source_ref)
@@ -382,6 +417,14 @@ class VerificationSession:
     def remember_match_report_replay(self, contract_id: str, replay: Any) -> None:
         self._ensure_open()
         self._match_report_replays[contract_id] = replay
+
+    def cached_match_report_player_batch(self, contract_id: str) -> Any | None:
+        self._ensure_open()
+        return self._match_report_player_batches.get(contract_id)
+
+    def remember_match_report_player_batch(self, contract_id: str, batch: Any) -> None:
+        self._ensure_open()
+        self._match_report_player_batches[contract_id] = batch
 
     @contextmanager
     def resolving_artifact_manifest(self, artifact_id: str) -> Iterator[None]:

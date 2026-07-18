@@ -72,9 +72,24 @@
 match-report contract，并从同一份 raw parser 输出重算统计和对应主客进球；canonical 行存在本身
 不构成验证通过。它是球队长期基线的输入事实，不等同于已经拟合完成的球队基线。
 
-## 球员单场观察
+## 球员单场观察（`PlayerMatchObservation`）
 
-一名球员在一场具体比赛中的出场时间、位置、事件和统计记录。它是事实层数据，不等同于球员能力评价。
+一名球员在一个明确比赛版本中的出场时间、角色和统计记录。当前 match-report typed replay 会从
+同一份 raw parser 输出和合同观察时点的历史球员映射重算其身份、球队、分钟、角色与 metrics，并
+核对内容 ID 和精确证据。它是事实层数据，不等同于球员能力评价或已经生成的角色画像。
+
+## 实际阵容事实（`ActualLineupFact`）
+
+从赛后 match report 的 player rows 重放得到的 starter/bench 事实，当前固定为 `official=False`。
+它表示实际出场名单，不是赛前发布的官方首发，不能用作 `lineups-confirmed` 快照或
+official-lineup contract 的证据。
+
+## 逐场球员事实批次（`MatchReportPlayerBatch`）
+
+把同一 match-report contract、raw、比赛版本、`known_at` 和 `observed_at` 下的全部 typed player
+observations 与 actual-lineup facts 作为一个整体重放。availability 对 knowledge/observation 应用双
+cutoff，只接受最新可见且唯一的语义批次；latest 无效时保留候选引用和诊断且不回退，同一观察时点
+存在不同批次时以 ambiguity fail closed。
 
 ## 类型化事实重放（typed fact replay）
 
@@ -82,8 +97,8 @@ match-report contract，并从同一份 raw parser 输出重算统计和对应�
 `record_id` 是否存在。按 `as_of` 选择版本时，最新可见候选若重放失败，必须保留诊断并 fail closed，
 不能回退到更老但看似有效的事实。需要成对消费双方球队观察时，还要比较 latest facts 的
 match/version/contract/raw/`observed_at`/`known_at` provenance；pair mismatch 保留 latest refs 并
-fail closed，不回退旧组合。当前该能力已覆盖 90 分钟结果的部分边界和球队单场观察；球员单场
-观察、通用阵容事实、新闻证据和赛前事件仍未完成同等级 verifier。
+fail closed，不回退旧组合。当前该能力已覆盖 90 分钟结果的部分边界、球队单场观察和 match-report
+球员/实际阵容 batch；其他来源的通用阵容事实、新闻证据和赛前事件仍未完成同等级 verifier。
 
 ## 角色画像
 
@@ -191,9 +206,9 @@ fail closed，不回退旧组合。当前该能力已覆盖 90 分钟结果的�
 
 ## `archived-complete`
 
-某个明确完整性配置要求的赛后数据已经归档并通过来源、身份和字段质量校验。当前球队事实
-checkpoint 要求 typed result ref、provenance 配对一致的双方 typed team refs 且没有 replay
-diagnostics；只有 SQL 行存在不满足该状态。它不自动表示适用于所有训练任务。
+某个明确完整性配置要求的赛后数据已经归档并通过来源、身份和字段质量校验。当前 checkpoint
+要求 typed result ref、provenance 配对一致的双方 typed team refs、完整 verified player/actual-lineup
+batch 且没有 replay diagnostics；只有 SQL 行存在不满足该状态。它不自动表示适用于所有训练任务。
 
 ## 训练资格
 
@@ -212,7 +227,10 @@ team refs 的 match/version/contract/raw/`observed_at`/`known_at` provenance 一
 
 ## `player-profile-ready`
 
-数据版本具备实际阵容、球员身份、出场时间或角色以及画像规范要求的球员统计，可以用于球员角色画像。
+数据版本具备实际阵容、球员身份、出场时间或角色以及画像规范要求的球员统计，可以用于球员角色
+画像。当前 match-report checkpoint 会从 latest verified player batch 重算并绑定精确 contract/fact
+refs；完整 22 人样本可通过。该结果不表示赛前官方阵容、通用画像 producer、其他来源或全季生产
+覆盖已经完成。
 
 ## 平台实体 ID
 
@@ -249,13 +267,14 @@ team refs 的 match/version/contract/raw/`observed_at`/`known_at` provenance 一
 ## `VerificationSession`
 
 一次验证请求内共享的只读验证上下文。它提供一致的 canonical SQLite read snapshot，并只在本次
-请求中复用已完成的 manifest、typed fact 和 match-report replay；cache 不是持久化 authority，也
-不能证明尚未接入的 loader 已闭环。递归 manifest 的 in-progress guard 用于拒绝 lineage cycle。
+请求中复用已完成的 manifest、typed fact、match-report player batch 和 report replay；cache 不是
+持久化 authority，也不能证明尚未接入的 loader 已闭环。递归 manifest 的 in-progress guard 用于
+拒绝 lineage cycle。
 
 ## `FileProof`
 
 对验证期间实际读取文件的身份、大小和内容摘要证明，并在 `VerificationSession` 关闭时再次核对。
-当前 typed team/result/report 路径把相应 raw manifest 和对象字节纳入该证明；它保证请求内读取
+当前 typed team/player/result/report 路径把相应 raw manifest 和对象字节纳入该证明；它保证请求内读取
 稳定性，但不能替代事实类型自身的 parser、normalization 和领域语义重放。
 
 ## 纵向切片

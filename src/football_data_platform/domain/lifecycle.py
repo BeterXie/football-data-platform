@@ -71,6 +71,24 @@ class PlayerObservationAvailability:
 
 
 @dataclass(frozen=True, slots=True)
+class ActualLineupAvailability:
+    record_id: str
+    team_id: str
+    lineup_role: str
+    official: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record_id, str) or not self.record_id:
+            raise ValueError("actual lineup record_id must be non-empty text")
+        if not isinstance(self.team_id, str) or not self.team_id:
+            raise ValueError("actual lineup team_id must be non-empty text")
+        if self.lineup_role not in {"starter", "bench"}:
+            raise ValueError("actual lineup role must be starter or bench")
+        if not isinstance(self.official, bool):
+            raise TypeError("actual lineup official must be a bool")
+
+
+@dataclass(frozen=True, slots=True)
 class MatchAvailability:
     match_status: MatchStatus
     team_ids: tuple[str, str]
@@ -94,6 +112,17 @@ class MatchAvailability:
     team_stat_diagnostics: dict[str, str] = field(default_factory=dict)
     team_stat_pair_diagnostic: str | None = None
     player_observations: dict[str, PlayerObservationAvailability] | None = None
+    player_observation_refs: dict[str, str] = field(default_factory=dict)
+    actual_lineup_refs: dict[str, str] = field(default_factory=dict)
+    actual_lineups: dict[str, ActualLineupAvailability] = field(default_factory=dict)
+    player_fact_refs: tuple[str, ...] = ()
+    player_fact_contract_id: str | None = None
+    player_fact_contract_candidates: tuple[str, ...] = ()
+    player_fact_raw_asset_id: str | None = None
+    player_fact_known_at: datetime | None = None
+    player_fact_observed_at: datetime | None = None
+    player_fact_candidate_refs: tuple[str, ...] = ()
+    player_fact_diagnostic: str | None = None
     as_of: datetime | None = None
 
 
@@ -266,7 +295,7 @@ def _player_profile_qualification(
     evaluated_at: datetime,
     ruleset_version: str,
 ) -> QualificationResult:
-    reasons: list[str] = []
+    reasons = _player_fact_batch_reasons(availability, evaluated_at=evaluated_at)
     required_metrics_by_role = _PLAYER_REQUIRED_METRICS_BY_RULESET[ruleset_version]
     if availability.match_status is not MatchStatus.FINISHED:
         reasons.append("match_not_finished")
@@ -349,6 +378,8 @@ def _archive_complete(availability: MatchAvailability, *, evaluated_at: datetime
         return False
     if availability.team_stat_diagnostics:
         return False
+    if _player_fact_batch_reasons(availability, evaluated_at=evaluated_at):
+        return False
     if set(availability.starters) - set(availability.team_ids):
         return False
     for team_id in availability.team_ids:
@@ -363,6 +394,90 @@ def _archive_complete(availability: MatchAvailability, *, evaluated_at: datetime
         if not starters <= availability.player_observation_ids:
             return False
     return True
+
+
+def _player_fact_batch_reasons(
+    availability: MatchAvailability,
+    *,
+    evaluated_at: datetime,
+) -> list[str]:
+    reasons: list[str] = []
+    if availability.player_fact_diagnostic is not None:
+        reasons.append(availability.player_fact_diagnostic)
+    if availability.player_fact_contract_id is None:
+        reasons.append("missing_typed_player_fact_batch")
+    elif availability.player_fact_contract_id not in set(
+        availability.player_fact_contract_candidates
+    ):
+        reasons.append("typed_player_fact_batch_contract_mismatch")
+    if availability.player_fact_raw_asset_id is None:
+        reasons.append("typed_player_fact_batch_raw_missing")
+    if availability.player_fact_known_at is None:
+        reasons.append("typed_player_fact_batch_known_at_missing")
+    if availability.player_fact_observed_at is None:
+        reasons.append("typed_player_fact_batch_observed_at_missing")
+    if (
+        availability.player_fact_known_at is not None
+        and availability.player_fact_observed_at is not None
+        and availability.player_fact_known_at > availability.player_fact_observed_at
+    ):
+        reasons.append("typed_player_fact_batch_temporal_mismatch")
+    if _known_after(availability.player_fact_known_at, evaluated_at):
+        reasons.append("typed_player_fact_batch_known_after_evaluation")
+    if _known_after(availability.player_fact_observed_at, evaluated_at):
+        reasons.append("typed_player_fact_batch_observed_after_evaluation")
+    if availability.as_of is not None and (
+        _known_after(availability.player_fact_known_at, availability.as_of)
+        or _known_after(availability.player_fact_observed_at, availability.as_of)
+    ):
+        reasons.append("typed_player_fact_batch_after_as_of")
+
+    observation_ids = set(availability.player_observation_ids)
+    observation_ref_ids = set(availability.player_observation_refs)
+    player_observations = availability.player_observations or {}
+    observation_detail_ids = set(player_observations)
+    if observation_ref_ids != observation_ids or observation_detail_ids != observation_ids:
+        reasons.append("typed_player_fact_batch_player_set_mismatch")
+    actual_lineup_ids = set(availability.actual_lineup_refs)
+    if set(availability.actual_lineups) != actual_lineup_ids:
+        reasons.append("typed_player_fact_batch_lineup_detail_set_mismatch")
+    expected_teams = set(availability.team_ids)
+    recomputed_starters = {team_id: set() for team_id in availability.team_ids}
+    for player_id, detail in availability.actual_lineups.items():
+        if availability.actual_lineup_refs.get(player_id) != detail.record_id:
+            reasons.append(f"typed_actual_lineup_ref_mismatch:{player_id}")
+        if detail.official:
+            reasons.append(f"typed_actual_lineup_official_invalid:{player_id}")
+        if detail.team_id not in expected_teams:
+            reasons.append(f"typed_actual_lineup_team_invalid:{player_id}")
+        else:
+            observation = player_observations.get(player_id)
+            if observation is not None and observation.team_id != detail.team_id:
+                reasons.append(f"typed_actual_lineup_team_mismatch:{player_id}")
+            if detail.lineup_role == "starter":
+                recomputed_starters[detail.team_id].add(player_id)
+    reported_starters = {
+        team_id: set(availability.starters.get(team_id, frozenset()))
+        for team_id in availability.team_ids
+    }
+    if set(availability.starters) - expected_teams or reported_starters != recomputed_starters:
+        reasons.append("typed_player_fact_batch_lineup_set_mismatch")
+    expected_refs = {
+        *availability.player_observation_refs.values(),
+        *availability.actual_lineup_refs.values(),
+    }
+    if len(expected_refs) != len(availability.player_observation_refs) + len(
+        availability.actual_lineup_refs
+    ) or availability.player_fact_refs != tuple(sorted(expected_refs)):
+        reasons.append("typed_player_fact_batch_ref_mismatch")
+    if availability.player_fact_contract_id is not None and not expected_refs:
+        reasons.append("typed_player_fact_batch_empty")
+    if (
+        availability.player_fact_contract_id is not None
+        and availability.player_fact_candidate_refs != tuple(sorted(expected_refs))
+    ):
+        reasons.append("typed_player_fact_batch_candidate_ref_mismatch")
+    return reasons
 
 
 def _team_stat_pair_reason(availability: MatchAvailability) -> str | None:

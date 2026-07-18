@@ -506,7 +506,8 @@ def test_non_score_qualifications_and_captured_snapshots_fail_closed(tmp_path: P
         result_ref=second_result,
     )
     assert not player_profile.passed
-    assert "typed_player_fact_replay_unavailable" in player_profile.reason_codes
+    assert "typed_player_fact_replay_unavailable" not in player_profile.reason_codes
+    assert "missing_typed_player_fact_batch" in player_profile.reason_codes
 
     derived = DerivedArchive(layout)
     snapshot_path = next(

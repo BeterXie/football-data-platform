@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import football_data_platform.pipelines.vertical_slice as vertical_slice_module
 from football_data_platform.domain.ids import MatchId, RawAssetId, TeamId
 from football_data_platform.pipelines.vertical_slice import (
     _paired_baseline_team_facts,
@@ -76,7 +77,10 @@ def test_bundled_golden_files_match_parser_regression_fixtures() -> None:
         ).read_bytes()
 
 
-def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) -> None:
+def test_offline_vertical_slice_replays_idempotently_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     arguments = {
         "data_root": tmp_path / "data",
         "registry_path": ROOT / "config/competitions.toml",
@@ -88,6 +92,15 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
         "second_result_known_at": datetime(2025, 8, 23, 16, 0, tzinfo=UTC),
         "profile_minimum_minutes": 60,
     }
+
+    profile_inputs = []
+    original_build_profiles = vertical_slice_module.build_player_profiles
+
+    def capture_profile_inputs(observations, **kwargs):
+        profile_inputs.extend(observations)
+        return original_build_profiles(observations, **kwargs)
+
+    monkeypatch.setattr(vertical_slice_module, "build_player_profiles", capture_profile_inputs)
 
     first = run_offline_vertical_slice(**arguments)
     second = run_offline_vertical_slice(**arguments)
@@ -128,6 +141,16 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
         "# Premier League 2025-26 Vertical Slice"
     )
     canonical = CanonicalStore(DataLayout(arguments["data_root"]).canonical / "platform.sqlite3")
+    assert profile_inputs
+    assert all(
+        observation.source_ref.startswith("fact:player_match_observations:")
+        for observation in profile_inputs
+    )
+    assert all(
+        observation.played_at
+        == canonical.match_versions(MatchId(observation.match_id))[0].kickoff_at
+        for observation in profile_inputs
+    )
     with canonical.connect() as connection:
         lineup_sources = connection.execute(
             "SELECT lineup.official, raw.source, COUNT(*) AS count "
@@ -157,9 +180,15 @@ def test_offline_vertical_slice_replays_idempotently_end_to_end(tmp_path: Path) 
         item for item in artifacts if item.artifact_type == "vertical-slice-report"
     )
     qualifications = [item for item in artifacts if item.artifact_type == "training-qualification"]
+    profile_manifest = next(item for item in artifacts if item.artifact_type == "player-profiles")
     assert summary_artifact.input_refs == (run_manifest.run_id,)
     assert report_artifact.input_refs == (summary_artifact.artifact_id,)
     assert sorted(item.quality for item in qualifications) == ["failed", "failed"]
+    assert profile_manifest.input_refs
+    assert all(
+        reference.startswith("fact:player_match_observations:")
+        for reference in profile_manifest.input_refs
+    )
     assert not any(item.artifact_type == "score-grid-composition" for item in artifacts)
     assert not any(item.artifact_type == "prediction" for item in artifacts)
     assert not any(item.artifact_type == "evaluation" for item in artifacts)

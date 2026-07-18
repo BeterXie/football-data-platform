@@ -11,6 +11,10 @@ import pytest
 
 import football_data_platform.storage.derived as derived_module
 import football_data_platform.storage.verification as verification_module
+from football_data_platform.features.player_profiles import (
+    PlayerMatchObservation,
+    build_player_profiles,
+)
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.derived import DerivedArchive, DerivedArtifactManifest
 from football_data_platform.storage.layout import DataLayout
@@ -497,6 +501,68 @@ def test_nested_derived_manifest_resolution_reuses_catalog(
             == parent
         )
     assert calls == 1
+
+
+def test_nested_player_profile_resolution_reuses_explicit_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = _layout(tmp_path)
+    archive = DerivedArchive(layout)
+    evidence = _evidence(layout)
+    profile = build_player_profiles(
+        (
+            PlayerMatchObservation(
+                player_id="player:session-profile",
+                team_id="team:session-profile",
+                match_id="match:session-profile",
+                role="forward",
+                minutes=90,
+                known_at=OBSERVED_AT,
+                metrics={"shots": 1.0},
+                source_ref=evidence.id.value,
+                played_at=OBSERVED_AT,
+            ),
+        ),
+        as_of=OBSERVED_AT,
+        minimum_minutes=0,
+    ).profiles[0]
+    archive.write_player_profiles((profile,), generated_at=OBSERVED_AT)
+    parent = DerivedArtifactManifest.create(
+        artifact_type="verification-profile-parent",
+        payload={"profile": profile.artifact_id},
+        generated_at=OBSERVED_AT,
+        transform_version="verification-profile-parent/1",
+        code_version="git:test",
+        input_refs=(profile.artifact_id,),
+        output_refs=("file-sha256:" + "7" * 64,),
+        quality="ready",
+    )
+    archive.write_artifact_manifest(parent)
+    sessions: list[VerificationSession | None] = []
+    original_load = archive.load_player_profile
+
+    def tracked_load(
+        artifact_id: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ):
+        sessions.append(verification_session)
+        return original_load(
+            artifact_id,
+            verification_session=verification_session,
+        )
+
+    monkeypatch.setattr(archive, "load_player_profile", tracked_load)
+    with VerificationSession(layout) as session:
+        assert (
+            archive.load_artifact_manifest(
+                parent.artifact_id,
+                verification_session=session,
+            )
+            == parent
+        )
+        assert sessions == [session]
 
 
 def test_manifest_catalog_detects_file_added_during_scan(

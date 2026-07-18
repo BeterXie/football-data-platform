@@ -9,14 +9,18 @@
 本文把已复现的实现缺口转成可执行工作项和验收证据。状态只能由当前数据、运行清单、
 负向测试和端到端产物共同证明；测试通过但未覆盖对应风险时，工作项仍保持未完成。
 
-## Review Checkpoint (2026-07-18，R04 partial)
+## Review Checkpoint (2026-07-18，R04 player-fact partial)
 
 本节取代 2026-07-16 checkpoint 中“R01-R12 合同级修复均已完成”和固定测试数量等过强、
-已过时的当前状态描述。当前工作树关闭了一批已复现的持久化伪造路径，并完成 R04 的一个局部
-checkpoint，但不是十二项全部完成，也不是 Premier League 2025-26 全季或总体设计第一阶段的
-验收证书。截至本 checkpoint，本批 R04 与 request-local verification 修改尚未归档一次全量
-`pytest` 和统一质量门禁通过记录；此前分组测试只能证明对应局部合同。最终测试数量和全量门禁
-结果须在全部修改落定后重新运行并归档，不在计划正文写死。
+已过时的当前状态描述。当前工作树关闭了一批已复现的持久化伪造路径，并完成 R04 的 team/player
+fact 局部 checkpoint，但不是十二项全部完成，也不是 Premier League 2025-26 全季或总体设计
+第一阶段的验收证书。本 checkpoint 的直接相关完成矩阵为 `393 passed`，且 Ruff、format、compile
+和 `git diff --check` 通过；`prediction_evaluation` 与 `governance` 两组各在 1204 秒硬超时前没有
+失败，但都未完成，不能计作通过。本批未运行全量 `pytest`，因此不得写成全量回归或统一质量门禁
+已经通过。`fdp run-golden --data-root C:\tmp\fdp-r04-player-golden --observed-at
+2026-07-16T08:00:00Z` 连续两次均为 exit 0 / status `ok`，run ID 都是
+`run:4738458e8ec3b5a079b9ce083ee8f45dc0591d5d285feea1c63a84d85d531764`；
+`prediction_id=null` 是既有 fail-closed 预期。该临时目录运行只证明确定性 replay，不是归档证据。
 
 canonical 数据库已通过原子迁移升级到 schema v7。source mapping 现在保存稳定 `mapping_id`、
 单调版本、创建者、被替代映射和 UTC 半开有效区间；当前版本唯一、实体类型、版本连续性、区间
@@ -43,7 +47,22 @@ match/version/contract/raw/`observed_at`/`known_at` provenance；不一致时保
 `typed_team_fact_pair_mismatch`，不回退旧组合。lifecycle 会独立重算该配对约束，因而
 `archived-complete` 和 `team-baseline-ready` 都要求 typed result ref、配对一致的双方 typed team refs
 且无 replay diagnostics；training qualification 会继承计算结果并把实际 result/team refs 固定进产物。
-该 checkpoint 不包含 player-profile 或其余四类 canonical fact verifier。
+该 checkpoint 还为 match-report player facts 增加不可变 typed `PlayerMatchObservation`、
+`ActualLineupFact` 与聚合的 `MatchReportPlayerBatch`。batch loader 从唯一 report contract 重放 raw、
+parser 和合同观察时点的历史 match/team/player mapping，逐项核对内容身份、精确 `fact_evidence`、
+RawArchive 注册/manifest/对象字节、match/version/team/player、role、minutes、metrics、starter/bench、
+`known_at` 与 `observed_at`。availability 同时应用 knowledge/observation 两个 cutoff，只选择最新可见
+report batch；最新 batch 无效时保留候选 refs 和诊断且不回退，多个同观察时点但语义不同的 batch
+以 ambiguity fail closed。由赛后 match report 产生的 `ActualLineupFact.official=False` 只表示实际
+出场名单，不是赛前官方首发，也不能充当 `lineups-confirmed` 或 official-lineup contract 的证据。
+
+完整 22 人离线样本已证明 22 条 typed player observations、22 条 actual-lineup facts、双方各 11 名
+starter 能让 `player-profile-ready`、lifecycle 和 formal training qualification 通过，并把精确 batch
+contract/fact refs 固定进资格产物。bundled vertical slice 的画像输入不再直接消费 parser DTO：只从
+verified canonical player refs 构造，`played_at` 使用 canonical 精确比赛版本的 kickoff，画像 manifest
+也只引用这些 canonical refs。`VerificationSession` 已接入 player batch、单条 player observation 和
+actual-lineup replay，在同一请求的 DB snapshot/FileProof 上复用成功结果，失败结果不缓存。上述只是
+R04 player-fact checkpoint，不代表通用画像 producer、其他来源 lineup/news/event 或其余开放项完成。
 
 正式预测已使用 prediction schema v4 和 score-grid-composition schema v2。持久化预测的共享
 校验入口会重新加载并校验 snapshot、snapshot manifest、model run、prediction manifest、完整
@@ -84,9 +103,11 @@ dataset schema v2 只接受带该资格引用的 formal sample，旧 schema v1 �
 audit 路径。team-baseline qualification 已能绑定并重放 typed result 和双方 typed team refs；通用
 availability/lifecycle 会要求两条 latest team refs 共用 match/version/contract/raw/`observed_at`/
 `known_at`，mismatch 以显式 reason fail closed，training qualification 按同一路径继承。captured 资格
-在 trusted capture-run validator 缺失时仍 fail closed；
-player-profile-ready 因 typed player fact replay 尚不存在而显式失败，不能据此宣称已有正式可训练的
-全季数据集。formal score sample、dataset、model run 和 prediction 固定使用当前
+在 trusted capture-run validator 缺失时仍 fail closed。player-profile qualification 已能从最新 verified
+`MatchReportPlayerBatch` 重算实际阵容、角色、分钟和必需 metrics，绑定 batch contract 及全部 player/
+actual-lineup fact refs；完整 22 人测试可以通过，缺失、无效或歧义 batch 则保留诊断并失败。该局部
+资格通过不能据此宣称已有正式可训练的全季数据集。formal score sample、dataset、model run 和
+prediction 固定使用当前
 `snapshot-score-features/1` projection，不接受调用方自报其他 feature version。dataset/model-run
 loader 还要求各自恰好一份 semantic manifest，并精确核对完整 payload、版本、input/output refs、
 状态、质量和时间；CLI command wrapper 只登记命令输出文件引用，不再重复认领 dataset/model-run ID。
@@ -140,13 +161,15 @@ unavailable；这不是模型质量、真实市场基准或 ROI 证据，也不�
 match-report 的 ingest/replay 按 raw/contract `observed_at` 解析历史映射，其他下游不作此保证）、
 aliases/candidate confidence policy、现有 resolver 自动入队整合、player 与 provider-scoped
 Football-Data mapping、映射修订后的下游 requalification/recompute，以及完整跨源
-生产验证；`player_match_observations`、通用 `lineup_facts`、`news_evidence`、`prematch_events` 四类
-canonical fact 的内容与证据重放 verifier；player-profile producer；从来源字节推导比分和 `known_at` 的版本化
+生产验证；match-report player facts 之外的通用 `lineup_facts`、`news_evidence`、`prematch_events`
+内容与证据重放 verifier；其他来源的 lineup/news/event adapter；通用 player-profile producer；
+从来源字节推导比分和 `known_at` 的版本化
 `result-observation/parser-normalization` contract；`file-sha256` 引用对应文件字节的定位和复验；
 operator-owned、versioned `SourceRegistry`，以及行级 schedule `known_at` 元数据的生产签发与审计；
-snapshot completeness vNext；球员单场观察与画像独立重算；通用 baseline builder 的 canonical-only
-输入门禁；`observation_version` 对 SQLite `rowid` 顺序的剩余依赖和更精确的单条 replay 失败
-candidate diagnostics；comparison 创建 CLI；
+snapshot completeness vNext；通用 baseline builder 的 canonical-only 输入门禁；`observation_version`
+对 SQLite `rowid` 顺序的剩余依赖；公开可构造 lifecycle DTO 的非 formal authority 边界；lineup-delta
+校验完整贯穿 request-local session；`load_score_grid_composition_payload()` 的 orphan artifact manifest
+authority；comparison 创建 CLI；
 20 队/380 场及逐场真实 attempt；prospective `captured` capture-run；权威真实市场存储与 cohort；
 paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；经评审的晋级政策和观察期。
 市场、captured 或政策缺失时必须 fail closed，不得据此声称 ROI、模型晋级或全季完成。
@@ -262,8 +285,8 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
 
 ### FDP-R04：canonical 事实约束与生命周期推进过宽
 
-- 严重度：P1；状态：Open（typed result/team replay 与局部 lifecycle 门禁已实现，其余事实 verifier、
-  历史重认证和若干信任边界开放）。
+- 严重度：P1；状态：Open（typed result/team/player-batch replay 与局部 lifecycle/training 门禁已实现，
+  result normalization、其余来源/事实 verifier、历史重认证和若干信任边界开放）。
 - 当前实现证据：结果、球队观察、球员观察和阵容写入会检查 finished match version、比赛参与方
   与球员 assignment；三种 readiness 独立计算。`load_verified_match_result` 会重算 typed
   `MatchResult90` 的内容 ID、精确 `fact_evidence`，并核对 RawArchive 注册元数据和实际字节；fact
@@ -274,18 +297,22 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   不回退旧版本。双方 latest observation 的 match/version/contract/raw/`observed_at`/`known_at`
   provenance 会被 availability 比较并由 lifecycle 独立重算；mismatch 保留两条 latest refs，记录
   `typed_team_fact_pair_mismatch`，且不回退旧组合。`archived-complete` 要求 typed result ref、配对一致
-  的双方 typed team refs 且没有 replay diagnostics；`team-baseline-ready` 同样从这些 refs 计算，
-  score-model readiness 保持独立。
-  official lineup contract v2 会独立重放双方首发事实。
+  的双方 typed team refs、完整 verified player batch 且没有 replay diagnostics；`team-baseline-ready`
+  同样从 result/team refs 计算，score-model readiness 保持独立。match-report player batch 会从 raw
+  parser 和历史映射重算全部 `PlayerMatchObservation` 及 `ActualLineupFact(official=False)`，以双 cutoff
+  选择 latest，拒绝无效 latest 和同观察时点歧义，并为 formal `player-profile-ready` 绑定精确 contract/
+  fact refs；完整 22 人样本可通过 lifecycle 与 training qualification。official lineup contract v2
+  另行重放赛前双方官方首发，不能与赛后 actual lineup 混用。
 - 剩余缺口：typed result 尚未绑定版本化 `result-observation/parser-normalization` contract；
   `load_verified_match_result` 不会从 raw 重新解析比分，也不会按 parser/normalization policy 重算
-  `known_at`。`player_match_observations`、通用 `lineup_facts`、`news_evidence`、`prematch_events`
-  四类记录仍无与 typed result/team observation 等价的内容身份和证据 loader，player-profile-ready
-  因此仍 fail closed。team observation 的 `observation_version` 不在内容 ID 中；UPDATE trigger 和连续
-  版本检查关闭了直接调大 ordinal 的路径，但历史顺序检查仍依赖 SQLite `rowid`。availability 当前把
-  单条 candidate 的一组较宽异常压缩为通用 replay diagnostic，且未保留该失败 candidate ref；这与
-  已实现且会保留 latest refs 的 pair-mismatch 诊断是不同边界。历史数据的完整重新认证和差异清单
-  也未完成。
+  `known_at`。match-report/official-lineup 合同之外的通用 `lineup_facts`、`news_evidence` 和
+  `prematch_events` 仍无同等级 loader，其他来源 lineup/news/event 也未接入。team/player observation
+  的 `observation_version` 不在内容 ID 中；UPDATE trigger 和连续版本检查关闭了直接调大 ordinal 的
+  路径，但历史顺序检查仍依赖 SQLite `rowid`。公开可构造的 `MatchAvailability` /
+  `PlayerObservationAvailability` 可直接传给纯 `assess_lifecycle()`；该入口只验证结构自洽，不能作为
+  canonical authority。formal `TrainingArtifactStore._recompute_training_qualification()` 会从 canonical
+  重算并精确比较，因此这是 P2 非 formal 信任边界，不是 formal training 绕过。team availability 的
+  单条失败 candidate 诊断仍较粗且不保留 ref；历史数据完整重新认证和差异清单也未完成。
 - 设计依据：总体设计第 6、9、13 节；ADR-0013、ADR-0014、ADR-0016。
 - 初始复现/根因：结果、球队统计、球员观察和阵容缺少比赛状态及参与方约束；空统计集合也可满足
   `archived-complete`，导致错误事实继续进入 readiness。
@@ -371,17 +398,19 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
 
 ### FDP-R07：FBref 逐场归档链路尚未证明适配真实报告
 
-- 严重度：P1；状态：Open（parser/fixture/result replay 已实现，canonical stats replay 与生产证据开放）。
+- 严重度：P1；状态：Open（parser/fixture/result 及 match-report team/player stats replay 已实现，真实
+  FBref 变体适配、完整生产采集和全季证据开放）。
 - 当前实现证据：match-report 解析在写事实前交叉校验 raw 页面、赛事/赛季、双方、日期、比分、
   URL 和来源身份；生产导入固定要求七张表，显式自定义表集合仅用于 preview/研究，不能满足
   完整报告覆盖门禁；强门禁会从 RawArchive 重放并核对 parser version、source match、主客方向、
   赛事/赛季、日期、90 分钟比分、逐队表集合、缺表和阻断诊断；缺失表、重复表、未知表及逐队
   缺表均形成结构化诊断并阻断相应事实写入。赛程 parser 还会保留每行
   `data-fdp-fixture-known-at`，显式解析 cancelled/postponed，并允许 context 按精确 canonical match
-  version 重放对应 schedule raw；table-level 时间不能认证单场版本。上述重放只证明 parser 输出、
-  fixture/result 身份和必需表集合；match-report contract 尚未把写出的 canonical team/player stats
-  逐字段绑定回 raw parser 输出，事后删除或篡改统计事实不能由该 contract 检出。真实 380 场成功
-  报告覆盖仍未取得。
+  version 重放对应 schedule raw；table-level 时间不能认证单场版本。typed team observation 与 player
+  batch loader 已把写出的 canonical team/player stats、实际 starter/bench 集合和精确 evidence 逐字段
+  绑定回同一 raw parser 输出，删除、篡改、错配历史映射或不完整 batch 会失败。该证据来自保存的
+  离线 fixture；尚未证明 parser 能覆盖真实 FBref 报告的生产变体、受阻响应和全季 380 场，真实
+  成功/失败 attempt 清单也未取得。
 - 设计依据：总体设计第 5.2、16、17 节；ADR-0004、ADR-0017、ADR-0022。
 - 初始复现/根因：比赛报告管线信任调用方比赛 ID/比分，未与 raw 页面身份交叉核验；解析器依赖
   golden fixture 人工提供而真实 summary 可能缺少的字段。
@@ -412,17 +441,22 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   因此不会被通用命令 wrapper 破坏。request-local `VerificationSession` 通过 `ContextVar` 在同一验证
   请求内传播，提供单一只读 canonical SQLite snapshot、tri-state entity identity lookup、fail-closed
   manifest/sample catalog 和带 close-time 终检的 `FileProof`。当前接入路径只在本次请求内缓存已完成
-  的 artifact manifest、typed result、typed team observation 与 match-report replay；同一 report contract
-  不重复解析，失败不作为可复用验证结果。raw manifest 和对象字节均进入 `FileProof`，canonical
-  result/team/report replay 使用同一 DB snapshot；manifest 的 in-progress guard 会拒绝递归 cycle。
+  的 artifact manifest、typed result、typed team/player observation、actual-lineup、player batch 与
+  match-report replay；同一 report contract 不重复解析，失败不作为可复用验证结果。raw manifest 和
+  对象字节均进入 `FileProof`，canonical result/team/player/report replay 使用同一 DB snapshot；manifest
+  的 in-progress guard 会拒绝递归 cycle。
 - 剩余缺口：上述 checkpoint 只证明已接入路径在单请求内使用一致 DB 视图并复验已读文件，不等于
   全链闭环。model/dataset、match-context、official-lineup、audit 旧扫描链，以及其他 public raw/
-  derived loader 尚未全部贯穿同一 session；cache 也不是跨请求 authority。通用 `file-sha256` resolver
+  derived loader 尚未全部贯穿同一 session；cache 也不是跨请求 authority。尤其
+  `DerivedArchive._validate_lineup_delta_source()` 对 raw source 和 player profile 的嵌套加载未传递
+  `verification_session`。public `load_score_grid_composition_payload()` 虽有文件证明和 content ID 校验，
+  仍不要求唯一、成功且类型正确的 semantic manifest，合法 orphan bytes 仍可能被直接加载。
+  通用 `file-sha256` resolver
   仍只校验引用语法，不能定位并
   重新哈希任意对应文件，也不能描述为可离线取回。typed result resolver 虽核对内容 ID、精确
   evidence、RawArchive 注册/字节和 fact/raw `observed_at`，仍缺版本化 parser/normalization contract
-  从 raw 重算比分与 `known_at`；player observation、通用 lineup、news 和 prematch event 仍缺 typed
-  replay verifier。行级 schedule `known_at` 虽可重放，其生产签发和 operator-owned 来源治理
+  从 raw 重算比分与 `known_at`；通用 lineup、news 和 prematch event 仍缺 typed replay verifier。
+  行级 schedule `known_at` 虽可重放，其生产签发和 operator-owned 来源治理
   尚未建立，不能把 bundled fixture 元数据当作 prospective capture 证据，也不能据此证明全季、
   captured、ROI 或模型质量。
 - 设计依据：总体设计第 6.3、16、17 节；ADR-0012、ADR-0016。
@@ -472,17 +506,23 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
 
 ### FDP-R10：球员画像与阵容增量可把空维度标记为 ready
 
-- 严重度：P1；状态：Open（readiness 与 lineup-delta 契约已实现，结构化观察开放）。
+- 严重度：P1；状态：Open（typed match-report observation、readiness、vertical profile 与 lineup-delta
+  局部契约已实现，通用画像 producer、session 闭环和真实全季覆盖开放）。
 - 当前实现证据：画像 readiness 校验角色必需维度、N/A、分钟/比赛阈值、窗口和 `as_of`；
   lineup delta 校验双方 11 人、非空 profile refs、契约版本、样本量、输入 raw/canonical
   引用和非空适用维度；`lineup-delta-input/3` 会逐项加载 player-profile manifest、重算增量，
   并与 `official-lineup-input/2` 绑定的 canonical official lineup facts 及其 raw refs 比对。
-  球员/球队归属由 canonical lineup fact 边界校验。
+  球员/球队归属由 canonical lineup fact 边界校验。match-report `PlayerMatchObservation` 与
+  `ActualLineupFact(official=False)` 已从 raw parser/history mapping 组成可重放 batch；完整 22 人测试
+  能通过 `player-profile-ready`。bundled vertical profile 只消费 verified canonical player refs，且
+  `played_at` 来自 canonical 精确版本 kickoff。
   `prematch-features/1` lineup 仅作为只读 legacy artifact；`prematch-features/2` 的 ready
   lineup 只接受 `/3` 证据。缺失、N/A、insufficient-sample 与 ready 保持独立。
-- 剩余缺口：canonical `player_match_observations.metrics_json` 仍是宽泛指标字典，没有版本化、
-  角色化的单场 observation artifact 和逐字段来源合同；player-profile manifest 虽验证形状与引用，
-  存储边界仍不能从结构化 observations 独立重算画像指标。真实全季球员覆盖也未证明。
+- 剩余缺口：typed batch 只覆盖 match-report 来源；canonical `metrics_json` 仍是宽泛指标字典，角色化
+  画像窗口和其他来源事实尚未形成完整生产合同。vertical producer 的 canonical-only 路径不能替代
+  通用 `build_player_profiles` producer 的独立 canonical 重算门禁；真实全季球员覆盖也未证明。
+  `DerivedArchive._validate_lineup_delta_source()` 的嵌套 raw/profile 加载未贯穿调用方
+  `VerificationSession`，request-local 一致读边界仍需补齐。
 - 设计依据：总体设计第 10、11、13、17 节；ADR-0006、ADR-0007、ADR-0014。
 - 初始复现/根因：画像 readiness 主要按总分钟判断，即使 `metrics` 为空也可 ready；阵容的所有球员
   `dimensions={}` 时会得到空 delta 且 ready。长期能力、近期状态、可用性和负荷也尚未作为
@@ -517,7 +557,9 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   `result-90/1` label ref 必须解析为通过内容/evidence/RawArchive 字节和 observation 时间校验的 typed
   `MatchResult90`，并精确匹配 goals 与 `label_known_at`。team-baseline qualification 还要求 availability
   选中的双方 typed `TeamMatchObservation` refs，并把 result 与 team refs 固定进 qualification
-  `fact_refs`；最新可见 team candidate 无效时记录诊断且不回退旧事实。dataset `generated_at` 不得早于
+  `fact_refs`；最新可见 team candidate 无效时记录诊断且不回退旧事实。player-profile qualification
+  同样从 latest verified player batch 重算并绑定 contract/player/actual-lineup refs；完整 22 人矩阵可
+  通过，latest invalid 或 ambiguous batch 会 fail closed。dataset `generated_at` 不得早于
   每个样本的 `feature_known_at`、`label_known_at` 和 captured `capture_observed_at`；成功/部分成功 dataset
   的每个输入还必须具有不晚于 `generated_at` 的 authoritative `available_at`。当前能提供 semantic
   `known_at` 的 feature ref 会与样本 `feature_known_at` 交叉校验；captured sample 的每个 feature
@@ -530,11 +572,12 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   prediction/evaluation。
 - 剩余缺口：并非所有 canonical/derived reference 都有 typed resolver 可提供 semantic
   `known_at`；通用 derived manifest 的递归 availability 校验不会从任意 payload 推导语义时间。
-  尚未接入的四类 canonical facts、`file-sha256` 以及 result 的 parser/normalization 语义仍未闭环；
+  尚未接入的通用 lineup/news/prematch-event facts、`file-sha256` 以及 result 的 parser/normalization
+  语义仍未闭环；
   不具备 authoritative `available_at` 的引用会 fail closed，并不等于已经完成语义重算。
-  player-profile-ready 仍因 typed player fact replay 不可用而失败；team-baseline qualification 已继承
-  latest team refs 的 provenance 配对门禁，但单条 replay 失败 candidate 的诊断仍过于粗粒度且不保留
-  该 ref。trusted capture-run 仍
+  player-profile-ready 的 match-report checkpoint 已可通过，但通用画像 producer、其他来源球员事实和
+  全季正式样本仍未闭环；team-baseline qualification 已继承 latest team refs 的 provenance 配对门禁，
+  但单条 team replay 失败 candidate 的诊断仍过于粗粒度且不保留该 ref。trusted capture-run 仍
   不存在，因此这些 training gates 只能称为 availability/serialization 骨架，不能把 reconstructed
   历史升级为 prospective captured，也不能单独证明训练集完全无泄漏；正式可训练的 full-season
   dataset，以及真实生产 champion/challenger 训练、复跑和回滚证据同样缺失。

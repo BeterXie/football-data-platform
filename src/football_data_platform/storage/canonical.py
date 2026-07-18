@@ -832,15 +832,17 @@ class CanonicalStore:
         source: str,
         source_id: str,
         as_of: datetime | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> ResolvedPlayer:
         mapping = self.resolve_source_mapping(
             source=source,
             entity_type="player",
             source_id=source_id,
             as_of=as_of,
+            _connection=_connection,
         )
         entity_id = mapping.entity_id.value
-        with self.connect() as connection:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             row = connection.execute(
                 "SELECT canonical_name FROM players WHERE player_id = ?", (entity_id,)
             ).fetchone()
@@ -3712,6 +3714,13 @@ CREATE TABLE IF NOT EXISTS player_match_observations (
     FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version),
     UNIQUE (match_id, match_version, player_id, observation_version)
 );
+
+CREATE TRIGGER IF NOT EXISTS player_match_observations_version_immutable
+BEFORE UPDATE OF observation_version ON player_match_observations
+WHEN OLD.observation_version <> NEW.observation_version
+BEGIN
+    SELECT RAISE(ABORT, 'player observation observation_version is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS lineup_facts (
     record_id TEXT PRIMARY KEY,

@@ -74,6 +74,7 @@ from football_data_platform.storage.derived import (
 from football_data_platform.storage.facts import (
     CanonicalFactStore,
     TeamMatchObservation,
+    load_verified_match_report_player_batch,
     load_verified_team_observation,
 )
 from football_data_platform.storage.layout import DataLayout
@@ -316,23 +317,25 @@ def _run_offline_vertical_slice(
     )
     baseline = baseline_result.artifact
 
-    player_observations: list[PlayerMatchObservation] = []
-    for team_report in report_ingest.parsed.teams:
-        team = canonical.mapped_team(source="fbref", source_id=team_report.source_team_id)
-        for player_row in team_report.players:
-            player = canonical.mapped_player(source="fbref", source_id=player_row.source_player_id)
-            player_observations.append(
-                PlayerMatchObservation(
-                    player_id=player.id.value,
-                    team_id=team.id.value,
-                    match_id=first_match_id.value,
-                    role=player_row.role,
-                    minutes=player_row.minutes,
-                    known_at=first_report_known_at,
-                    metrics=player_row.metrics,
-                    source_ref=report_ingest.raw_asset_id,
-                )
-            )
+    player_batch = load_verified_match_report_player_batch(
+        report_ingest.contract_id,
+        archive=archive,
+        canonical=canonical,
+    )
+    player_observations = [
+        PlayerMatchObservation(
+            player_id=observation.player_id.value,
+            team_id=observation.team_id.value,
+            match_id=observation.match_id.value,
+            role=observation.role,
+            minutes=observation.minutes,
+            known_at=observation.known_at,
+            metrics=dict(observation.metrics),
+            source_ref=observation.record_id,
+            played_at=first_version.kickoff_at,
+        )
+        for observation in player_batch.player_observations
+    ]
     profiles = build_player_profiles(
         tuple(player_observations),
         as_of=second_fixture.kickoff_at - timedelta(hours=24),

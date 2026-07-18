@@ -24,6 +24,7 @@ from football_data_platform.domain.ids import (
     TeamId,
 )
 from football_data_platform.domain.lifecycle import (
+    ActualLineupAvailability,
     LifecycleState,
     MatchAvailability,
     PlayerObservationAvailability,
@@ -1144,6 +1145,12 @@ def test_snapshot_verifier_rejects_tampered_identity_and_quality(tmp_path: Path)
 def test_qualifications_are_independent_but_cannot_skip_incomplete_archive() -> None:
     eleven_home = frozenset(f"home-player-{index}" for index in range(11))
     eleven_away = frozenset(f"away-player-{index}" for index in range(11))
+    bench_player = "home-player-bench"
+    home_players = eleven_home | {bench_player}
+    all_players = home_players | eleven_away
+    player_refs = {player_id: f"fact:player:{player_id}" for player_id in all_players}
+    lineup_refs = {player_id: f"fact:lineup:{player_id}" for player_id in all_players}
+    evaluated_at = datetime(2026, 7, 16, tzinfo=UTC)
     availability = MatchAvailability(
         match_status=MatchStatus.FINISHED,
         team_ids=(HOME.value, AWAY.value),
@@ -1160,12 +1167,40 @@ def test_qualifications_are_independent_but_cannot_skip_incomplete_archive() -> 
             AWAY.value: frozenset({"goals", "shots"}),
         },
         starters={HOME.value: eleven_home, AWAY.value: eleven_away},
-        player_observation_ids=eleven_home | eleven_away,
+        player_observation_ids=all_players,
+        player_observations={
+            player_id: PlayerObservationAvailability(
+                team_id=HOME.value if player_id in home_players else AWAY.value,
+                role="FW",
+                minutes=90,
+                metric_fields=frozenset({"shots"}),
+                known_at=evaluated_at,
+            )
+            for player_id in all_players
+        },
+        player_observation_refs=player_refs,
+        actual_lineup_refs=lineup_refs,
+        actual_lineups={
+            player_id: ActualLineupAvailability(
+                record_id=lineup_refs[player_id],
+                team_id=HOME.value if player_id in home_players else AWAY.value,
+                lineup_role="starter" if player_id != bench_player else "bench",
+                official=False,
+            )
+            for player_id in all_players
+        },
+        player_fact_refs=tuple(sorted((*player_refs.values(), *lineup_refs.values()))),
+        player_fact_contract_id="match-report-contract:test",
+        player_fact_contract_candidates=("match-report-contract:test",),
+        player_fact_raw_asset_id="raw-asset:test",
+        player_fact_known_at=evaluated_at,
+        player_fact_observed_at=evaluated_at,
+        player_fact_candidate_refs=tuple(sorted((*player_refs.values(), *lineup_refs.values()))),
     )
 
     assessment = assess_lifecycle(
         availability,
-        evaluated_at=datetime(2026, 7, 16, tzinfo=UTC),
+        evaluated_at=evaluated_at,
     )
     by_name = {result.qualification: result for result in assessment.qualifications}
 
@@ -1176,6 +1211,166 @@ def test_qualifications_are_independent_but_cannot_skip_incomplete_archive() -> 
     assert not by_name[Qualification.TEAM_BASELINE].passed
     assert by_name[Qualification.PLAYER_PROFILE].passed
     assert f"missing_team_stat:{AWAY.value}:xg" in by_name[Qualification.TEAM_BASELINE].reason_codes
+
+    bench_observation = availability.player_observations[bench_player]
+    bench_without_profile_metrics = replace(
+        availability,
+        player_observations={
+            **availability.player_observations,
+            bench_player: replace(bench_observation, metric_fields=frozenset()),
+        },
+    )
+    bench_profile = next(
+        result
+        for result in assess_lifecycle(
+            bench_without_profile_metrics,
+            evaluated_at=evaluated_at,
+        ).qualifications
+        if result.qualification is Qualification.PLAYER_PROFILE
+    )
+    assert bench_profile.passed
+    assert f"missing_player_metrics:{bench_player}" not in bench_profile.reason_codes
+
+    bench_lineup = availability.actual_lineups[bench_player]
+    invalid_bench_details = (
+        (
+            replace(
+                availability,
+                player_observation_refs={
+                    player_id: reference
+                    for player_id, reference in availability.player_observation_refs.items()
+                    if player_id != bench_player
+                },
+            ),
+            "typed_player_fact_batch_player_set_mismatch",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineup_refs={
+                    player_id: reference
+                    for player_id, reference in availability.actual_lineup_refs.items()
+                    if player_id != bench_player
+                },
+            ),
+            "typed_player_fact_batch_lineup_detail_set_mismatch",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineups={
+                    **availability.actual_lineups,
+                    bench_player: replace(bench_lineup, team_id=AWAY.value),
+                },
+            ),
+            f"typed_actual_lineup_team_mismatch:{bench_player}",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineups={
+                    **availability.actual_lineups,
+                    bench_player: replace(bench_lineup, official=True),
+                },
+            ),
+            f"typed_actual_lineup_official_invalid:{bench_player}",
+        ),
+    )
+    for forged_availability, expected_reason in invalid_bench_details:
+        profile = next(
+            result
+            for result in assess_lifecycle(
+                forged_availability,
+                evaluated_at=evaluated_at,
+            ).qualifications
+            if result.qualification is Qualification.PLAYER_PROFILE
+        )
+        assert not profile.passed
+        assert expected_reason in profile.reason_codes
+    with pytest.raises(ValueError, match="starter or bench"):
+        replace(bench_lineup, lineup_role="reserve")
+
+    forged = assess_lifecycle(
+        replace(availability, player_observations=None),
+        evaluated_at=evaluated_at,
+    )
+    forged_profile = next(
+        result
+        for result in forged.qualifications
+        if result.qualification is Qualification.PLAYER_PROFILE
+    )
+    assert not forged_profile.passed
+    assert "typed_player_fact_batch_player_set_mismatch" in forged_profile.reason_codes
+
+    selected_player = sorted(eleven_home)[0]
+    selected_detail = availability.actual_lineups[selected_player]
+    missing_details = dict(availability.actual_lineups)
+    missing_details.pop(selected_player)
+    invalid_actual_lineups = (
+        (
+            replace(availability, actual_lineups=missing_details),
+            "typed_player_fact_batch_lineup_detail_set_mismatch",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineups={
+                    **availability.actual_lineups,
+                    selected_player: replace(selected_detail, lineup_role="bench"),
+                },
+            ),
+            "typed_player_fact_batch_lineup_set_mismatch",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineups={
+                    **availability.actual_lineups,
+                    selected_player: replace(selected_detail, official=True),
+                },
+            ),
+            f"typed_actual_lineup_official_invalid:{selected_player}",
+        ),
+        (
+            replace(
+                availability,
+                actual_lineups={
+                    **availability.actual_lineups,
+                    selected_player: replace(selected_detail, team_id=AWAY.value),
+                },
+            ),
+            "typed_player_fact_batch_lineup_set_mismatch",
+        ),
+    )
+    for forged_availability, expected_reason in invalid_actual_lineups:
+        assessment = assess_lifecycle(forged_availability, evaluated_at=evaluated_at)
+        profile = next(
+            result
+            for result in assessment.qualifications
+            if result.qualification is Qualification.PLAYER_PROFILE
+        )
+        assert not profile.passed
+        assert expected_reason in profile.reason_codes
+
+    candidate_refs = availability.player_fact_candidate_refs
+    invalid_candidate_refs = (
+        tuple(reference for reference in candidate_refs if reference != player_refs[bench_player]),
+        (*candidate_refs, candidate_refs[0]),
+        tuple(reversed(candidate_refs)),
+        (*candidate_refs[:-1], "fact:player:not-selected"),
+    )
+    for forged_refs in invalid_candidate_refs:
+        assessment = assess_lifecycle(
+            replace(availability, player_fact_candidate_refs=forged_refs),
+            evaluated_at=evaluated_at,
+        )
+        profile = next(
+            result
+            for result in assessment.qualifications
+            if result.qualification is Qualification.PLAYER_PROFILE
+        )
+        assert not profile.passed
+        assert "typed_player_fact_batch_candidate_ref_mismatch" in profile.reason_codes
 
 
 def test_finished_but_incomplete_archive_is_pending() -> None:

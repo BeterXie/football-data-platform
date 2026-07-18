@@ -938,6 +938,11 @@ class TrainingArtifactStore:
                 if team_id in availability.team_stat_refs
             }
             fact_refs = tuple(sorted({*fact_refs, *selected_team_refs}))
+        elif qualification is Qualification.PLAYER_PROFILE:
+            selected_player_refs = set(availability.player_fact_refs)
+            if availability.player_fact_contract_id is not None:
+                selected_player_refs.add(availability.player_fact_contract_id)
+            fact_refs = tuple(sorted(selected_player_refs))
         reasons = list(result.reason_codes)
         if qualification in {Qualification.SCORE_MODEL, Qualification.TEAM_BASELINE} and (
             result_ref is None
@@ -945,8 +950,6 @@ class TrainingArtifactStore:
             reasons.append("missing_bound_result_90")
         if qualification is Qualification.SCORE_MODEL and snapshot_ref is None:
             reasons.append("missing_bound_prematch_snapshot")
-        if qualification is Qualification.PLAYER_PROFILE:
-            reasons.append("typed_player_fact_replay_unavailable")
         normalized_reasons = tuple(sorted(set(reasons)))
         replayed_result = QualificationResult(
             qualification=qualification,

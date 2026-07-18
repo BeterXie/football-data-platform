@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.lifecycle import (
+    ActualLineupAvailability,
     MatchAvailability,
     PlayerObservationAvailability,
     SnapshotAvailability,
@@ -68,6 +69,61 @@ class TeamMatchObservation:
     observed_at: datetime
     raw_asset_id: RawAssetId
     contract_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerMatchObservation:
+    record_id: str
+    match_id: MatchId
+    match_version: int
+    team_id: TeamId
+    player_id: PlayerId
+    observation_version: int
+    role: str
+    minutes: float
+    metrics: Mapping[str, float | int | None]
+    known_at: datetime
+    observed_at: datetime
+    raw_asset_id: RawAssetId
+    contract_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActualLineupFact:
+    record_id: str
+    match_id: MatchId
+    match_version: int
+    team_id: TeamId
+    player_id: PlayerId
+    lineup_role: str
+    official: bool
+    known_at: datetime
+    observed_at: datetime
+    raw_asset_id: RawAssetId
+    contract_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class MatchReportPlayerBatch:
+    contract_id: str
+    match_id: MatchId
+    match_version: int
+    raw_asset_id: RawAssetId
+    known_at: datetime
+    observed_at: datetime
+    player_observations: tuple[PlayerMatchObservation, ...]
+    actual_lineup_facts: tuple[ActualLineupFact, ...]
+
+    @property
+    def fact_refs(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    *(item.record_id for item in self.player_observations),
+                    *(item.record_id for item in self.actual_lineup_facts),
+                }
+            )
+        )
 
 
 class OfficialLineupRawParseError(ValueError):
@@ -918,42 +974,60 @@ class CanonicalFactStore:
                 observed_at=team_stats_observed_at,
                 known_at=team_stats_known_at,
             )
-            lineup_query = (
-                "SELECT team_id, player_id FROM lineup_facts WHERE match_id = ? AND "
-                "match_version = ? AND lineup_role = 'starter' AND official = 1"
+            player_batch = _latest_verified_player_batch(
+                connection,
+                match_id=match_id,
+                match_version=int(version["version"]),
+                as_of_text=as_of_text,
+                archive=archive,
+                canonical=self.canonical,
+                verification_session=verification_session,
             )
-            lineup_parameters: list[object] = [match_id.value, version["version"]]
-            if as_of_text is not None:
-                lineup_query += " AND known_at <= ?"
-                lineup_parameters.append(as_of_text)
-            lineup_rows = connection.execute(lineup_query, tuple(lineup_parameters)).fetchall()
+            selected_player_batch = player_batch[0]
+            player_contract_candidates = player_batch[1]
+            player_candidate_refs = player_batch[2]
+            player_diagnostic = player_batch[3]
             starters: dict[str, set[str]] = {}
-            for row in lineup_rows:
-                starters.setdefault(row["team_id"], set()).add(row["player_id"])
-            player_query = (
-                "SELECT player_id, team_id, role, minutes, metrics_json, known_at "
-                "FROM player_match_observations WHERE match_id = ? AND match_version = ?"
-            )
-            player_parameters: list[object] = [match_id.value, version["version"]]
-            if as_of_text is not None:
-                player_query += " AND known_at <= ?"
-                player_parameters.append(as_of_text)
-            player_query += " ORDER BY observation_version DESC"
-            player_rows = connection.execute(player_query, tuple(player_parameters)).fetchall()
             player_observations: dict[str, PlayerObservationAvailability] = {}
-            for row in player_rows:
-                if row["player_id"] in player_observations:
-                    continue
-                metrics = json.loads(row["metrics_json"])
-                player_observations[row["player_id"]] = PlayerObservationAvailability(
-                    team_id=row["team_id"],
-                    role=row["role"],
-                    minutes=float(row["minutes"]),
-                    metric_fields=frozenset(
-                        key for key, value in metrics.items() if value is not None
-                    ),
-                    known_at=_parse_timestamp(row["known_at"]),
-                )
+            player_observation_refs: dict[str, str] = {}
+            actual_lineup_refs: dict[str, str] = {}
+            actual_lineups: dict[str, ActualLineupAvailability] = {}
+            player_fact_refs: tuple[str, ...] = ()
+            player_contract_id = None
+            player_raw_asset_id = None
+            player_known_at = None
+            player_observed_at = None
+            if selected_player_batch is not None:
+                player_contract_id = selected_player_batch.contract_id
+                player_raw_asset_id = selected_player_batch.raw_asset_id.value
+                player_known_at = selected_player_batch.known_at
+                player_observed_at = selected_player_batch.observed_at
+                player_fact_refs = selected_player_batch.fact_refs
+                for lineup in selected_player_batch.actual_lineup_facts:
+                    actual_lineup_refs[lineup.player_id.value] = lineup.record_id
+                    actual_lineups[lineup.player_id.value] = ActualLineupAvailability(
+                        record_id=lineup.record_id,
+                        team_id=lineup.team_id.value,
+                        lineup_role=lineup.lineup_role,
+                        official=lineup.official,
+                    )
+                    if lineup.lineup_role == "starter":
+                        starters.setdefault(lineup.team_id.value, set()).add(lineup.player_id.value)
+                for observation in selected_player_batch.player_observations:
+                    player_observation_refs[observation.player_id.value] = observation.record_id
+                    player_observations[observation.player_id.value] = (
+                        PlayerObservationAvailability(
+                            team_id=observation.team_id.value,
+                            role=observation.role,
+                            minutes=observation.minutes,
+                            metric_fields=frozenset(
+                                key
+                                for key, value in observation.metrics.items()
+                                if value is not None
+                            ),
+                            known_at=observation.known_at,
+                        )
+                    )
         return MatchAvailability(
             match_status=MatchStatus(version["status"]),
             team_ids=(match["home_team_id"], match["away_team_id"]),
@@ -977,6 +1051,17 @@ class CanonicalFactStore:
             team_stat_diagnostics=team_stat_diagnostics,
             team_stat_pair_diagnostic=team_stat_pair_diagnostic,
             player_observations=player_observations,
+            player_observation_refs=player_observation_refs,
+            actual_lineup_refs=actual_lineup_refs,
+            actual_lineups=actual_lineups,
+            player_fact_refs=player_fact_refs,
+            player_fact_contract_id=player_contract_id,
+            player_fact_contract_candidates=player_contract_candidates,
+            player_fact_raw_asset_id=player_raw_asset_id,
+            player_fact_known_at=player_known_at,
+            player_fact_observed_at=player_observed_at,
+            player_fact_candidate_refs=player_candidate_refs,
+            player_fact_diagnostic=player_diagnostic,
             as_of=as_of,
         )
 
@@ -1090,6 +1175,119 @@ def _team_observation_pair_diagnostic(
     ):
         return "typed_team_fact_pair_mismatch"
     return None
+
+
+def _latest_verified_player_batch(
+    connection: sqlite3.Connection,
+    *,
+    match_id: MatchId,
+    match_version: int,
+    as_of_text: str | None,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    verification_session: VerificationSession | None,
+) -> tuple[
+    MatchReportPlayerBatch | None,
+    tuple[str, ...],
+    tuple[str, ...],
+    str | None,
+]:
+    query = (
+        "SELECT contract.contract_id, contract.raw_asset_id, contract.observed_at, "
+        "raw.target_event_time FROM match_report_contracts AS contract JOIN raw_assets AS raw "
+        "ON raw.raw_asset_id = contract.raw_asset_id WHERE contract.match_id = ? "
+        "AND contract.match_version = ?"
+    )
+    parameters: list[object] = [match_id.value, match_version]
+    if as_of_text is not None:
+        query += (
+            " AND contract.observed_at <= ? AND "
+            "(raw.target_event_time IS NULL OR raw.target_event_time <= ?)"
+        )
+        parameters.extend((as_of_text, as_of_text))
+    query += " ORDER BY contract.observed_at DESC, contract.contract_id"
+    rows = connection.execute(query, tuple(parameters)).fetchall()
+    if not rows:
+        return None, (), (), None
+    latest_observed_at = rows[0]["observed_at"]
+    latest_rows = tuple(row for row in rows if row["observed_at"] == latest_observed_at)
+    contract_ids = tuple(str(row["contract_id"]) for row in latest_rows)
+    candidate_refs = tuple(
+        sorted(
+            {
+                reference
+                for row in latest_rows
+                for reference in _player_batch_candidate_refs(
+                    connection,
+                    raw_asset_id=str(row["raw_asset_id"]),
+                    observed_at=str(row["observed_at"]),
+                )
+            }
+        )
+    )
+    batches: list[MatchReportPlayerBatch] = []
+    for contract_id in contract_ids:
+        try:
+            batches.append(
+                load_verified_match_report_player_batch(
+                    contract_id,
+                    archive=archive,
+                    canonical=canonical,
+                    _connection=connection,
+                    verification_session=verification_session,
+                )
+            )
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            KeyError,
+            sqlite3.Error,
+        ):
+            return (
+                None,
+                contract_ids,
+                candidate_refs,
+                "typed_player_fact_batch_replay_invalid",
+            )
+    signatures = {
+        (
+            batch.match_id.value,
+            batch.match_version,
+            batch.known_at,
+            batch.observed_at,
+            batch.fact_refs,
+        )
+        for batch in batches
+    }
+    if len(signatures) != 1:
+        return None, contract_ids, candidate_refs, "typed_player_fact_batch_ambiguous"
+    return batches[0], contract_ids, candidate_refs, None
+
+
+def _player_batch_candidate_refs(
+    connection: sqlite3.Connection,
+    *,
+    raw_asset_id: str,
+    observed_at: str,
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        "SELECT player.record_id FROM player_match_observations AS player "
+        "JOIN fact_evidence AS evidence ON evidence.record_id = player.record_id "
+        "WHERE evidence.raw_asset_id = ? AND evidence.observed_at = ? "
+        "UNION SELECT lineup.record_id FROM lineup_facts AS lineup "
+        "JOIN fact_evidence AS evidence ON evidence.record_id = lineup.record_id "
+        "WHERE lineup.official = 0 AND evidence.raw_asset_id = ? "
+        "AND evidence.observed_at = ? ORDER BY 1",
+        (
+            raw_asset_id,
+            observed_at,
+            raw_asset_id,
+            observed_at,
+        ),
+    ).fetchall()
+    return tuple(str(row["record_id"]) for row in rows)
 
 
 def load_verified_match_result(
@@ -1391,6 +1589,449 @@ def load_verified_team_observation(
     return observation
 
 
+def load_verified_match_report_player_batch(
+    contract_id: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    _connection: sqlite3.Connection | None = None,
+    verification_session: VerificationSession | None = None,
+) -> MatchReportPlayerBatch:
+    """Replay one report and verify its complete canonical player/actual-lineup batch."""
+
+    _require_text(contract_id, "contract_id")
+    if verification_session is None:
+        from football_data_platform.storage.verification import active_verification_session
+
+        verification_session = active_verification_session(archive.layout)
+    if verification_session is not None:
+        cached = verification_session.cached_match_report_player_batch(contract_id)
+        if cached is not None:
+            return cached
+        _connection = verification_session.canonical_connection()
+    if _connection is None:
+        with canonical.connect() as connection:
+            batch = _verify_match_report_player_batch(
+                contract_id,
+                archive=archive,
+                canonical=canonical,
+                connection=connection,
+                verification_session=verification_session,
+            )
+    else:
+        batch = _verify_match_report_player_batch(
+            contract_id,
+            archive=archive,
+            canonical=canonical,
+            connection=_connection,
+            verification_session=verification_session,
+        )
+    if verification_session is not None:
+        verification_session.remember_match_report_player_batch(contract_id, batch)
+        for observation in batch.player_observations:
+            verification_session.remember_player_observation(
+                observation.record_id,
+                observation,
+                contract_id=contract_id,
+            )
+        for lineup in batch.actual_lineup_facts:
+            verification_session.remember_actual_lineup_fact(
+                lineup.record_id,
+                lineup,
+                contract_id=contract_id,
+            )
+    return batch
+
+
+def load_verified_player_observation(
+    source_ref: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    _connection: sqlite3.Connection | None = None,
+    verification_session: VerificationSession | None = None,
+) -> PlayerMatchObservation:
+    """Load one player observation only through its complete report batch replay."""
+
+    _require_text(source_ref, "source_ref")
+    if verification_session is None:
+        from football_data_platform.storage.verification import active_verification_session
+
+        verification_session = active_verification_session(archive.layout)
+    if verification_session is not None:
+        cached = verification_session.cached_player_observation(source_ref)
+        if cached is not None:
+            return cached
+        _connection = verification_session.canonical_connection()
+    batch = _verified_batch_for_canonical_fact(
+        source_ref,
+        table="player_match_observations",
+        archive=archive,
+        canonical=canonical,
+        connection=_connection,
+        verification_session=verification_session,
+    )
+    matches = tuple(item for item in batch.player_observations if item.record_id == source_ref)
+    if len(matches) != 1:
+        raise ValueError("canonical player observation does not belong to its verified batch")
+    if verification_session is not None:
+        verification_session.remember_player_observation(source_ref, matches[0])
+    return matches[0]
+
+
+def load_verified_actual_lineup_fact(
+    source_ref: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    _connection: sqlite3.Connection | None = None,
+    verification_session: VerificationSession | None = None,
+) -> ActualLineupFact:
+    """Load one report-derived actual-lineup fact through its complete batch replay."""
+
+    _require_text(source_ref, "source_ref")
+    if verification_session is None:
+        from football_data_platform.storage.verification import active_verification_session
+
+        verification_session = active_verification_session(archive.layout)
+    if verification_session is not None:
+        cached = verification_session.cached_actual_lineup_fact(source_ref)
+        if cached is not None:
+            return cached
+        _connection = verification_session.canonical_connection()
+    batch = _verified_batch_for_canonical_fact(
+        source_ref,
+        table="lineup_facts",
+        archive=archive,
+        canonical=canonical,
+        connection=_connection,
+        verification_session=verification_session,
+    )
+    matches = tuple(item for item in batch.actual_lineup_facts if item.record_id == source_ref)
+    if len(matches) != 1:
+        raise ValueError("canonical actual lineup fact does not belong to its verified batch")
+    if verification_session is not None:
+        verification_session.remember_actual_lineup_fact(source_ref, matches[0])
+    return matches[0]
+
+
+def _verified_batch_for_canonical_fact(
+    source_ref: str,
+    *,
+    table: str,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    connection: sqlite3.Connection | None,
+    verification_session: VerificationSession | None,
+) -> MatchReportPlayerBatch:
+    if table not in {"player_match_observations", "lineup_facts"}:
+        raise ValueError("unsupported match-report player fact table")
+    connection_scope = canonical.connect() if connection is None else nullcontext(connection)
+    with connection_scope as selected_connection:
+        row = selected_connection.execute(
+            f"SELECT match_id, match_version, observed_at, raw_asset_id"
+            f"{', official' if table == 'lineup_facts' else ''} FROM {table} "
+            "WHERE record_id = ?",
+            (source_ref,),
+        ).fetchone()
+        if row is None or (table == "lineup_facts" and row["official"] != 0):
+            raise ValueError("source_ref does not identify a report-derived player fact")
+        contracts = selected_connection.execute(
+            "SELECT contract_id FROM match_report_contracts WHERE match_id = ? "
+            "AND match_version = ? AND raw_asset_id = ? AND observed_at = ? "
+            "ORDER BY contract_id",
+            (row["match_id"], row["match_version"], row["raw_asset_id"], row["observed_at"]),
+        ).fetchall()
+        if len(contracts) != 1:
+            raise ValueError(
+                "canonical player fact batch requires one matching match-report contract"
+            )
+        return load_verified_match_report_player_batch(
+            str(contracts[0]["contract_id"]),
+            archive=archive,
+            canonical=canonical,
+            _connection=selected_connection,
+            verification_session=verification_session,
+        )
+
+
+def _verify_match_report_player_batch(
+    contract_id: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    connection: sqlite3.Connection,
+    verification_session: VerificationSession | None,
+) -> MatchReportPlayerBatch:
+    replay = replay_match_report_contract(
+        contract_id,
+        archive=archive,
+        canonical=canonical,
+        verification_session=verification_session,
+    )
+    contract = replay.contract
+    asset = archive.load(contract.raw_asset_id)
+    archive.verify(asset)
+    if asset.target_event_time is None:
+        raise ValueError("match-report player fact batch lacks its knowledge timestamp")
+    known_at = asset.target_event_time
+    observed_at = contract.observed_at
+    _require_temporal_order(known_at, observed_at)
+    _verify_player_batch_raw_registration(connection, asset)
+
+    expected_players: dict[str, dict[str, Any]] = {}
+    expected_lineups: dict[str, dict[str, Any]] = {}
+    mapped_player_ids: set[str] = set()
+    for team_report in replay.parsed.teams:
+        team = replay.identity.resolved_teams[team_report.source_team_id]
+        for player_row in team_report.players:
+            player = canonical.mapped_player(
+                source="fbref",
+                source_id=player_row.source_player_id,
+                as_of=observed_at,
+                _connection=connection,
+            )
+            if player.id.value in mapped_player_ids:
+                raise ValueError("match-report player fact batch maps one player more than once")
+            mapped_player_ids.add(player.id.value)
+            player_payload = {
+                "match_id": contract.match_id.value,
+                "match_version": contract.match_version,
+                "team_id": team.id.value,
+                "player_id": player.id.value,
+                "role": player_row.role,
+                "minutes": player_row.minutes,
+                "known_at": _timestamp(known_at),
+                "observed_at": _timestamp(observed_at),
+                "metrics_json": _json_text(player_row.metrics),
+                "raw_asset_id": contract.raw_asset_id.value,
+            }
+            player_ref = _record_id("player_match_observations", _semantic_payload(player_payload))
+            expected_players[player_ref] = player_payload
+            if player_row.starter is not None:
+                lineup_payload = {
+                    "match_id": contract.match_id.value,
+                    "match_version": contract.match_version,
+                    "team_id": team.id.value,
+                    "player_id": player.id.value,
+                    "lineup_role": "starter" if player_row.starter else "bench",
+                    "official": 0,
+                    "known_at": _timestamp(known_at),
+                    "observed_at": _timestamp(observed_at),
+                    "raw_asset_id": contract.raw_asset_id.value,
+                }
+                lineup_ref = _record_id("lineup", _semantic_payload(lineup_payload))
+                expected_lineups[lineup_ref] = lineup_payload
+
+    player_rows = connection.execute(
+        "SELECT player.record_id, player.match_id, player.match_version, player.team_id, "
+        "player.player_id, player.observation_version, player.role, player.minutes, "
+        "player.known_at, player.observed_at, player.metrics_json, player.raw_asset_id "
+        "FROM player_match_observations AS player JOIN fact_evidence AS evidence "
+        "ON evidence.record_id = player.record_id WHERE evidence.raw_asset_id = ? "
+        "AND evidence.observed_at = ? ORDER BY player.record_id",
+        (
+            contract.raw_asset_id.value,
+            _timestamp(observed_at),
+        ),
+    ).fetchall()
+    lineup_rows = connection.execute(
+        "SELECT lineup.record_id, lineup.match_id, lineup.match_version, lineup.team_id, "
+        "lineup.player_id, lineup.lineup_role, lineup.official, lineup.known_at, "
+        "lineup.observed_at, lineup.raw_asset_id FROM lineup_facts AS lineup "
+        "JOIN fact_evidence AS evidence ON evidence.record_id = lineup.record_id "
+        "WHERE lineup.official = 0 AND evidence.raw_asset_id = ? "
+        "AND evidence.observed_at = ? ORDER BY lineup.record_id",
+        (
+            contract.raw_asset_id.value,
+            _timestamp(observed_at),
+        ),
+    ).fetchall()
+    if {row["record_id"] for row in player_rows} != set(expected_players):
+        raise ValueError("canonical player fact batch does not match replayed parser player set")
+    if {row["record_id"] for row in lineup_rows} != set(expected_lineups):
+        raise ValueError("canonical actual lineup batch does not match replayed parser lineup set")
+
+    all_refs = tuple(sorted((*expected_players, *expected_lineups)))
+    placeholders = ", ".join("?" for _ in all_refs)
+    evidence_rows = connection.execute(
+        "SELECT record_id, raw_asset_id, observed_at FROM fact_evidence "
+        f"WHERE record_id IN ({placeholders}) AND raw_asset_id = ? AND observed_at = ? "
+        "ORDER BY record_id, raw_asset_id",
+        (*all_refs, contract.raw_asset_id.value, _timestamp(observed_at)),
+    ).fetchall()
+    expected_evidence = {
+        (reference, contract.raw_asset_id.value, _timestamp(observed_at)) for reference in all_refs
+    }
+    actual_evidence = {
+        (row["record_id"], row["raw_asset_id"], row["observed_at"]) for row in evidence_rows
+    }
+    if actual_evidence != expected_evidence:
+        raise ValueError("match-report player fact batch lacks exact raw evidence bindings")
+
+    observations: list[PlayerMatchObservation] = []
+    for row in player_rows:
+        payload = expected_players[str(row["record_id"])]
+        _validate_player_observation_row(connection, row, payload)
+        observations.append(
+            PlayerMatchObservation(
+                record_id=str(row["record_id"]),
+                match_id=MatchId(str(row["match_id"])),
+                match_version=int(row["match_version"]),
+                team_id=TeamId(str(row["team_id"])),
+                player_id=PlayerId(str(row["player_id"])),
+                observation_version=int(row["observation_version"]),
+                role=str(row["role"]),
+                minutes=float(row["minutes"]),
+                metrics=MappingProxyType(_parse_canonical_player_metrics(str(row["metrics_json"]))),
+                known_at=_parse_timestamp(str(row["known_at"])),
+                observed_at=observed_at,
+                raw_asset_id=contract.raw_asset_id,
+                contract_id=contract_id,
+            )
+        )
+
+    lineups: list[ActualLineupFact] = []
+    for row in lineup_rows:
+        payload = expected_lineups[str(row["record_id"])]
+        semantic_fields = {
+            field: value
+            for field, value in payload.items()
+            if field not in {"observed_at", "raw_asset_id"}
+        }
+        if any(row[field] != value for field, value in semantic_fields.items()):
+            raise ValueError("canonical actual lineup fact does not match replayed parser output")
+        lineups.append(
+            ActualLineupFact(
+                record_id=str(row["record_id"]),
+                match_id=MatchId(str(row["match_id"])),
+                match_version=int(row["match_version"]),
+                team_id=TeamId(str(row["team_id"])),
+                player_id=PlayerId(str(row["player_id"])),
+                lineup_role=str(row["lineup_role"]),
+                official=bool(row["official"]),
+                known_at=_parse_timestamp(str(row["known_at"])),
+                observed_at=observed_at,
+                raw_asset_id=contract.raw_asset_id,
+                contract_id=contract_id,
+            )
+        )
+
+    return MatchReportPlayerBatch(
+        contract_id=contract_id,
+        match_id=contract.match_id,
+        match_version=contract.match_version,
+        raw_asset_id=contract.raw_asset_id,
+        known_at=known_at,
+        observed_at=observed_at,
+        player_observations=tuple(observations),
+        actual_lineup_facts=tuple(lineups),
+    )
+
+
+def _verify_player_batch_raw_registration(connection: sqlite3.Connection, asset: Any) -> None:
+    row = connection.execute(
+        "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
+        "collector_version, media_type, size_bytes FROM raw_assets WHERE raw_asset_id = ?",
+        (asset.id.value,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("match-report player fact batch raw asset is not registered")
+    persisted = (
+        row["source"],
+        row["source_id"],
+        row["url"],
+        row["observed_at"],
+        row["target_event_time"],
+        row["checksum"],
+        row["collector_version"],
+        row["media_type"],
+        row["size_bytes"],
+    )
+    archived = (
+        asset.source,
+        asset.source_id,
+        asset.url,
+        _timestamp(asset.observed_at),
+        _timestamp(asset.target_event_time) if asset.target_event_time is not None else None,
+        asset.checksum,
+        asset.collector_version,
+        asset.media_type,
+        asset.size_bytes,
+    )
+    if persisted != archived:
+        raise ValueError("match-report player fact raw registration conflicts with the archive")
+
+
+def _validate_player_observation_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    expected_payload: Mapping[str, Any],
+) -> None:
+    if (
+        any(
+            not isinstance(row[field], str)
+            for field in (
+                "record_id",
+                "match_id",
+                "team_id",
+                "player_id",
+                "role",
+                "known_at",
+                "observed_at",
+                "metrics_json",
+                "raw_asset_id",
+            )
+        )
+        or any(type(row[field]) is not int for field in ("match_version", "observation_version"))
+        or not isinstance(row["minutes"], (int, float))
+        or isinstance(row["minutes"], bool)
+    ):
+        raise ValueError("canonical player observation contains invalid persisted field types")
+    if row["match_version"] < 1 or row["observation_version"] < 1:
+        raise ValueError("canonical player observation versions must be positive")
+    if not math.isfinite(float(row["minutes"])) or float(row["minutes"]) < 0:
+        raise ValueError("canonical player observation minutes are invalid")
+    _parse_canonical_player_metrics(str(row["metrics_json"]))
+    semantic_fields = {
+        field: value
+        for field, value in expected_payload.items()
+        if field not in {"observed_at", "raw_asset_id"}
+    }
+    if any(row[field] != value for field, value in semantic_fields.items()):
+        raise ValueError("canonical player observation does not match replayed parser output")
+    expected_ref = _record_id(
+        "player_match_observations", _semantic_payload(dict(expected_payload))
+    )
+    if row["record_id"] != expected_ref:
+        raise ValueError(
+            "canonical player observation content ID does not match persisted semantics"
+        )
+    _validate_player_observation_version_history(connection, row)
+
+
+def _validate_player_observation_version_history(
+    connection: sqlite3.Connection,
+    observation: sqlite3.Row,
+) -> None:
+    versions = [
+        item["observation_version"]
+        for item in connection.execute(
+            "SELECT observation_version FROM player_match_observations WHERE match_id = ? "
+            "AND match_version = ? AND player_id = ? ORDER BY rowid",
+            (
+                observation["match_id"],
+                observation["match_version"],
+                observation["player_id"],
+            ),
+        ).fetchall()
+    ]
+    if any(type(version) is not int for version in versions) or versions != list(
+        range(1, len(versions) + 1)
+    ):
+        raise ValueError("canonical player observation has invalid observation version history")
+
+
 def _team_observation_rows(
     source_ref: str,
     connection: sqlite3.Connection,
@@ -1681,6 +2322,17 @@ def _parse_canonical_team_stats(value: str) -> dict[str, float | int | None]:
     _validate_team_stats(parsed, "canonical team observation stats")
     if value != _json_text(parsed):
         raise ValueError("canonical team observation stats_json is not canonical")
+    return parsed
+
+
+def _parse_canonical_player_metrics(value: str) -> dict[str, float | int | None]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("canonical player observation metrics_json is invalid") from error
+    if not isinstance(parsed, dict) or _json_text(parsed) != value:
+        raise ValueError("canonical player observation metrics_json is not canonical")
+    _validate_metrics(parsed, "canonical player observation metrics")
     return parsed
 
 

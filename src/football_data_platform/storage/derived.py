@@ -54,7 +54,9 @@ from football_data_platform.features.team_baseline import (
 )
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.facts import (
+    load_verified_actual_lineup_fact,
     load_verified_match_result,
+    load_verified_player_observation,
     load_verified_team_observation,
     verify_official_lineup_contract,
 )
@@ -1428,18 +1430,32 @@ class DerivedArchive:
         )
         return self.write_artifact_manifest(manifest)
 
-    def load_player_profile(self, artifact_id: str) -> PlayerProfile:
+    def load_player_profile(
+        self,
+        artifact_id: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> PlayerProfile:
         """Load one profile only after validating its enclosing manifest."""
 
-        profile, _ = self._load_player_profile_with_manifest(artifact_id)
+        profile, _ = self._load_player_profile_with_manifest(
+            artifact_id,
+            verification_session=verification_session,
+        )
         return profile
 
     def _load_player_profile_with_manifest(
-        self, artifact_id: str
+        self,
+        artifact_id: str,
+        *,
+        verification_session: VerificationSession | None = None,
     ) -> tuple[PlayerProfile, DerivedArtifactManifest]:
         if not isinstance(artifact_id, str) or not artifact_id.startswith("player-profile:"):
             raise ArchiveConflictError("invalid player profile artifact reference")
-        manifest = self._load_artifact_manifest_for_output_ref(artifact_id)
+        manifest = self._load_artifact_manifest_for_output_ref(
+            artifact_id,
+            verification_session=verification_session,
+        )
         if manifest.artifact_type != "player-profiles":
             raise ArchiveConflictError(
                 "player profile reference resolves to the wrong artifact type"
@@ -1469,7 +1485,10 @@ class DerivedArchive:
         if not isinstance(excluded, list) or any(not isinstance(item, str) for item in excluded):
             raise ArchiveConflictError("player profile manifest excluded refs are invalid")
         for reference in sorted(set(excluded)):
-            self._verify_player_profile_input_ref(reference)
+            self._verify_player_profile_input_ref(
+                reference,
+                verification_session=verification_session,
+            )
         expected_inputs = tuple(
             sorted({ref for profile in profiles for ref in profile.input_refs} | set(excluded))
         )
@@ -1497,10 +1516,18 @@ class DerivedArchive:
             raise ArchiveConflictError("player profile manifest metadata does not match profiles")
         for profile in profiles:
             for reference in profile.input_refs:
-                self._verify_player_profile_input_ref(reference)
+                self._verify_player_profile_input_ref(
+                    reference,
+                    verification_session=verification_session,
+                )
         return by_id[artifact_id], manifest
 
-    def _verify_player_profile_input_ref(self, reference: str) -> None:
+    def _verify_player_profile_input_ref(
+        self,
+        reference: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> None:
         """Resolve a profile input through an immutable raw, derived, or canonical store."""
 
         if not isinstance(reference, str) or not reference or reference.strip() != reference:
@@ -1510,24 +1537,39 @@ class DerivedArchive:
                 RawArchive(self.layout).verify(RawAssetId(reference))
                 return
             if reference.startswith("derived-source:"):
-                self.validate_snapshot_source(reference)
+                self.validate_snapshot_source(
+                    reference,
+                    verification_session=verification_session,
+                )
                 return
             if reference.startswith("derived-artifact:"):
-                self.load_artifact_manifest(reference)
+                self.load_artifact_manifest(
+                    reference,
+                    verification_session=verification_session,
+                )
                 return
             if reference.startswith("team-baseline:"):
                 self.load_team_baseline(reference)
-                manifest = self._load_artifact_manifest_for_output_ref(reference)
+                manifest = self._load_artifact_manifest_for_output_ref(
+                    reference,
+                    verification_session=verification_session,
+                )
                 if manifest.artifact_type != "team-baseline":
                     raise ArchiveConflictError(
                         "profile input team baseline manifest has wrong type"
                     )
                 return
             if reference.startswith("player-profile:"):
-                self._load_player_profile_with_manifest(reference)
+                self._load_player_profile_with_manifest(
+                    reference,
+                    verification_session=verification_session,
+                )
                 return
             if reference.startswith(("canonical:", "fact:", "event:", "lineup:")):
-                self._verify_canonical_player_profile_ref(reference)
+                self._verify_canonical_player_profile_ref(
+                    reference,
+                    verification_session=verification_session,
+                )
                 return
         except (OSError, KeyError, ValueError, sqlite3.Error, ArchiveConflictError) as error:
             raise ArchiveConflictError(
@@ -1535,7 +1577,30 @@ class DerivedArchive:
             ) from error
         raise ArchiveConflictError(f"unsupported player profile input reference: {reference}")
 
-    def _verify_canonical_player_profile_ref(self, reference: str) -> None:
+    def _verify_canonical_player_profile_ref(
+        self,
+        reference: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> None:
+        archive = RawArchive(self.layout)
+        canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
+        if reference.startswith("fact:player_match_observations:"):
+            load_verified_player_observation(
+                reference,
+                archive=archive,
+                canonical=canonical,
+                verification_session=verification_session,
+            )
+            return
+        if reference.startswith("fact:lineup:"):
+            load_verified_actual_lineup_fact(
+                reference,
+                archive=archive,
+                canonical=canonical,
+                verification_session=verification_session,
+            )
+            return
         path = self.layout.canonical / "platform.sqlite3"
         if not path.exists():
             raise ArchiveConflictError("canonical store is unavailable for player profile input")
@@ -2470,7 +2535,10 @@ class _ManifestReferenceResolver:
             )
             return
         if namespace == "player-profile":
-            self.archive.load_player_profile(reference)
+            self.archive.load_player_profile(
+                reference,
+                verification_session=self.verification_session,
+            )
             return
         if namespace in _MANIFEST_OUTPUT_REFERENCE_NAMESPACES:
             self.archive._load_artifact_manifest_for_output_ref(
@@ -2594,6 +2662,7 @@ class _ManifestReferenceResolver:
                 reference,
                 archive=RawArchive(self.archive.layout),
                 canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+                verification_session=self.verification_session,
             )
             return
         if namespace == "fact" and reference.startswith("fact:match_results_90:"):
@@ -2606,6 +2675,22 @@ class _ManifestReferenceResolver:
             return
         if namespace == "fact" and reference.startswith("fact:team_match_observations:"):
             load_verified_team_observation(
+                reference,
+                archive=RawArchive(self.archive.layout),
+                canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+                verification_session=self.verification_session,
+            )
+            return
+        if namespace == "fact" and reference.startswith("fact:player_match_observations:"):
+            load_verified_player_observation(
+                reference,
+                archive=RawArchive(self.archive.layout),
+                canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+                verification_session=self.verification_session,
+            )
+            return
+        if namespace == "fact" and reference.startswith("fact:lineup:"):
+            load_verified_actual_lineup_fact(
                 reference,
                 archive=RawArchive(self.archive.layout),
                 canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),

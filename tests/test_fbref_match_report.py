@@ -35,7 +35,10 @@ from football_data_platform.storage import match_report_contracts as contract_re
 from football_data_platform.storage.canonical import CanonicalConflictError, CanonicalStore
 from football_data_platform.storage.facts import (
     CanonicalFactStore,
+    load_verified_actual_lineup_fact,
+    load_verified_match_report_player_batch,
     load_verified_match_result,
+    load_verified_player_observation,
     load_verified_team_observation,
 )
 from football_data_platform.storage.layout import DataLayout
@@ -45,6 +48,7 @@ from football_data_platform.storage.match_report_contracts import (
 )
 from football_data_platform.storage.raw import RawArchive
 from football_data_platform.storage.training import TrainingArtifactConflict, TrainingArtifactStore
+from football_data_platform.storage.verification import VerificationSession
 
 ROOT = Path(__file__).parents[1]
 OBSERVED_AT = datetime(2026, 7, 16, 6, 0, tzinfo=UTC)
@@ -110,6 +114,52 @@ def _complete_report_content() -> bytes:
         b"</tbody></table>"
     )
     return _report_content().replace(b"</body>", missing_tables + b"</body>")
+
+
+def _full_player_profile_report_content() -> bytes:
+    def rows(prefix: str, team_name: str) -> str:
+        return "".join(
+            f"""
+            <tr>
+              <th data-stat="player">
+                <a href="/en/players/{prefix}{index:02d}/p">{team_name} {index}</a>
+              </th>
+              <td data-stat="position">FW</td><td data-stat="games_starts">1</td>
+              <td data-stat="minutes">90</td><td data-stat="goals">0</td>
+              <td data-stat="xg">0.1</td><td data-stat="shots">1</td>
+              <td data-stat="shots_on_target">1</td>
+            </tr>
+            """
+            for index in range(11)
+        )
+
+    return f"""
+    <!doctype html><html><body>
+      <link rel="canonical" href="https://fbref.com/en/matches/aaaaaaaa/report">
+      <div class="scorebox">
+        <div class="scorebox_meta">
+          <a href="/en/comps/9/2025-2026/Premier-League-Stats">Premier League</a>
+          <span data-venue-date="2025-08-15"></span>
+        </div>
+        <div><strong><a href="/en/squads/18bb7c10/Arsenal-Stats">Arsenal</a></strong>
+          <div class="score">2</div></div>
+        <div><strong><a href="/en/squads/cff3d9bb/Chelsea-Stats">Chelsea</a></strong>
+          <div class="score">1</div></div>
+      </div>
+      <table id="stats_18bb7c10_summary"><tbody>
+        {rows("homep", "Home Player")}
+        <tr><th data-stat="player">Team Total</th><td data-stat="goals">2</td>
+          <td data-stat="xg">1.1</td><td data-stat="shots">11</td>
+          <td data-stat="shots_on_target">11</td></tr>
+      </tbody></table>
+      <table id="stats_cff3d9bb_summary"><tbody>
+        {rows("awayp", "Away Player")}
+        <tr><th data-stat="player">Team Total</th><td data-stat="goals">1</td>
+          <td data-stat="xg">1.1</td><td data-stat="shots">11</td>
+          <td data-stat="shots_on_target">11</td></tr>
+      </tbody></table>
+    </body></html>
+    """.encode()
 
 
 def _seed_team_observation_replay(
@@ -691,6 +741,463 @@ def test_match_report_ingest_creates_canonical_team_and_player_facts(tmp_path: P
         result_count = connection.execute("SELECT COUNT(*) FROM match_results_90").fetchone()[0]
     assert '"goals":2' in stats
     assert result_count == 1
+
+
+def test_verified_match_report_player_batch_replays_players_and_actual_lineup(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+
+    batch = load_verified_match_report_player_batch(
+        ingest.contract_id,
+        archive=archive,
+        canonical=canonical,
+    )
+
+    assert batch.contract_id == ingest.contract_id
+    assert batch.match_id == match_id
+    assert batch.match_version == 1
+    assert batch.raw_asset_id.value == ingest.raw_asset_id
+    assert batch.known_at == OBSERVED_AT == batch.observed_at
+    assert {item.record_id for item in batch.player_observations} == set(ingest.player_fact_ids)
+    assert len(batch.actual_lineup_facts) == 3
+    assert sum(item.lineup_role == "starter" for item in batch.actual_lineup_facts) == 2
+    assert all(not item.official for item in batch.actual_lineup_facts)
+    assert {
+        load_verified_player_observation(
+            item.record_id,
+            archive=archive,
+            canonical=canonical,
+        ).record_id
+        for item in batch.player_observations
+    } == {item.record_id for item in batch.player_observations}
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement"),
+    [
+        ("role", "GK"),
+        ("minutes", 1.0),
+        ("metrics_json", '{"shots":999.0}'),
+        ("known_at", "2026-07-16T05:59:00Z"),
+        ("observed_at", "2026-07-16T05:59:00Z"),
+    ],
+)
+def test_verified_player_observation_rejects_canonical_semantic_tampering(
+    tmp_path: Path,
+    column: str,
+    replacement: object,
+) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    reference = ingest.player_fact_ids[0]
+    with canonical.connect() as connection:
+        connection.execute(
+            f"UPDATE player_match_observations SET {column} = ? WHERE record_id = ?",
+            (replacement, reference),
+        )
+
+    with pytest.raises(ValueError, match="player observation|player fact batch"):
+        load_verified_player_observation(reference, archive=archive, canonical=canonical)
+
+
+def test_verified_player_batch_rejects_missing_actual_lineup_fact(tmp_path: Path) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    with canonical.connect() as connection:
+        reference = connection.execute(
+            "SELECT record_id FROM lineup_facts WHERE official = 0 ORDER BY record_id LIMIT 1"
+        ).fetchone()["record_id"]
+        connection.execute("DELETE FROM lineup_facts WHERE record_id = ?", (reference,))
+
+    with pytest.raises(ValueError, match="actual lineup|player fact batch"):
+        load_verified_match_report_player_batch(
+            ingest.contract_id,
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+def test_player_observation_version_is_immutable_and_history_is_replayed(tmp_path: Path) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    reference = ingest.player_fact_ids[0]
+
+    with canonical.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="observation_version is immutable"):
+            connection.execute(
+                "UPDATE player_match_observations SET observation_version = 99 WHERE record_id = ?",
+                (reference,),
+            )
+
+    assert (
+        load_verified_player_observation(reference, archive=archive, canonical=canonical).record_id
+        == reference
+    )
+
+    with canonical.connect() as connection:
+        connection.execute("DROP TRIGGER player_match_observations_version_immutable")
+        connection.execute(
+            "UPDATE player_match_observations SET observation_version = 2 WHERE record_id = ?",
+            (reference,),
+        )
+
+    with pytest.raises(ValueError, match="observation version history"):
+        load_verified_player_observation(reference, archive=archive, canonical=canonical)
+    with pytest.raises(ValueError, match="observation version history"):
+        load_verified_match_report_player_batch(
+            ingest.contract_id,
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+def test_player_batch_accepts_reused_semantic_facts_with_new_contract_evidence(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    second = ingest_fbref_match_report(
+        _report_content(),
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+
+    assert second.player_fact_ids == first.player_fact_ids
+    assert second.raw_asset_id != first.raw_asset_id
+    batch = load_verified_match_report_player_batch(
+        second.contract_id,
+        archive=archive,
+        canonical=canonical,
+    )
+    assert batch.raw_asset_id.value == second.raw_asset_id
+    assert batch.observed_at == later
+    assert {item.record_id for item in batch.player_observations} == set(first.player_fact_ids)
+    with canonical.connect() as connection:
+        assert {
+            row["raw_asset_id"]
+            for row in connection.execute(
+                "SELECT raw_asset_id FROM fact_evidence WHERE record_id = ?",
+                (first.player_fact_ids[0],),
+            ).fetchall()
+        } == {first.raw_asset_id, second.raw_asset_id}
+
+    facts = CanonicalFactStore(canonical, raw_archive=archive)
+    historical = facts.availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=OBSERVED_AT + timedelta(minutes=30),
+    )
+    latest = facts.availability(MatchId(schedule.canonical_match_ids[0]), as_of=later)
+    assert historical.player_fact_contract_id == first.contract_id
+    assert historical.player_fact_raw_asset_id == first.raw_asset_id
+    assert latest.player_fact_contract_id == second.contract_id
+    assert latest.player_fact_raw_asset_id == second.raw_asset_id
+    assert latest.player_fact_refs == historical.player_fact_refs
+
+
+def test_player_fact_cache_is_independent_of_contract_batch_load_order(tmp_path: Path) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    second = ingest_fbref_match_report(
+        _report_content(),
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report?revision=2",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    player_ref = first.player_fact_ids[0]
+    with canonical.connect() as connection:
+        lineup_ref = connection.execute(
+            "SELECT record_id FROM lineup_facts WHERE official = 0 ORDER BY record_id LIMIT 1"
+        ).fetchone()["record_id"]
+
+    with VerificationSession(DataLayout(tmp_path / "data"), canonical=canonical) as session:
+        old_before = load_verified_player_observation(
+            player_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        old_lineup_before = load_verified_actual_lineup_fact(
+            lineup_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        new_batch = load_verified_match_report_player_batch(
+            second.contract_id,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        old_after = load_verified_player_observation(
+            player_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        old_lineup_after = load_verified_actual_lineup_fact(
+            lineup_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+    assert old_before == old_after
+    assert old_after.contract_id == first.contract_id
+    assert old_after.observed_at == OBSERVED_AT
+    assert old_lineup_before == old_lineup_after
+    assert old_lineup_after.contract_id == first.contract_id
+    assert new_batch.observed_at == later
+
+    with VerificationSession(DataLayout(tmp_path / "data"), canonical=canonical) as session:
+        new_first = load_verified_match_report_player_batch(
+            second.contract_id,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        old = load_verified_player_observation(
+            player_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        old_lineup = load_verified_actual_lineup_fact(
+            lineup_ref,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+        new_again = load_verified_match_report_player_batch(
+            second.contract_id,
+            archive=archive,
+            canonical=canonical,
+            verification_session=session,
+        )
+    assert new_first == new_again
+    assert new_again.observed_at == later
+    assert old.contract_id == first.contract_id
+    assert old.observed_at == OBSERVED_AT
+    assert old_lineup.contract_id == first.contract_id
+    assert old_lineup.observed_at == OBSERVED_AT
+
+
+def test_player_batch_rejects_cross_match_fact_bound_to_same_raw_evidence(tmp_path: Path) -> None:
+    archive, canonical, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    player = canonical.mapped_player(source="fbref", source_id="playera1")
+    team = canonical.mapped_team(source="fbref", source_id="18bb7c10")
+    CanonicalFactStore(canonical).append_player_observation(
+        match_id=MatchId(schedule.canonical_match_ids[1]),
+        match_version=1,
+        team_id=team.id,
+        player_id=player.id,
+        role="FW",
+        minutes=10,
+        metrics={"shots": 1.0},
+        known_at=OBSERVED_AT,
+        observed_at=OBSERVED_AT,
+        raw_asset_id=RawAssetId(ingest.raw_asset_id),
+    )
+
+    with pytest.raises(ValueError, match="player set"):
+        load_verified_match_report_player_batch(
+            ingest.contract_id,
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+def test_player_profile_qualification_binds_exact_verified_report_batch_refs(
+    tmp_path: Path,
+) -> None:
+    archive, _, _, schedule, result_ref, ingest = _seed_team_observation_replay(tmp_path)
+    canonical = CanonicalStore(DataLayout(tmp_path / "data").canonical / "platform.sqlite3")
+    batch = load_verified_match_report_player_batch(
+        ingest.contract_id,
+        archive=archive,
+        canonical=canonical,
+    )
+    store = TrainingArtifactStore(DataLayout(tmp_path / "data"))
+
+    qualification = store.create_training_qualification(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        qualification=Qualification.PLAYER_PROFILE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=None,
+        result_ref=result_ref,
+    )
+
+    assert not qualification.passed
+    assert "typed_player_fact_replay_unavailable" not in qualification.reason_codes
+    assert any(reason.startswith("starter_count:") for reason in qualification.reason_codes)
+    assert set(qualification.fact_refs) == {*batch.fact_refs, ingest.contract_id}
+    assert store.load_training_qualification(qualification.qualification_id) == qualification
+
+
+def test_complete_player_report_batch_passes_player_profile_and_training_qualification(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule = _prepare_schedule(tmp_path)
+    result_ref = _seed_first_result(canonical, schedule)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    ingest = ingest_fbref_match_report(
+        _full_player_profile_report_content(),
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=match_id,
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=OBSERVED_AT,
+        archive=archive,
+        canonical=canonical,
+    )
+    batch = load_verified_match_report_player_batch(
+        ingest.contract_id,
+        archive=archive,
+        canonical=canonical,
+    )
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        match_id,
+        as_of=OBSERVED_AT,
+    )
+    assessment = assess_lifecycle(availability, evaluated_at=OBSERVED_AT)
+    qualifications = {item.qualification: item for item in assessment.qualifications}
+
+    assert len(batch.player_observations) == 22
+    assert len(batch.actual_lineup_facts) == 22
+    assert all(len(availability.starters[team_id]) == 11 for team_id in availability.team_ids)
+    assert qualifications[Qualification.PLAYER_PROFILE].passed
+    assert assessment.state.value == "training-ready"
+    scheduled = assess_lifecycle(
+        replace(availability, match_status=MatchStatus.SCHEDULED),
+        evaluated_at=OBSERVED_AT,
+    )
+    assert scheduled.state.value == "discovered"
+
+    store = TrainingArtifactStore(DataLayout(tmp_path / "data"))
+    qualification = store.create_training_qualification(
+        match_id=match_id,
+        match_version=1,
+        qualification=Qualification.PLAYER_PROFILE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=None,
+        result_ref=result_ref,
+    )
+    assert qualification.passed
+    assert set(qualification.fact_refs) == {*batch.fact_refs, ingest.contract_id}
+    assert store.load_training_qualification(qualification.qualification_id) == qualification
+
+
+def test_player_availability_keeps_invalid_latest_batch_and_does_not_fallback(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    changed = _report_content().replace(
+        b'<td data-stat="xg">1.4</td>',
+        b'<td data-stat="xg">1.5</td>',
+        1,
+    )
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report?revision=2",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    changed_ref = next(iter(set(second.player_fact_ids) - set(first.player_fact_ids)))
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE player_match_observations SET metrics_json = ? WHERE record_id = ?",
+            ('{"xg":999.0}', changed_ref),
+        )
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=later,
+    )
+
+    assert availability.player_fact_contract_id is None
+    assert availability.player_fact_contract_candidates == (second.contract_id,)
+    assert availability.player_fact_diagnostic == "typed_player_fact_batch_replay_invalid"
+    assert changed_ref in availability.player_fact_candidate_refs
+    assert availability.player_fact_refs == ()
+    assert availability.player_observation_ids == frozenset()
+    qualifications = {
+        item.qualification: item
+        for item in assess_lifecycle(availability, evaluated_at=later).qualifications
+    }
+    assert (
+        "typed_player_fact_batch_replay_invalid"
+        in qualifications[Qualification.PLAYER_PROFILE].reason_codes
+    )
+    assert (
+        "typed_player_fact_batch_replay_invalid"
+        not in qualifications[Qualification.SCORE_MODEL].reason_codes
+    )
+    assert (
+        "typed_player_fact_batch_replay_invalid"
+        not in qualifications[Qualification.TEAM_BASELINE].reason_codes
+    )
+
+
+def test_player_availability_rejects_non_equivalent_contracts_at_same_observed_at(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    changed = _report_content().replace(
+        b'<td data-stat="xg">1.4</td>',
+        b'<td data-stat="xg">1.5</td>',
+        1,
+    )
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report?revision=2",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=OBSERVED_AT,
+        archive=archive,
+        canonical=canonical,
+    )
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=OBSERVED_AT,
+    )
+
+    assert availability.player_fact_contract_id is None
+    assert availability.player_fact_contract_candidates == tuple(
+        sorted((first.contract_id, second.contract_id))
+    )
+    assert availability.player_fact_diagnostic == "typed_player_fact_batch_ambiguous"
+    assert availability.player_fact_refs == ()
 
 
 def test_verified_team_observation_replays_raw_contract_and_team_mapping(
