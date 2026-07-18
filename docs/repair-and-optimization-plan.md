@@ -362,7 +362,7 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
 
 ### FDP-R08：derived 血缘、运行清单和静态报告未闭环
 
-- 严重度：P2；状态：Open（manifest 与 typed resolver 已部分实现，字节及事实闭环开放）。
+- 严重度：P2；状态：Open（manifest、typed resolver 与直接字节证明已部分实现，深层闭环开放）。
 - 当前实现证据：derived artifact/run manifest 校验 namespace、内容身份、时间、状态、input/output
   refs 和重复 output 的语义一致性；失败/partial 运行、command output、training/model、governance、
   paper ledger、match-report 与 official-lineup contract 已有相应持久化或 replay 路径。training 的
@@ -374,15 +374,20 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   认领，并逐项核对 writer contract 的 payload、schema/transform、input/output refs、状态、质量与
   时间。`register-training-dataset` 和 `register-model-run` 的 CLI wrapper manifest 只认领命令摘要/
   文件内容引用，不再重复把 dataset/model-run ID 列为自身 output；semantic manifest 的唯一所有权
-  因此不会被通用命令 wrapper 破坏。
-- 剩余缺口：`file-sha256` 目前只校验引用语法，resolver 不定位或重新哈希对应文件字节，不能
-  描述为可离线取回；typed result resolver 只核对内容 ID、精确 evidence、RawArchive 注册/字节，
-  并要求 fact/raw `observed_at` 一致，但没有版本化 parser/normalization contract 来从 raw 重算
-  比分和 `known_at`；除 match-report 与 official-lineup 两个 parser contract 外的其余 canonical
-  facts 仍缺相应 typed replay verifier。行级 schedule `known_at` 目前能被重放，但其生产签发和
-  operator-owned 来源治理尚未建立，不能把 bundled fixture 元数据当作 prospective capture 证据。
-  通用 prediction resolver 只做较浅的 hash/manifest/composition 检查，正式消费者虽已使用共享
-  完整 loader，registry 本身仍需避免将浅检查描述成完整 domain replay。
+  因此不会被通用命令 wrapper 破坏。request-local `VerificationSession` 已提供只读 canonical
+  snapshot primitive、tri-state entity identity lookup、fail-closed manifest/sample catalog 和带终检的
+  `FileProof`。formal prediction 同一请求直接读取的 prediction、snapshot、composition、
+  snapshot-source 及其递归 raw manifest/object 字节已进入该 session，同时仍执行原 domain verifier。
+- 剩余缺口：上述 checkpoint 只证明 formal prediction 的直接字节在单请求内稳定，不等于全链闭环。
+  `VerificationSession.canonical_connection` 尚未注入 canonical domain replay；model/dataset、
+  match-context、official-lineup、typed result 的深层 replay，audit 旧扫描链，以及其他 public raw/
+  derived loader 仍未贯穿同一 session。通用 `file-sha256` resolver 仍只校验引用语法，不能定位并
+  重新哈希任意对应文件，也不能描述为可离线取回。typed result resolver 虽核对内容 ID、精确
+  evidence、RawArchive 注册/字节和 fact/raw `observed_at`，仍缺版本化 parser/normalization contract
+  从 raw 重算比分与 `known_at`；除 match-report 与 official-lineup 外的其他 canonical facts 仍缺
+  typed replay verifier。行级 schedule `known_at` 虽可重放，其生产签发和 operator-owned 来源治理
+  尚未建立，不能把 bundled fixture 元数据当作 prospective capture 证据，也不能据此证明全季、
+  captured、ROI 或模型质量。
 - 设计依据：总体设计第 6.3、16、17 节；ADR-0012、ADR-0016。
 - 初始复现/根因：归档重点限于 snapshot/prediction，球队基线、球员画像、训练集、模型运行、
   评估等缺少统一产物登记；运行摘要缺少完整时间、参数、代码版本、输入输出和失败记录。

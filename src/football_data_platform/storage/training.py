@@ -8,7 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from football_data_platform.domain.ids import MatchId, RawAssetId
 from football_data_platform.domain.lifecycle import (
@@ -27,6 +27,7 @@ from football_data_platform.domain.snapshots import (
     CURRENT_FEATURE_SPEC_VERSION,
     CaptureMode,
     PreMatchSnapshot,
+    SnapshotSourceValidation,
     parse_snapshot_payload,
 )
 from football_data_platform.domain.training import (
@@ -58,6 +59,9 @@ from football_data_platform.storage.facts import CanonicalFactStore, load_verifi
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
+if TYPE_CHECKING:
+    from football_data_platform.storage.verification import VerificationSession
+
 
 class TrainingArtifactConflict(ArchiveConflictError):
     """Raised when a training artifact conflicts with immutable storage."""
@@ -68,6 +72,18 @@ class _TrainingReferenceAvailability:
     reference: str
     available_at: datetime | None
     semantic_known_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionSnapshotSourceValidator:
+    archive: DerivedArchive
+    verification_session: VerificationSession
+
+    def validate_snapshot_source(self, source_ref: str) -> SnapshotSourceValidation:
+        return self.archive.validate_snapshot_source(
+            source_ref,
+            verification_session=self.verification_session,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,7 +455,28 @@ class TrainingArtifactStore:
         reference: str,
         *,
         require_current: bool,
+        verification_session: VerificationSession | None = None,
     ) -> tuple[ScorePrediction, PreMatchSnapshot]:
+        if require_current and verification_session is None:
+            from football_data_platform.storage.verification import VerificationSession
+
+            try:
+                with VerificationSession(self.layout) as session:
+                    return self._load_prediction_replay(
+                        reference,
+                        require_current=True,
+                        verification_session=session,
+                    )
+            except TrainingArtifactConflict:
+                raise
+            except ArchiveConflictError as error:
+                raise TrainingArtifactConflict(
+                    f"prediction domain replay is unavailable or invalid: {error}"
+                ) from error
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise TrainingArtifactConflict(
+                    f"prediction domain replay is unavailable or invalid: {error}"
+                ) from error
         replay_archive = (
             self.derived
             if require_current
@@ -448,10 +485,22 @@ class TrainingArtifactStore:
                 model_run_validator=_AuditModelRunValidator(self),
             )
         )
+        snapshot_validator = self.derived
+        if require_current:
+            assert verification_session is not None
+            # This slice proves directly read prediction/snapshot/composition/source bytes.
+            # Canonical contracts, model/dataset replay, and deeper match-context, official, and
+            # result replay still use their existing verifiers without a shared session.
+            snapshot_validator = _SessionSnapshotSourceValidator(
+                self.derived,
+                verification_session,
+            )
 
         try:
             prediction_manifest = (
-                self._load_fixed_code_manifest_for_output_ref(reference)
+                self._load_fixed_code_manifest_for_output_ref(
+                    reference, verification_session=verification_session
+                )
                 if require_current
                 else replay_archive._load_artifact_manifest_for_output_ref(reference)
             )
@@ -462,12 +511,15 @@ class TrainingArtifactStore:
                 "prediction",
                 manifest_archive=replay_archive,
                 manifest=prediction_manifest,
+                verification_session=verification_session,
             )
             snapshot_ref = payload.get("snapshot_id")
             if not isinstance(snapshot_ref, str):
                 raise TrainingArtifactConflict("prediction lacks a snapshot reference")
             snapshot_manifest = (
-                self._load_fixed_code_manifest_for_output_ref(snapshot_ref)
+                self._load_fixed_code_manifest_for_output_ref(
+                    snapshot_ref, verification_session=verification_session
+                )
                 if require_current
                 else replay_archive._load_artifact_manifest_for_output_ref(snapshot_ref)
             )
@@ -478,10 +530,11 @@ class TrainingArtifactStore:
                 "prematch-snapshot",
                 manifest_archive=replay_archive,
                 manifest=snapshot_manifest,
+                verification_session=verification_session,
             )
             snapshot = parse_snapshot_payload(
                 snapshot_document,
-                source_validator=self.derived,
+                source_validator=snapshot_validator,
             )
             if require_current and snapshot.feature_spec_version != CURRENT_FEATURE_SPEC_VERSION:
                 raise TrainingArtifactConflict(
@@ -505,14 +558,14 @@ class TrainingArtifactStore:
             prediction = parse_prediction_payload(
                 payload,
                 snapshot=snapshot,
-                snapshot_validator=self.derived,
+                snapshot_validator=snapshot_validator,
                 model_run_validator=(self if require_current else _AuditModelRunValidator(self)),
             )
             if require_current:
                 verify_prediction_snapshot(
                     prediction,
                     snapshot=snapshot,
-                    snapshot_validator=self.derived,
+                    snapshot_validator=snapshot_validator,
                     model_run_validator=self,
                 )
             expected_inputs = tuple(
@@ -533,7 +586,10 @@ class TrainingArtifactStore:
                 raise TrainingArtifactConflict(
                     "prediction manifest does not match its domain contract"
                 )
-            replay_archive.verify_score_grid_composition(prediction)
+            replay_archive.verify_score_grid_composition(
+                prediction,
+                verification_session=verification_session,
+            )
         except TrainingArtifactConflict as error:
             if _exception_chain_contains(error, "audit-only") or _exception_chain_contains(
                 error, "current score feature projection"
@@ -705,34 +761,54 @@ class TrainingArtifactStore:
                 "model run manifest does not match persisted model-run bytes"
             )
 
-    def _load_unique_manifest_for_output_ref(self, output_ref: str) -> DerivedArtifactManifest:
-        matches = 0
-        root = self.layout.derived / "manifests" / "artifacts"
-        for path in root.rglob("*.json"):
+    def _load_unique_manifest_for_output_ref(
+        self,
+        output_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> DerivedArtifactManifest:
+        # Build one request-local, fail-closed catalog.  The normal archive loader remains the
+        # authority for typed manifest and lineage validation after the catalog selects a path.
+        if verification_session is None:
+            from football_data_platform.storage.verification import VerificationSession
+
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            output_refs = payload.get("output_refs") if isinstance(payload, dict) else None
-            if (
-                isinstance(output_refs, list)
-                and all(isinstance(item, str) for item in output_refs)
-                and output_ref in output_refs
-            ):
-                matches += 1
-        if matches != 1:
-            raise TrainingArtifactConflict(
-                f"{output_ref} requires exactly one derived artifact manifest; found {matches}"
-            )
+                with VerificationSession(self.layout) as session:
+                    return self._load_unique_manifest_for_output_ref(
+                        output_ref, verification_session=session
+                    )
+            except TrainingArtifactConflict:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
+                if "requires exactly one derived artifact manifest" in str(error):
+                    raise TrainingArtifactConflict(str(error)) from error
+                raise TrainingArtifactConflict(
+                    f"{output_ref} derived artifact manifest is unavailable or invalid"
+                ) from error
         try:
-            return self.derived._load_artifact_manifest_for_output_ref(output_ref)
+            entry = verification_session.require_unique_manifest(output_ref)
+            manifest = self.derived.load_artifact_manifest(
+                entry.artifact_id,
+                verification_session=verification_session,
+            )
+            entry.proof.verify()
+            return manifest
         except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
+            if "requires exactly one derived artifact manifest" in str(error):
+                raise TrainingArtifactConflict(str(error)) from error
             raise TrainingArtifactConflict(
                 f"{output_ref} derived artifact manifest is unavailable or invalid"
             ) from error
 
-    def _load_fixed_code_manifest_for_output_ref(self, output_ref: str) -> DerivedArtifactManifest:
-        manifest = self._load_unique_manifest_for_output_ref(output_ref)
+    def _load_fixed_code_manifest_for_output_ref(
+        self,
+        output_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> DerivedArtifactManifest:
+        manifest = self._load_unique_manifest_for_output_ref(
+            output_ref, verification_session=verification_session
+        )
         if manifest.code_version != DERIVED_CODE_VERSION:
             raise TrainingArtifactConflict(
                 f"{output_ref} manifest does not use the fixed producer code_version"
@@ -1147,9 +1223,12 @@ class TrainingArtifactStore:
         *,
         manifest_archive: DerivedArchive | None = None,
         manifest: DerivedArtifactManifest | None = None,
+        verification_session: VerificationSession | None = None,
     ) -> dict[str, Any]:
         digest = _digest_id(reference, prefix)
         path = self.layout.derived / directory / digest[:2] / f"{digest}.json"
+        if verification_session is not None:
+            verification_session.file_proof(path)
         payload = self._read_json(path)
         if payload.get("id") != reference:
             raise TrainingArtifactConflict(f"{reference} ID does not match stored bytes")
@@ -1159,7 +1238,8 @@ class TrainingArtifactStore:
             raise TrainingArtifactConflict(f"{reference} content hash does not match its ID")
         if manifest is None:
             manifest = (manifest_archive or self.derived)._load_artifact_manifest_for_output_ref(
-                reference
+                reference,
+                verification_session=verification_session,
             )
         if (
             manifest.artifact_type != artifact_type

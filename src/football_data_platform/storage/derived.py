@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.models import require_utc
@@ -64,6 +64,9 @@ from football_data_platform.storage.match_context import (
 )
 from football_data_platform.storage.match_report_contracts import verify_match_report_contract
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
+
+if TYPE_CHECKING:
+    from football_data_platform.storage.verification import VerificationSession
 
 DERIVED_MANIFEST_VERSION = 1
 DERIVED_CODE_VERSION = "football-data-platform/0.1.0"
@@ -580,8 +583,15 @@ class DerivedArchive:
             self.artifact_manifest_path(manifest.artifact_id), manifest.to_payload()
         )
 
-    def load_artifact_manifest(self, artifact_id: str) -> DerivedArtifactManifest:
+    def load_artifact_manifest(
+        self,
+        artifact_id: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> DerivedArtifactManifest:
         path = self.artifact_manifest_path(artifact_id)
+        if verification_session is not None:
+            verification_session.file_proof(path)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -590,7 +600,7 @@ class DerivedArchive:
         if manifest.artifact_id != artifact_id:
             raise ArchiveConflictError("derived artifact manifest ID does not match path")
         _verify_artifact_manifest(manifest)
-        _ManifestReferenceResolver(self).verify(
+        _ManifestReferenceResolver(self, verification_session).verify(
             input_refs=manifest.input_refs,
             output_refs=manifest.output_refs,
             status=manifest.status,
@@ -1007,12 +1017,19 @@ class DerivedArchive:
         self._write_json(self._snapshot_source_path(source_ref), {"id": source_ref, **identity})
         return source_ref
 
-    def validate_snapshot_source(self, source_ref: str) -> SnapshotSourceValidation:
+    def validate_snapshot_source(
+        self,
+        source_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> SnapshotSourceValidation:
         """Verify a raw or derived snapshot source against immutable storage."""
 
         if not source_ref.startswith("derived-source:"):
             raise ValueError(f"snapshot source is not available in derived storage: {source_ref}")
         path = self._snapshot_source_path(source_ref)
+        if verification_session is not None:
+            verification_session.file_proof(path)
         payload = json.loads(path.read_text(encoding="utf-8"))
         stored_id = payload.pop("id", None)
         calculated = f"derived-source:{hashlib.sha256(_canonical_json(payload)).hexdigest()}"
@@ -1024,7 +1041,11 @@ class DerivedArchive:
         if tuple(sorted(set(input_refs))) != input_refs:
             raise ArchiveConflictError("derived snapshot source input_refs are not canonical")
         input_observed_at = [
-            self._validate_snapshot_source_input_ref(reference) for reference in input_refs
+            self._validate_snapshot_source_input_ref(
+                reference,
+                verification_session=verification_session,
+            )
+            for reference in input_refs
         ]
         generated_at = datetime.fromisoformat(str(payload["generated_at"]).replace("Z", "+00:00"))
         require_utc(generated_at, "generated_at")
@@ -1167,7 +1188,12 @@ class DerivedArchive:
         self.write_artifact_manifest(manifest)
         return composition_path
 
-    def verify_score_grid_composition(self, prediction: ScorePrediction) -> DerivedArtifactManifest:
+    def verify_score_grid_composition(
+        self,
+        prediction: ScorePrediction,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> DerivedArtifactManifest:
         """Verify the referenced composition bytes and manifest against a prediction."""
 
         verify_score_prediction(
@@ -1181,10 +1207,11 @@ class DerivedArchive:
         expected_output_ref = score_grid_composition_artifact_id(expected_payload)
         if artifact_ref != expected_output_ref:
             raise ArchiveConflictError("prediction composition artifact reference is not canonical")
+        composition_path = self.score_grid_composition_path(artifact_ref)
+        if verification_session is not None:
+            verification_session.file_proof(composition_path)
         try:
-            composition_payload = json.loads(
-                self.score_grid_composition_path(artifact_ref).read_text(encoding="utf-8")
-            )
+            composition_payload = json.loads(composition_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise ArchiveConflictError(
                 "prediction composition artifact bytes are unavailable or invalid"
@@ -1194,7 +1221,10 @@ class DerivedArchive:
         if composition_payload != expected_payload:
             raise ArchiveConflictError("prediction composition bytes do not match prediction")
         try:
-            manifest = self._load_artifact_manifest_for_output_ref(artifact_ref)
+            manifest = self._load_artifact_manifest_for_output_ref(
+                artifact_ref,
+                verification_session=verification_session,
+            )
         except (OSError, ValueError, ArchiveConflictError) as error:
             raise ArchiveConflictError(
                 "prediction composition artifact is unavailable or invalid"
@@ -1214,14 +1244,20 @@ class DerivedArchive:
             raise ArchiveConflictError("composition artifact predates prediction snapshot as_of")
         return manifest
 
-    def load_score_grid_composition_payload(self, artifact_ref: str) -> dict[str, Any]:
+    def load_score_grid_composition_payload(
+        self,
+        artifact_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> dict[str, Any]:
         """Load and verify one standalone composition payload by content ID."""
 
         _validate_score_grid_composition_ref(artifact_ref)
+        path = self.score_grid_composition_path(artifact_ref)
+        if verification_session is not None:
+            verification_session.file_proof(path)
         try:
-            payload = json.loads(
-                self.score_grid_composition_path(artifact_ref).read_text(encoding="utf-8")
-            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ArchiveConflictError("cannot load score-grid-composition bytes") from error
         stored_id = payload.pop("id", None)
@@ -1492,7 +1528,12 @@ class DerivedArchive:
         digest = artifact_ref.removeprefix("score-grid-composition:")
         return self.layout.derived / "compositions" / digest[:2] / f"{digest}.json"
 
-    def _load_artifact_manifest_for_output_ref(self, output_ref: str) -> DerivedArtifactManifest:
+    def _load_artifact_manifest_for_output_ref(
+        self,
+        output_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> DerivedArtifactManifest:
         """Resolve a logical output ref through immutable manifests.
 
         Manifest IDs include execution metadata, whereas composition IDs are
@@ -1500,7 +1541,10 @@ class DerivedArchive:
         separate and lets the manifest remain fully content-addressed.
         """
 
-        matches = self._load_artifact_manifests_for_output_ref(output_ref)
+        matches = self._load_artifact_manifests_for_output_ref(
+            output_ref,
+            verification_session=verification_session,
+        )
         if not matches:
             raise ArchiveConflictError(f"no derived manifest exposes output ref {output_ref}")
         if len(matches) > 1:
@@ -1512,10 +1556,21 @@ class DerivedArchive:
         return min(matches, key=lambda item: item.artifact_id)
 
     def _load_artifact_manifests_for_output_ref(
-        self, output_ref: str
+        self,
+        output_ref: str,
+        *,
+        verification_session: VerificationSession | None = None,
     ) -> list[DerivedArtifactManifest]:
         """Load every valid manifest file that claims one logical output ref."""
 
+        if verification_session is not None:
+            return [
+                self.load_artifact_manifest(
+                    entry.artifact_id,
+                    verification_session=verification_session,
+                )
+                for entry in verification_session.manifests_for_output_ref(output_ref)
+            ]
         matches: list[DerivedArtifactManifest] = []
         for path in (self.layout.derived / "manifests" / "artifacts").rglob("*.json"):
             try:
@@ -1555,12 +1610,24 @@ class DerivedArchive:
         digest = source_ref.removeprefix("derived-source:")
         return self.layout.derived / "snapshot-sources" / digest[:2] / f"{digest}.json"
 
-    def _validate_snapshot_source_input_ref(self, reference: str) -> datetime:
+    def _validate_snapshot_source_input_ref(
+        self,
+        reference: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> datetime:
         if reference.startswith("raw-asset:"):
             asset_id = RawAssetId(reference)
             raw = RawArchive(self.layout)
+            if verification_session is not None:
+                verification_session.file_proof(self.layout.raw_manifest_path(asset_id))
+            asset = raw.load(asset_id)
+            if verification_session is not None:
+                verification_session.file_proof(self.layout.raw_object_path(asset.checksum))
+            # FileProof extends byte stability only. RawArchive remains the domain authority for
+            # manifest identity, object checksum, and size.
             raw.verify(asset_id)
-            return raw.load(asset_id).observed_at
+            return asset.observed_at
         if reference.startswith("official-lineup-contract:"):
             return self._replay_official_lineup_contract(reference).observed_at
         if reference.startswith("fact:match_results_90:"):
@@ -1587,7 +1654,10 @@ class DerivedArchive:
                 _, manifest = self._load_player_profile_with_manifest(reference)
                 return manifest.generated_at
             if reference.startswith("derived-source:"):
-                return self.validate_snapshot_source(reference).observed_at
+                return self.validate_snapshot_source(
+                    reference,
+                    verification_session=verification_session,
+                ).observed_at
         except (OSError, KeyError, TypeError, ValueError, ArchiveConflictError) as error:
             raise ArchiveConflictError(
                 f"snapshot source input reference is unavailable or invalid: {reference}"
@@ -2187,8 +2257,13 @@ class DerivedArchive:
 class _ManifestReferenceResolver:
     """Validate typed manifest refs and resolve successful input lineage."""
 
-    def __init__(self, archive: DerivedArchive) -> None:
+    def __init__(
+        self,
+        archive: DerivedArchive,
+        verification_session: VerificationSession | None = None,
+    ) -> None:
         self.archive = archive
+        self.verification_session = verification_session
 
     def verify(
         self,
@@ -2285,7 +2360,10 @@ class _ManifestReferenceResolver:
             self._resolve_training_reference(reference)
             return
         if namespace == "derived-artifact":
-            self.archive.load_artifact_manifest(reference)
+            self.archive.load_artifact_manifest(
+                reference,
+                verification_session=self.verification_session,
+            )
             return
         if namespace == "run":
             self.archive.load_run_manifest(reference)
@@ -2294,7 +2372,10 @@ class _ManifestReferenceResolver:
             self.archive.load_player_profile(reference)
             return
         if namespace in _MANIFEST_OUTPUT_REFERENCE_NAMESPACES:
-            self.archive._load_artifact_manifest_for_output_ref(reference)
+            self.archive._load_artifact_manifest_for_output_ref(
+                reference,
+                verification_session=self.verification_session,
+            )
             return
         if (
             namespace in _CANONICAL_RECORD_NAMESPACES | _ENTITY_REFERENCE_NAMESPACES
@@ -2335,12 +2416,18 @@ class _ManifestReferenceResolver:
             self.archive.model_run_validator.load_model_run(reference)
             return
         if reference.startswith("score-grid-composition:"):
-            manifest = self.archive._load_artifact_manifest_for_output_ref(reference)
+            manifest = self.archive._load_artifact_manifest_for_output_ref(
+                reference,
+                verification_session=self.verification_session,
+            )
             if manifest.artifact_type != "score-grid-composition":
                 raise ArchiveConflictError(
                     "score-grid-composition reference resolves to the wrong artifact type"
                 )
-            self.archive.load_score_grid_composition_payload(reference)
+            self.archive.load_score_grid_composition_payload(
+                reference,
+                verification_session=self.verification_session,
+            )
             return
         from football_data_platform.storage.training import TrainingArtifactStore
 
@@ -2360,7 +2447,10 @@ class _ManifestReferenceResolver:
             or hashlib.sha256(_canonical_json(identity)).hexdigest() != digest
         ):
             raise ArchiveConflictError("prediction artifact identity failed")
-        manifest = self.archive._load_artifact_manifest_for_output_ref(reference)
+        manifest = self.archive._load_artifact_manifest_for_output_ref(
+            reference,
+            verification_session=self.verification_session,
+        )
         composition_ref = payload.get("composition_artifact_ref")
         if (
             manifest.artifact_type != "prediction"
@@ -2370,7 +2460,10 @@ class _ManifestReferenceResolver:
             or composition_ref not in manifest.input_refs
         ):
             raise ArchiveConflictError("prediction artifact does not match its manifest")
-        self.archive.load_score_grid_composition_payload(composition_ref)
+        self.archive.load_score_grid_composition_payload(
+            composition_ref,
+            verification_session=self.verification_session,
+        )
 
     def _resolve_sample_reference(self, reference: str) -> None:
         from football_data_platform.storage.training import TrainingArtifactStore
