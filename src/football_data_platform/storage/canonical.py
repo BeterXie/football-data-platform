@@ -42,6 +42,7 @@ SCHEMA_VERSION = 7
 OFFICIAL_LINEUP_CONTRACT_VERSION = 2
 LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION = 1
 _ID_NAMESPACE = uuid.UUID("c62a4fc0-2e72-4d9c-b4b3-113b31c31982")
+_UUID_GLOB_SUFFIX = "-".join("[0-9a-f]" * length for length in (8, 4, 4, 4, 12))
 
 
 class CanonicalConflictError(RuntimeError):
@@ -272,12 +273,19 @@ class CanonicalStore:
                 if version <= 5:
                     _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection)
+            _validate_existing_source_mappings_v7(connection)
             _create_source_mapping_v7_auxiliary(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "source_mapping_id",
+            4,
+            _source_mapping_id,
+            deterministic=True,
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             with connection:
@@ -532,7 +540,7 @@ class CanonicalStore:
         _require_text(canonical_name, "canonical_name")
         require_utc(observed_at, "observed_at")
         _require_raw_asset(connection, raw_asset_id)
-        entity_id = _current_mapping(connection, source, "player", source_id)
+        entity_id = _mapping_as_of(connection, source, "player", source_id, observed_at)
         if entity_id is not None:
             row = connection.execute(
                 "SELECT canonical_name FROM players WHERE player_id = ?",
@@ -541,6 +549,16 @@ class CanonicalStore:
             if row is None:
                 raise CanonicalConflictError(f"mapped player does not exist: {entity_id}")
             return ResolvedPlayer(PlayerId(entity_id), row["canonical_name"])
+
+        later_mapping = connection.execute(
+            "SELECT 1 FROM source_mappings WHERE source = ? AND entity_type = 'player' "
+            "AND source_id = ? LIMIT 1",
+            (source, source_id),
+        ).fetchone()
+        if later_mapping is not None:
+            raise CanonicalConflictError(
+                f"{source}:player:{source_id} has no mapping at {observed_at.isoformat()}"
+            )
 
         player_id = PlayerId(_stable_id("player", source, source_id))
         _insert_entity(connection, player_id, "player", _timestamp(observed_at))
@@ -1855,7 +1873,9 @@ def _source_mappings_v7_table_sql(table_name: str) -> str:
         raise ValueError("unsupported source mappings table name")
     return f"""
         CREATE TABLE {table_name} (
-            mapping_id TEXT PRIMARY KEY,
+            mapping_id TEXT PRIMARY KEY CHECK (
+                {_canonical_uuid_id_sql("mapping_id", "source-mapping")}
+            ),
             source TEXT NOT NULL CHECK (
                 length(trim(source)) > 0 AND source = trim(source)
             ),
@@ -1918,9 +1938,11 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
         "ON source_mappings(source, entity_type, source_id) WHERE valid_to IS NULL"
     )
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS source_mapping_conflicts (
-            conflict_id TEXT PRIMARY KEY,
+            conflict_id TEXT PRIMARY KEY CHECK (
+                {_canonical_uuid_id_sql("conflict_id", "source-mapping-conflict")}
+            ),
             source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
             entity_type TEXT NOT NULL CHECK (
                 entity_type IN ('competition', 'season', 'team', 'player', 'match')
@@ -1948,10 +1970,14 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
         "WHERE current_mapping_id IS NULL"
     )
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS source_mapping_revision_events (
-            revision_event_id TEXT PRIMARY KEY,
-            decision_id TEXT NOT NULL UNIQUE,
+            revision_event_id TEXT PRIMARY KEY CHECK (
+                {_canonical_uuid_id_sql("revision_event_id", "source-mapping-revision-event")}
+            ),
+            decision_id TEXT NOT NULL UNIQUE CHECK (
+                {_canonical_uuid_id_sql("decision_id", "source-mapping-decision")}
+            ),
             conflict_id TEXT NOT NULL UNIQUE REFERENCES source_mapping_conflicts(conflict_id),
             source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
             entity_type TEXT NOT NULL CHECK (
@@ -1962,7 +1988,9 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
             ),
             expected_current_mapping_id TEXT REFERENCES source_mappings(mapping_id),
             candidate_entity_id TEXT NOT NULL REFERENCES entities(entity_id),
-            new_mapping_id TEXT NOT NULL UNIQUE,
+            new_mapping_id TEXT NOT NULL UNIQUE CHECK (
+                {_canonical_uuid_id_sql("new_mapping_id", "source-mapping")}
+            ),
             new_version INTEGER NOT NULL CHECK (new_version > 0),
             effective_at TEXT NOT NULL CHECK (
                 length(effective_at) = 27 AND substr(effective_at, 27, 1) = 'Z'
@@ -1977,9 +2005,11 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
         """
     )
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS source_mapping_evidence (
-            evidence_id TEXT PRIMARY KEY,
+            evidence_id TEXT PRIMARY KEY CHECK (
+                {_canonical_uuid_id_sql("evidence_id", "source-mapping-evidence")}
+            ),
             mapping_id TEXT REFERENCES source_mappings(mapping_id),
             conflict_id TEXT REFERENCES source_mapping_conflicts(conflict_id),
             evidence_ref TEXT NOT NULL CHECK (
@@ -1998,9 +2028,11 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
         """
     )
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS source_mapping_decisions (
-            decision_id TEXT PRIMARY KEY,
+            decision_id TEXT PRIMARY KEY CHECK (
+                {_canonical_uuid_id_sql("decision_id", "source-mapping-decision")}
+            ),
             revision_event_id TEXT NOT NULL UNIQUE
                 REFERENCES source_mapping_revision_events(revision_event_id),
             conflict_id TEXT NOT NULL UNIQUE
@@ -2045,17 +2077,22 @@ def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
 
 def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
     trigger_names = (
+        "source_mappings_id_insert",
         "source_mappings_entity_type_insert",
         "source_mappings_revision_insert",
         "source_mappings_history_insert",
         "source_mappings_overlap_insert",
         "source_mappings_close_only_update",
         "source_mappings_no_delete",
+        "source_mapping_conflicts_id_insert",
         "source_mapping_conflicts_validate_insert",
+        "source_mapping_revision_events_id_insert",
         "source_mapping_revision_events_require_evidence",
         "source_mapping_revision_events_validate_evidence",
         "source_mapping_revision_events_validate_insert",
         "source_mapping_revision_events_apply_insert",
+        "source_mapping_evidence_id_insert",
+        "source_mapping_decisions_id_insert",
         "source_mapping_decisions_validate_insert",
         "source_mapping_conflict_obsoletions_validate_insert",
     )
@@ -2073,6 +2110,21 @@ def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
         connection.execute(f"DROP TRIGGER IF EXISTS {table}_no_delete")
 
     statements = (
+        f"""
+        CREATE TRIGGER source_mappings_id_insert
+        BEFORE INSERT ON source_mappings
+        WHEN NOT ({_canonical_uuid_id_sql("NEW.mapping_id", "source-mapping")})
+            OR NEW.mapping_id <> source_mapping_id(
+                NEW.source, NEW.entity_type, NEW.source_id, NEW.version
+            )
+            OR (
+                NEW.supersedes_mapping_id IS NOT NULL
+                AND NOT ({_canonical_uuid_id_sql("NEW.supersedes_mapping_id", "source-mapping")})
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping ID is not its canonical deterministic identity');
+        END
+        """,
         """
         CREATE TRIGGER IF NOT EXISTS source_mappings_entity_type_insert
         BEFORE INSERT ON source_mappings
@@ -2187,6 +2239,19 @@ def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
             SELECT RAISE(ABORT, 'source mappings are append-only');
         END
         """,
+        f"""
+        CREATE TRIGGER source_mapping_conflicts_id_insert
+        BEFORE INSERT ON source_mapping_conflicts
+        WHEN NOT (
+                {_canonical_uuid_id_sql("NEW.conflict_id", "source-mapping-conflict")}
+            ) OR (
+                NEW.current_mapping_id IS NOT NULL
+                AND NOT ({_canonical_uuid_id_sql("NEW.current_mapping_id", "source-mapping")})
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping conflict ID format is not canonical');
+        END
+        """,
         """
         CREATE TRIGGER IF NOT EXISTS source_mapping_conflicts_validate_insert
         BEFORE INSERT ON source_mapping_conflicts
@@ -2225,6 +2290,27 @@ def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
         WHEN json_array_length(NEW.evidence_json) = 0
         BEGIN
             SELECT RAISE(ABORT, 'source mapping revision requires at least one evidence');
+        END
+        """,
+        f"""
+        CREATE TRIGGER source_mapping_revision_events_id_insert
+        BEFORE INSERT ON source_mapping_revision_events
+        WHEN NOT (
+                {_canonical_uuid_id_sql("NEW.revision_event_id", "source-mapping-revision-event")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.decision_id", "source-mapping-decision")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.conflict_id", "source-mapping-conflict")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.new_mapping_id", "source-mapping")}
+            ) OR (
+                NEW.expected_current_mapping_id IS NOT NULL
+                AND NOT (
+                    {_canonical_uuid_id_sql("NEW.expected_current_mapping_id", "source-mapping")}
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping revision ID format is not canonical');
         END
         """,
         """
@@ -2367,8 +2453,50 @@ def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
                 ON obsolete.conflict_id = conflict.conflict_id
             WHERE conflict.conflict_id <> NEW.conflict_id
                 AND conflict.current_mapping_id IS NEW.expected_current_mapping_id
+                AND conflict.source = NEW.source
+                AND conflict.entity_type = NEW.entity_type
+                AND conflict.source_id = NEW.source_id
                 AND decision.decision_id IS NULL
                 AND obsolete.obsoletion_id IS NULL;
+        END
+        """,
+        f"""
+        CREATE TRIGGER source_mapping_evidence_id_insert
+        BEFORE INSERT ON source_mapping_evidence
+        WHEN NOT (
+                {_canonical_uuid_id_sql("NEW.evidence_id", "source-mapping-evidence")}
+            ) OR (
+                NEW.mapping_id IS NOT NULL
+                AND NOT ({_canonical_uuid_id_sql("NEW.mapping_id", "source-mapping")})
+            ) OR (
+                NEW.conflict_id IS NOT NULL
+                AND NOT (
+                    {_canonical_uuid_id_sql("NEW.conflict_id", "source-mapping-conflict")}
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping evidence ID format is not canonical');
+        END
+        """,
+        f"""
+        CREATE TRIGGER source_mapping_decisions_id_insert
+        BEFORE INSERT ON source_mapping_decisions
+        WHEN NOT (
+                {_canonical_uuid_id_sql("NEW.decision_id", "source-mapping-decision")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.revision_event_id", "source-mapping-revision-event")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.conflict_id", "source-mapping-conflict")}
+            ) OR NOT (
+                {_canonical_uuid_id_sql("NEW.new_mapping_id", "source-mapping")}
+            ) OR (
+                NEW.previous_mapping_id IS NOT NULL
+                AND NOT (
+                    {_canonical_uuid_id_sql("NEW.previous_mapping_id", "source-mapping")}
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping decision ID format is not canonical');
         END
         """,
         """
@@ -2437,6 +2565,9 @@ def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
                 AND decision.decision_id = NEW.decision_id
                 AND obsolete.conflict_id <> event.conflict_id
                 AND obsolete.current_mapping_id IS event.expected_current_mapping_id
+                AND obsolete.source = event.source
+                AND obsolete.entity_type = event.entity_type
+                AND obsolete.source_id = event.source_id
                 AND NEW.obsoleted_at = event.effective_at
         )
         BEGIN
@@ -2872,11 +3003,15 @@ def _validate_match_report_contract_lineage(
         raise CanonicalConflictError("match report contract conflicts with collection attempt")
 
     version = connection.execute(
-        "SELECT 1 FROM match_versions WHERE match_id = ? AND version = ?",
+        "SELECT observed_at FROM match_versions WHERE match_id = ? AND version = ?",
         (evidence.match_id.value, evidence.match_version),
     ).fetchone()
     if version is None:
         raise KeyError(f"match version {evidence.match_id}:{evidence.match_version} does not exist")
+    if _parse_timestamp(str(version["observed_at"])) > evidence.observed_at:
+        raise CanonicalConflictError(
+            "match report contract references a match version observed after the contract"
+        )
     raw = connection.execute(
         "SELECT source, source_id, observed_at FROM raw_assets WHERE raw_asset_id = ?",
         (evidence.raw_asset_id.value,),
@@ -3250,6 +3385,15 @@ def _mapping_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _canonical_uuid_id_sql(column: str, prefix: str) -> str:
+    expected_length = len(prefix) + 1 + 36
+    pattern = f"{prefix}:{_UUID_GLOB_SUFFIX}"
+    return (
+        f"{column} IS NOT NULL AND length({column}) = {expected_length} "
+        f"AND {column} GLOB '{pattern}'"
+    )
+
+
 def _parse_timestamp(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     require_utc(parsed)
@@ -3287,7 +3431,7 @@ CREATE TABLE{qualifier} {table_name} (
 
 
 _SCHEMA = (
-    """
+    f"""
 CREATE TABLE IF NOT EXISTS schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     version INTEGER NOT NULL CHECK (version > 0)
@@ -3358,7 +3502,9 @@ CREATE TABLE IF NOT EXISTS raw_assets (
 );
 
 CREATE TABLE IF NOT EXISTS source_mappings (
-    mapping_id TEXT PRIMARY KEY,
+    mapping_id TEXT PRIMARY KEY CHECK (
+        {_canonical_uuid_id_sql("mapping_id", "source-mapping")}
+    ),
     source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
     entity_type TEXT NOT NULL CHECK (
         entity_type IN ('competition', 'season', 'team', 'player', 'match')

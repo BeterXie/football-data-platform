@@ -120,9 +120,10 @@ dataset 的 train 与 holdout 两条 sample 均因赛前 snapshot/资格不满�
 holdout 都为空。model gate 以 `no_eligible_train_split` 失败，prediction 与 evaluation 均
 unavailable；这不是模型质量、真实市场基准或 ROI 证据，也不证明真实来源全季采集。
 
-以下边界继续保持 Open：R02 下游 exact `mapping_id`/version pin（当前仅以 `observed_at` 维持
-legacy 稳定性）、aliases/candidate confidence policy、现有 resolver 自动入队整合、player 与
-provider-scoped Football-Data mapping、映射修订后的下游 requalification/recompute，以及完整跨源
+以下边界继续保持 Open：R02 下游 exact `mapping_id`/version pin（当前仅 official-lineup 与
+match-report 的 ingest/replay 按 raw/contract `observed_at` 解析历史映射，其他下游不作此保证）、
+aliases/candidate confidence policy、现有 resolver 自动入队整合、player 与 provider-scoped
+Football-Data mapping、映射修订后的下游 requalification/recompute，以及完整跨源
 生产验证；除 typed result 外其余五类 canonical fact 的内容与证据重放 verifier；从来源字节推导
 比分和 `known_at` 的版本化
 `result-observation/parser-normalization` contract；`file-sha256` 引用对应文件字节的定位和复验；

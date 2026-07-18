@@ -519,6 +519,7 @@ class CanonicalFactStore:
         mapped_match_id = self.canonical.mapped_match_ids(
             source=match_mapping_source,
             source_ids=(source_match_id,),
+            as_of=observed_at,
         ).get(source_match_id)
         if mapped_match_id is None:
             raise ValueError("official lineup source match mapping is missing")
@@ -536,6 +537,7 @@ class CanonicalFactStore:
             team = self.canonical.mapped_team(
                 source=team_mapping_source,
                 source_id=parsed_team.source_team_id,
+                as_of=observed_at,
             )
             source_players = tuple(
                 (player.source_player_id, player.name) for player in parsed_team.starters
@@ -599,8 +601,14 @@ class CanonicalFactStore:
                 raise ValueError("official lineup contract conflicts with raw archive metadata")
             mapping = connection.execute(
                 "SELECT entity_id FROM source_mappings WHERE source = ? "
-                "AND entity_type = 'match' AND source_id = ? AND valid_to IS NULL",
-                (match_mapping_source, source_match_id),
+                "AND entity_type = 'match' AND source_id = ? AND valid_from <= ? "
+                "AND (valid_to IS NULL OR ? < valid_to)",
+                (
+                    match_mapping_source,
+                    source_match_id,
+                    _mapping_timestamp(observed_at),
+                    _mapping_timestamp(observed_at),
+                ),
             ).fetchone()
             if mapping is None or mapping["entity_id"] != match_id.value:
                 raise ValueError("official lineup source match does not map to the canonical match")
@@ -617,8 +625,14 @@ class CanonicalFactStore:
             for source_team_id, team_id, _ in normalized_team_source_lineups:
                 team_mapping = connection.execute(
                     "SELECT entity_id FROM source_mappings WHERE source = ? "
-                    "AND entity_type = 'team' AND source_id = ? AND valid_to IS NULL",
-                    (team_mapping_source, source_team_id),
+                    "AND entity_type = 'team' AND source_id = ? AND valid_from <= ? "
+                    "AND (valid_to IS NULL OR ? < valid_to)",
+                    (
+                        team_mapping_source,
+                        source_team_id,
+                        _mapping_timestamp(observed_at),
+                        _mapping_timestamp(observed_at),
+                    ),
                 ).fetchone()
                 if team_mapping is None or team_mapping["entity_id"] != team_id.value:
                     raise ValueError(
@@ -1082,9 +1096,12 @@ def verify_official_lineup_contract(
     ).get(parsed.source_match_id)
     if mapped_match_id != contract.match_id:
         raise ValueError("official lineup replay match mapping conflicts with its contract")
-    versions = {version.version for version in canonical.match_versions(contract.match_id)}
-    if contract.match_version not in versions:
+    versions = {version.version: version for version in canonical.match_versions(contract.match_id)}
+    version = versions.get(contract.match_version)
+    if version is None:
         raise ValueError("official lineup replay match version no longer exists")
+    if version.observed_at > contract.observed_at:
+        raise ValueError("official lineup replay match version was observed after its contract")
 
     replayed_lineups: list[tuple[TeamId, tuple[PlayerId, ...]]] = []
     replayed_bindings: list[OfficialLineupSourceBinding] = []
@@ -1435,6 +1452,11 @@ def _json_text(value: Any) -> str:
 def _timestamp(value: datetime) -> str:
     require_utc(value)
     return value.isoformat().replace("+00:00", "Z")
+
+
+def _mapping_timestamp(value: datetime) -> str:
+    require_utc(value)
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: str) -> datetime:

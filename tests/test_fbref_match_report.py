@@ -7,7 +7,7 @@ import pytest
 
 from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import MatchId, RawAssetId
-from football_data_platform.domain.models import CollectionAttemptOutcome
+from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus
 from football_data_platform.pipelines.match_report import (
     PRODUCTION_COLLECTOR_VERSION,
     PRODUCTION_REQUIRED_TABLES,
@@ -26,9 +26,13 @@ from football_data_platform.sources.fbref_match_report import (
     REPORT_PARSER_VERSION,
     parse_match_report,
 )
-from football_data_platform.storage.canonical import CanonicalStore
+from football_data_platform.storage.canonical import CanonicalConflictError, CanonicalStore
 from football_data_platform.storage.facts import CanonicalFactStore
 from football_data_platform.storage.layout import DataLayout
+from football_data_platform.storage.match_report_contracts import (
+    MatchReportContractReplayError,
+    verify_match_report_contract,
+)
 from football_data_platform.storage.raw import RawArchive
 
 ROOT = Path(__file__).parents[1]
@@ -653,6 +657,78 @@ def test_match_report_ingest_creates_canonical_team_and_player_facts(tmp_path: P
     assert result_count == 1
 
 
+def test_historical_ingest_and_contract_replay_survive_later_mapping_revisions(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule = _prepare_schedule(tmp_path)
+    _seed_first_result(canonical, schedule)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    arguments = {
+        "content": _report_content(),
+        "page_url": "https://fbref.example/en/matches/aaaaaaaa/report",
+        "source_match_id": "aaaaaaaa",
+        "match_id": match_id,
+        "match_version": 1,
+        "home_goals": 2,
+        "away_goals": 1,
+        "known_at": OBSERVED_AT,
+        "observed_at": OBSERVED_AT,
+        "archive": archive,
+        "canonical": canonical,
+    }
+    first = ingest_fbref_match_report(**arguments)  # type: ignore[arg-type]
+    effective_at = OBSERVED_AT + timedelta(hours=1)
+    replacement_team = canonical.mapped_team(source="fbref", source_id="cff3d9bb")
+    replacement_player = canonical.mapped_player(source="fbref", source_id="playerb1")
+    replacements = (
+        ("fbref-schedule", "match", "aaaaaaaa", MatchId(schedule.canonical_match_ids[1])),
+        ("fbref", "team", "18bb7c10", replacement_team.id),
+        ("fbref", "player", "playera1", replacement_player.id),
+    )
+    for source, entity_type, source_id, candidate_entity_id in replacements:
+        current = canonical.resolve_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+        )
+        conflict = canonical.propose_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+            candidate_entity_id=candidate_entity_id,
+            proposed_at=effective_at - timedelta(minutes=1),
+            actor="resolver:test",
+            reason="later provider identity review",
+            evidence_refs=(f"ticket:{entity_type}-revision",),
+        )
+        canonical.revise_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+            conflict_id=conflict.conflict_id,  # type: ignore[union-attr]
+            expected_current_mapping_id=current.mapping_id or "",
+            candidate_entity_id=candidate_entity_id,
+            effective_at=effective_at,
+            actor="operator:test",
+            reason="accepted later provider identity review",
+            evidence_refs=(f"ticket:{entity_type}-revision",),
+        )
+
+    replayed = ingest_fbref_match_report(**arguments)  # type: ignore[arg-type]
+
+    assert replayed.contract_id == first.contract_id
+    assert replayed.team_fact_ids == first.team_fact_ids
+    assert replayed.player_fact_ids == first.player_fact_ids
+    assert (
+        verify_match_report_contract(
+            first.contract_id,
+            archive=archive,
+            canonical=canonical,
+        ).contract_id
+        == first.contract_id
+    )
+
+
 @pytest.mark.parametrize(
     ("content", "expected_code"),
     [
@@ -960,6 +1036,134 @@ def test_non_finished_match_version_cannot_ingest_report_facts(tmp_path: Path) -
         assert (
             connection.execute("SELECT COUNT(*) FROM player_match_observations").fetchone()[0] == 0
         )
+
+
+def test_future_match_version_is_rejected_by_ingest_contract_write_and_replay(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule = _prepare_schedule(tmp_path)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    match = canonical.match(match_id)
+    version_one = canonical.match_versions(match_id)[0]
+    future_at = OBSERVED_AT + timedelta(hours=1)
+    future_asset = archive.archive(
+        b"future schedule correction",
+        source="fbref",
+        source_id="future-schedule-correction",
+        url="https://fbref.example/future-schedule-correction",
+        observed_at=future_at,
+        target_event_time=None,
+        collector_version="test-schedule/2",
+        media_type="text/html",
+    )
+    canonical.register_raw_asset(future_asset)
+    _, future_version = canonical.resolve_or_create_match(
+        source="fbref-schedule",
+        source_id="aaaaaaaa",
+        competition_id=match.competition_id,
+        season_id=match.season_id,
+        home_team_id=match.home_team_id,
+        away_team_id=match.away_team_id,
+        kickoff_at=version_one.kickoff_at,
+        status=MatchStatus.FINISHED,
+        observed_at=future_at,
+        raw_asset_id=future_asset.id,
+        round_name="future correction",
+    )
+    assert future_version.version == 2
+
+    report_url = "https://fbref.example/en/matches/aaaaaaaa/report"
+    with pytest.raises(MatchReportIngestError) as caught:
+        ingest_fbref_match_report(
+            _report_content(),
+            page_url=report_url,
+            source_match_id="aaaaaaaa",
+            match_id=match_id,
+            match_version=future_version.version,
+            home_goals=2,
+            away_goals=1,
+            known_at=OBSERVED_AT,
+            observed_at=OBSERVED_AT,
+            archive=archive,
+            canonical=canonical,
+        )
+    assert caught.value.code == "match_version_not_visible"
+
+    old_report_asset = archive.load(RawAssetId(caught.value.raw_asset_id))
+    old_attempt = canonical.record_collection_attempt(
+        match_id=match_id,
+        source="fbref-match-report",
+        source_id="aaaaaaaa",
+        target_url=report_url,
+        outcome=CollectionAttemptOutcome.SUCCEEDED,
+        observed_at=OBSERVED_AT,
+        collector_version=old_report_asset.collector_version,
+        raw_asset_id=old_report_asset.id,
+    )
+    parsed = parse_match_report(_report_content(), required_tables=("summary",))
+    team_tables = {team.source_team_id: team.tables_present for team in parsed.teams}
+    with pytest.raises(CanonicalConflictError, match="observed after the contract"):
+        canonical.record_match_report_contract(
+            collection_attempt_id=old_attempt.id,
+            match_id=match_id,
+            match_version=future_version.version,
+            raw_asset_id=old_report_asset.id,
+            source_match_id="aaaaaaaa",
+            parser_version=parsed.parser_version,
+            required_tables=parsed.required_tables,
+            team_tables=team_tables,
+            observed_at=OBSERVED_AT,
+        )
+
+    replay_asset = archive.archive(
+        _report_content(),
+        source="fbref",
+        source_id="aaaaaaaa",
+        url=report_url,
+        observed_at=future_at,
+        target_event_time=OBSERVED_AT,
+        collector_version=old_report_asset.collector_version,
+        media_type="text/html",
+    )
+    canonical.register_raw_asset(replay_asset)
+    replay_attempt = canonical.record_collection_attempt(
+        match_id=match_id,
+        source="fbref-match-report",
+        source_id="aaaaaaaa",
+        target_url=report_url,
+        outcome=CollectionAttemptOutcome.SUCCEEDED,
+        observed_at=future_at,
+        collector_version=replay_asset.collector_version,
+        raw_asset_id=replay_asset.id,
+    )
+    contract = canonical.record_match_report_contract(
+        collection_attempt_id=replay_attempt.id,
+        match_id=match_id,
+        match_version=future_version.version,
+        raw_asset_id=replay_asset.id,
+        source_match_id="aaaaaaaa",
+        parser_version=parsed.parser_version,
+        required_tables=parsed.required_tables,
+        team_tables=team_tables,
+        observed_at=future_at,
+    )
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE match_versions SET observed_at = ? WHERE match_id = ? AND version = ?",
+            (
+                (future_at + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                match_id.value,
+                future_version.version,
+            ),
+        )
+
+    with pytest.raises(MatchReportContractReplayError) as replay_error:
+        verify_match_report_contract(
+            contract.contract_id,
+            archive=archive,
+            canonical=canonical,
+        )
+    assert replay_error.value.category == "replay_failed"
 
 
 def test_report_requires_existing_canonical_result_and_rejects_claimed_score(

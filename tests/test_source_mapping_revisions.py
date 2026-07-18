@@ -3,9 +3,11 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
+import football_data_platform.storage.canonical as canonical_module
 from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import CompetitionId, TeamId
 from football_data_platform.storage.canonical import (
@@ -19,6 +21,14 @@ from football_data_platform.storage.raw import RawArchive
 
 NOW = datetime(2026, 7, 16, 2, 0, tzinfo=UTC)
 COMPETITION_ID = CompetitionId("competition:eng.1")
+
+
+def _canonical_id(prefix: str, index: int) -> str:
+    return f"{prefix}:00000000-0000-0000-0000-{index:012x}"
+
+
+def _mapping_id(source: str, entity_type: str, source_id: str, version: int) -> str:
+    return canonical_module._source_mapping_id(source, entity_type, source_id, version)
 
 
 @pytest.fixture
@@ -114,6 +124,7 @@ def test_conflict_revision_preserves_half_open_history_and_override_evidence(
         reason="manual review accepted the fallback identity",
         evidence_refs=("raw-asset:manual-review", "ticket:identity-42"),
     )
+    store.initialize()
 
     history = store.mapping_history(source="fbref", entity_type="team", source_id="revision-team-0")
     assert [mapping.version for mapping in history] == [1, 2]
@@ -253,7 +264,17 @@ def test_unmapped_candidate_is_queued_and_can_be_accepted_as_version_one(
 
     assert conflict.current_mapping_id is None  # type: ignore[union-attr]
     assert conflict.current_entity_id is None  # type: ignore[union-attr]
-    assert store.list_source_mapping_conflicts() == (conflict,)
+    unrelated = store.propose_source_mapping(
+        source="scout",
+        entity_type="team",
+        source_id="different-unmapped-key",
+        candidate_entity_id=teams[2],
+        proposed_at=proposed_at + timedelta(seconds=1),
+        actor="resolver:test",
+        reason="different provider key requires its own review",
+        evidence_refs=("raw-asset:different-unmapped-key",),
+    )
+    assert store.list_source_mapping_conflicts() == (conflict, unrelated)
 
     accepted_at = proposed_at + timedelta(minutes=5)
     mapping, decision = store.revise_source_mapping(
@@ -282,7 +303,7 @@ def test_unmapped_candidate_is_queued_and_can_be_accepted_as_version_one(
         )
         == mapping
     )
-    assert store.list_source_mapping_conflicts() == ()
+    assert store.list_source_mapping_conflicts() == (unrelated,)
 
 
 def test_manual_override_requires_evidence_before_any_mapping_is_closed(
@@ -334,7 +355,7 @@ def test_sql_constraints_reject_type_time_overlap_and_mutation(
         source="fbref", entity_type="team", source_id="revision-team-0"
     )
     values = (
-        "source-mapping:sql-attack",
+        _mapping_id("attack-source", "player", "attack-id", 1),
         "attack-source",
         "player",
         "attack-id",
@@ -363,7 +384,7 @@ def test_sql_constraints_reject_type_time_overlap_and_mutation(
             connection.execute(
                 insert_sql,
                 (
-                    "source-mapping:time-attack",
+                    _mapping_id("attack-source", "team", "invalid-time", 1),
                     "attack-source",
                     "team",
                     "invalid-time",
@@ -392,7 +413,7 @@ def test_sql_constraints_reject_type_time_overlap_and_mutation(
             connection.execute(
                 insert_sql,
                 (
-                    "source-mapping:overlap-attack",
+                    _mapping_id("fbref", "team", "revision-team-0", 2),
                     "fbref",
                     "team",
                     "revision-team-0",
@@ -415,6 +436,163 @@ def test_sql_constraints_reject_type_time_overlap_and_mutation(
                 "UPDATE source_mappings SET entity_id = ? WHERE mapping_id = ?",
                 (values[3], current.mapping_id),
             )
+
+
+def test_sql_layer_rejects_noncanonical_mapping_audit_ids(
+    mapping_store: tuple[CanonicalStore, tuple[TeamId, TeamId, TeamId]],
+) -> None:
+    store, teams = mapping_store
+    current = store.resolve_source_mapping(
+        source="fbref", entity_type="team", source_id="revision-team-0"
+    )
+    conflict = store.propose_source_mapping(
+        source="fbref",
+        entity_type="team",
+        source_id="revision-team-0",
+        candidate_entity_id=teams[1],
+        proposed_at=NOW + timedelta(minutes=1),
+        actor="resolver:test",
+        reason="candidate differs",
+        evidence_refs=("raw-asset:candidate",),
+    )
+    timestamp = "2026-07-16T03:00:00.000000Z"
+    statements = (
+        (
+            "INSERT INTO source_mappings(mapping_id, source, entity_type, source_id, "
+            "entity_id, version, valid_from, valid_to, match_rule, confidence, created_at, "
+            "created_by, audit_note, supersedes_mapping_id) "
+            "VALUES (?, 'attack', 'team', 'bad-id', ?, 1, ?, NULL, 'source_id', 1.0, "
+            "?, 'attacker', 'invalid ID', NULL)",
+            (" ", teams[0].value, timestamp, timestamp),
+        ),
+        (
+            "INSERT INTO source_mapping_conflicts(conflict_id, source, entity_type, "
+            "source_id, current_mapping_id, candidate_entity_id, proposed_at, proposed_by, "
+            "reason) VALUES (?, 'fbref', 'team', 'revision-team-0', ?, ?, ?, 'attacker', "
+            "'invalid ID')",
+            (
+                "source-mapping-conflict:not-a-uuid",
+                current.mapping_id,
+                teams[2].value,
+                timestamp,
+            ),
+        ),
+        (
+            "INSERT INTO source_mapping_evidence(evidence_id, mapping_id, conflict_id, "
+            "evidence_ref, recorded_at, recorded_by, reason) "
+            "VALUES (?, ?, NULL, 'ticket:attack', ?, 'attacker', 'invalid ID')",
+            ("source-mapping-evidence:not-a-uuid", current.mapping_id, timestamp),
+        ),
+        (
+            "INSERT INTO source_mapping_revision_events(revision_event_id, decision_id, "
+            "conflict_id, source, entity_type, source_id, expected_current_mapping_id, "
+            "candidate_entity_id, new_mapping_id, new_version, effective_at, actor, reason, "
+            "evidence_json) VALUES (?, ?, ?, 'fbref', 'team', 'revision-team-0', ?, ?, ?, 2, "
+            "?, 'attacker', 'invalid ID', ?)",
+            (
+                "source-mapping-revision-event:not-a-uuid",
+                _canonical_id("source-mapping-decision", 20),
+                conflict.conflict_id,  # type: ignore[union-attr]
+                current.mapping_id,
+                teams[1].value,
+                _canonical_id("source-mapping", 21),
+                timestamp,
+                (
+                    '[{"evidence_id":"'
+                    + _canonical_id("source-mapping-evidence", 22)
+                    + '","evidence_ref":"ticket:attack"}]'
+                ),
+            ),
+        ),
+        (
+            "INSERT INTO source_mapping_decisions(decision_id, revision_event_id, conflict_id, "
+            "previous_mapping_id, new_mapping_id, decided_at, decided_by, reason, "
+            "evidence_ids_json) VALUES (?, ?, ?, ?, ?, ?, 'attacker', 'invalid ID', ?)",
+            (
+                "source-mapping-decision:not-a-uuid",
+                _canonical_id("source-mapping-revision-event", 23),
+                conflict.conflict_id,  # type: ignore[union-attr]
+                current.mapping_id,
+                _canonical_id("source-mapping", 24),
+                timestamp,
+                '["' + _canonical_id("source-mapping-evidence", 25) + '"]',
+            ),
+        ),
+    )
+
+    for statement, parameters in statements:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="canonical|CHECK constraint|exact revision event evidence",
+        ):
+            with store.connect() as connection:
+                connection.execute(statement, parameters)
+
+    with store.connect() as connection:
+        trigger_names = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'source_mapping%_id_insert'"
+            ).fetchall()
+        }
+    assert trigger_names == {
+        "source_mappings_id_insert",
+        "source_mapping_conflicts_id_insert",
+        "source_mapping_revision_events_id_insert",
+        "source_mapping_evidence_id_insert",
+        "source_mapping_decisions_id_insert",
+    }
+
+
+def test_mapping_insert_requires_its_deterministic_id_and_udf(
+    mapping_store: tuple[CanonicalStore, tuple[TeamId, TeamId, TeamId]],
+) -> None:
+    store, teams = mapping_store
+    insert_sql = (
+        "INSERT INTO source_mappings(mapping_id, source, entity_type, source_id, entity_id, "
+        "version, valid_from, valid_to, match_rule, confidence, created_at, created_by, "
+        "audit_note, supersedes_mapping_id) VALUES (?, ?, 'team', ?, ?, 1, ?, NULL, "
+        "'source_id', 1.0, ?, 'attacker', 'canonical-shaped wrong ID', NULL)"
+    )
+    timestamp = "2026-07-16T03:00:00.000000Z"
+
+    with pytest.raises(sqlite3.IntegrityError, match="deterministic identity"):
+        with store.connect() as connection:
+            connection.execute(
+                insert_sql,
+                (
+                    _canonical_id("source-mapping", 100),
+                    "attack",
+                    "canonical-shaped-wrong",
+                    teams[0].value,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    with pytest.raises(sqlite3.OperationalError, match="no such function: source_mapping_id"):
+        with sqlite3.connect(store.path) as connection:
+            connection.execute(
+                insert_sql,
+                (
+                    _canonical_id("source-mapping", 101),
+                    "raw-sqlite-attack",
+                    "missing-udf",
+                    teams[0].value,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    with store.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM source_mappings "
+                "WHERE source IN ('attack', 'raw-sqlite-attack')"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_sql_layer_requires_one_evidenced_revision_event(
@@ -452,7 +630,7 @@ def test_sql_layer_requires_one_evidenced_revision_event(
                 "supersedes_mapping_id) VALUES (?, ?, ?, ?, ?, 1, ?, NULL, "
                 "'manual_override', 1.0, ?, ?, ?, NULL)",
                 (
-                    "source-mapping:manual-without-event",
+                    _mapping_id("attacker", "team", "manual-without-event", 1),
                     "attacker",
                     "team",
                     "manual-without-event",
@@ -472,8 +650,8 @@ def test_sql_layer_requires_one_evidenced_revision_event(
                 "new_mapping_id, decided_at, decided_by, reason, evidence_ids_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "source-mapping-decision:attack",
-                    "source-mapping-revision-event:missing",
+                    _canonical_id("source-mapping-decision", 5),
+                    _canonical_id("source-mapping-revision-event", 6),
                     conflict.conflict_id,  # type: ignore[union-attr]
                     current.mapping_id,
                     current.mapping_id,
@@ -493,15 +671,15 @@ def test_sql_layer_requires_one_evidenced_revision_event(
                 "effective_at, actor, reason, evidence_json) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "source-mapping-revision-event:no-evidence",
-                    "source-mapping-decision:no-evidence",
+                    _canonical_id("source-mapping-revision-event", 7),
+                    _canonical_id("source-mapping-decision", 8),
                     conflict.conflict_id,  # type: ignore[union-attr]
                     "fbref",
                     "team",
                     "revision-team-0",
                     current.mapping_id,
                     teams[1].value,
-                    "source-mapping:no-evidence",
+                    _mapping_id("fbref", "team", "revision-team-0", 2),
                     2,
                     effective_at,
                     "attacker",
@@ -533,6 +711,11 @@ def test_v6_migration_is_deterministic_and_idempotent(tmp_path: Path) -> None:
     assert [item.version for item in first] == [1, 2]
     assert first[1].supersedes_mapping_id == first[0].mapping_id
     assert {item.created_by for item in first} == {"legacy-v6-migration"}
+    for item in first:
+        assert item.mapping_id is not None
+        prefix, suffix = item.mapping_id.split(":", 1)
+        assert prefix == "source-mapping"
+        assert str(UUID(suffix)) == suffix
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
@@ -617,6 +800,37 @@ def test_existing_v7_validation_rejects_gap_atomically(tmp_path: Path) -> None:
                 "AND name = 'source_mappings_close_only_update'"
             ).fetchone()
             is None
+        )
+
+
+def test_existing_v7_validation_rejects_wrong_deterministic_mapping_id(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "invalid-existing-v7-mapping-id.sqlite3"
+    _create_v6_mapping_database(path, overlap=False, gap=False, type_mismatch=False)
+    store = CanonicalStore(path)
+    store.initialize()
+    wrong_mapping_id = _canonical_id("source-mapping", 999)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER source_mappings_close_only_update")
+        connection.execute(
+            "UPDATE source_mappings SET mapping_id = ? WHERE version = 1",
+            (wrong_mapping_id,),
+        )
+
+    with pytest.raises(CanonicalConflictError, match="malformed v7.*history"):
+        store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute(
+                "SELECT mapping_id FROM source_mappings WHERE version = 1"
+            ).fetchone()[0]
+            == wrong_mapping_id
+        )
+        assert (
+            connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
+            == SCHEMA_VERSION
         )
 
 

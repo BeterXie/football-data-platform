@@ -20,6 +20,9 @@ from football_data_platform.domain.ids import (
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_UUID_SUFFIX = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 class MatchStatus(StrEnum):
@@ -135,13 +138,17 @@ class SourceMapping:
         _require_text(self.created_by, "created_by")
         _require_text(self.audit_note, "audit_note")
         if self.mapping_id is not None:
-            _require_text(self.mapping_id, "mapping_id")
+            _require_canonical_uuid_id(self.mapping_id, "mapping_id", "source-mapping")
         if self.entity_type is not None:
             _require_text(self.entity_type, "entity_type")
             if self.entity_type != _entity_type(self.entity_id):
                 raise ValueError("source mapping entity_type does not match entity_id")
         if self.supersedes_mapping_id is not None:
-            _require_text(self.supersedes_mapping_id, "supersedes_mapping_id")
+            _require_canonical_uuid_id(
+                self.supersedes_mapping_id,
+                "supersedes_mapping_id",
+                "source-mapping",
+            )
             if self.mapping_id is None:
                 raise ValueError("supersedes_mapping_id requires mapping_id")
         if self.version < 1:
@@ -169,8 +176,12 @@ class SourceMappingEvidence:
     conflict_id: str | None = None
 
     def __post_init__(self) -> None:
+        _require_canonical_uuid_id(
+            self.evidence_id,
+            "evidence_id",
+            "source-mapping-evidence",
+        )
         for value, field_name in (
-            (self.evidence_id, "evidence_id"),
             (self.evidence_ref, "evidence_ref"),
             (self.recorded_by, "recorded_by"),
             (self.reason, "reason"),
@@ -180,9 +191,13 @@ class SourceMappingEvidence:
         if (self.mapping_id is None) == (self.conflict_id is None):
             raise ValueError("mapping evidence must reference exactly one mapping or conflict")
         if self.mapping_id is not None:
-            _require_text(self.mapping_id, "mapping_id")
+            _require_canonical_uuid_id(self.mapping_id, "mapping_id", "source-mapping")
         if self.conflict_id is not None:
-            _require_text(self.conflict_id, "conflict_id")
+            _require_canonical_uuid_id(
+                self.conflict_id,
+                "conflict_id",
+                "source-mapping-conflict",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,8 +217,12 @@ class SourceMappingConflict:
     decision_id: str | None = None
 
     def __post_init__(self) -> None:
+        _require_canonical_uuid_id(
+            self.conflict_id,
+            "conflict_id",
+            "source-mapping-conflict",
+        )
         for value, field_name in (
-            (self.conflict_id, "conflict_id"),
             (self.source, "source"),
             (self.entity_type, "entity_type"),
             (self.source_id, "source_id"),
@@ -213,7 +232,11 @@ class SourceMappingConflict:
             _require_text(value, field_name)
         require_utc(self.proposed_at, "proposed_at")
         if self.current_mapping_id is not None:
-            _require_text(self.current_mapping_id, "current_mapping_id")
+            _require_canonical_uuid_id(
+                self.current_mapping_id,
+                "current_mapping_id",
+                "source-mapping",
+            )
         if (self.current_mapping_id is None) != (self.current_entity_id is None):
             raise ValueError("mapping conflict current mapping and entity must both be present")
         if self.entity_type != _entity_type(self.candidate_entity_id) or (
@@ -227,7 +250,11 @@ class SourceMappingConflict:
         ):
             raise ValueError("mapping conflict candidate must differ from current entity")
         if self.decision_id is not None:
-            _require_text(self.decision_id, "decision_id")
+            _require_canonical_uuid_id(
+                self.decision_id,
+                "decision_id",
+                "source-mapping-decision",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,22 +272,37 @@ class SourceMappingDecision:
     evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for value, field_name, prefix in (
+            (self.decision_id, "decision_id", "source-mapping-decision"),
+            (self.conflict_id, "conflict_id", "source-mapping-conflict"),
+            (self.new_mapping_id, "new_mapping_id", "source-mapping"),
+        ):
+            _require_canonical_uuid_id(value, field_name, prefix)
         for value, field_name in (
-            (self.decision_id, "decision_id"),
-            (self.conflict_id, "conflict_id"),
-            (self.new_mapping_id, "new_mapping_id"),
             (self.decided_by, "decided_by"),
             (self.reason, "reason"),
         ):
             _require_text(value, field_name)
         if self.previous_mapping_id is not None:
-            _require_text(self.previous_mapping_id, "previous_mapping_id")
+            _require_canonical_uuid_id(
+                self.previous_mapping_id,
+                "previous_mapping_id",
+                "source-mapping",
+            )
         if self.revision_event_id is not None:
-            _require_text(self.revision_event_id, "revision_event_id")
+            _require_canonical_uuid_id(
+                self.revision_event_id,
+                "revision_event_id",
+                "source-mapping-revision-event",
+            )
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
             raise ValueError("mapping decision evidence IDs must be unique")
         for evidence_id in self.evidence_ids:
-            _require_text(evidence_id, "evidence_id")
+            _require_canonical_uuid_id(
+                evidence_id,
+                "evidence_id",
+                "source-mapping-evidence",
+            )
         require_utc(self.decided_at, "decided_at")
 
 
@@ -318,3 +360,12 @@ def _entity_type(entity_id: EntityId) -> str:
 def _require_text(value: str, field_name: str) -> None:
     if not value or value.strip() != value:
         raise ValueError(f"{field_name} must be non-empty text without surrounding whitespace")
+
+
+def _require_canonical_uuid_id(value: str, field_name: str, prefix: str) -> None:
+    _require_text(value, field_name)
+    expected_prefix = f"{prefix}:"
+    if not value.startswith(expected_prefix) or not _CANONICAL_UUID_SUFFIX.fullmatch(
+        value.removeprefix(expected_prefix)
+    ):
+        raise ValueError(f"{field_name} must be a canonical {prefix} ID")

@@ -198,6 +198,14 @@ def validate_match_report_identity(
             "match_version_missing",
             f"canonical match version {match_id}:{match_version} does not exist",
         )
+    if version.observed_at > mapping_as_of:
+        raise MatchReportCanonicalValidationError(
+            "match_version_not_visible",
+            (
+                f"canonical match version {match_id}:{match_version} was observed after "
+                "the report boundary"
+            ),
+        )
     if version.status is not MatchStatus.FINISHED:
         raise MatchReportCanonicalValidationError(
             "match_version_not_finished",

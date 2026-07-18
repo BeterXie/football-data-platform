@@ -14,4 +14,4 @@ venv/
 .env.*
 !.env.example
 /data/
-
+/.tmp-r02-sql-audit/

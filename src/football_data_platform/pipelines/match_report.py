@@ -115,6 +115,7 @@ def ingest_fbref_match_report(
     mapped_match_id = canonical.mapped_match_ids(
         source=MATCH_MAPPING_SOURCE,
         source_ids=(source_match_id,),
+        as_of=observed_at,
     ).get(source_match_id)
     if mapped_match_id is None:
         raise MatchReportIngestError(
@@ -159,6 +160,19 @@ def ingest_fbref_match_report(
             raw_asset_id=asset.id,
             code="match_version_missing",
             message=f"canonical match version {mapped_match_id}:{match_version} does not exist",
+        )
+    if version.observed_at > observed_at:
+        raise _record_failure(
+            canonical=canonical,
+            match_id=mapped_match_id,
+            page_url=page_url,
+            observed_at=observed_at,
+            raw_asset_id=asset.id,
+            code="match_version_not_visible",
+            message=(
+                f"canonical match version {mapped_match_id}:{match_version} was observed after "
+                "the report"
+            ),
         )
     if version.status is not MatchStatus.FINISHED:
         raise _record_failure(
@@ -214,6 +228,7 @@ def ingest_fbref_match_report(
         resolved_teams,
         canonical,
         mapped_match_id,
+        mapping_as_of=observed_at,
     )
     if player_validation_error is not None:
         code, message = player_validation_error
@@ -451,6 +466,8 @@ def _validate_player_rows(
     resolved_teams: dict[str, ResolvedTeam],
     canonical: CanonicalStore,
     match_id: MatchId,
+    *,
+    mapping_as_of: datetime,
 ) -> tuple[str, str] | None:
     player_teams: dict[str, str] = {}
     source_player_ids: list[str] = []
@@ -496,12 +513,14 @@ def _validate_player_rows(
                 )
 
     placeholders = ", ".join("?" for _ in source_player_ids)
+    mapping_timestamp = mapping_as_of.isoformat(timespec="microseconds").replace("+00:00", "Z")
     with canonical.connect() as connection:
         mapped_players = connection.execute(
             "SELECT source_id, entity_id FROM source_mappings WHERE source = 'fbref' "
-            "AND entity_type = 'player' AND valid_to IS NULL "
+            "AND entity_type = 'player' AND valid_from <= ? "
+            "AND (valid_to IS NULL OR ? < valid_to) "
             f"AND source_id IN ({placeholders})",
-            source_player_ids,
+            (mapping_timestamp, mapping_timestamp, *source_player_ids),
         ).fetchall()
         for mapped_player in mapped_players:
             source_team_id = player_teams[str(mapped_player["source_id"])]

@@ -278,6 +278,106 @@ def test_repeated_observation_replays_stable_facts_with_exact_evidence(
     assert evidence_count == 22
 
 
+def test_historical_ingest_and_contract_replay_survive_later_mapping_revisions(
+    tmp_path: Path,
+) -> None:
+    _, archive, canonical, sources, teams, match, _, first = _ingest(tmp_path)
+    effective_at = NOW + timedelta(hours=1)
+    later_asset = archive.archive(
+        b"later reviewed identity evidence",
+        source="identity-review",
+        source_id="official-lineup-revisions",
+        url="https://club.example/identity-review",
+        observed_at=effective_at,
+        target_event_time=None,
+        collector_version="identity-review/1",
+        media_type="text/plain",
+    )
+    canonical.register_raw_asset(later_asset)
+    replacement_team = canonical.resolve_or_create_team(
+        source="identity-review",
+        source_id="replacement-team",
+        canonical_name="Replacement Team",
+        competition_id=CompetitionId("competition:eng.1"),
+        observed_at=effective_at,
+        raw_asset_id=later_asset.id,
+    )
+    replacement_match, _ = canonical.resolve_or_create_match(
+        source="identity-review",
+        source_id="replacement-match",
+        competition_id=CompetitionId("competition:eng.1"),
+        season_id=SeasonId("season:eng.1.2025-26"),
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        kickoff_at=KICKOFF,
+        status=MatchStatus.SCHEDULED,
+        observed_at=effective_at,
+        raw_asset_id=later_asset.id,
+    )
+    replacement_player = canonical.resolve_or_create_player(
+        source="identity-review",
+        source_id="replacement-player",
+        canonical_name="Replacement Player",
+        observed_at=effective_at,
+        raw_asset_id=later_asset.id,
+    )
+
+    for source, entity_type, source_id, candidate_entity_id in (
+        ("fbref-schedule", "match", SOURCE_MATCH_ID, replacement_match.id),
+        ("fbref", "team", "official-home", replacement_team.id),
+        (SOURCE, "player", "home-01", replacement_player.id),
+    ):
+        current = canonical.resolve_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+        )
+        conflict = canonical.propose_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+            candidate_entity_id=candidate_entity_id,
+            proposed_at=effective_at - timedelta(minutes=1),
+            actor="resolver:test",
+            reason="later provider identity review",
+            evidence_refs=(f"raw-asset:{later_asset.id.value}",),
+        )
+        canonical.revise_source_mapping(
+            source=source,
+            entity_type=entity_type,
+            source_id=source_id,
+            conflict_id=conflict.conflict_id,  # type: ignore[union-attr]
+            expected_current_mapping_id=current.mapping_id or "",
+            candidate_entity_id=candidate_entity_id,
+            effective_at=effective_at,
+            actor="operator:test",
+            reason="accepted later provider identity review",
+            evidence_refs=(f"raw-asset:{later_asset.id.value}",),
+        )
+
+    replayed_ingest = ingest_official_lineup_json(
+        _content(),
+        source=SOURCE,
+        source_match_id=SOURCE_MATCH_ID,
+        page_url=PAGE_URL,
+        observed_at=NOW,
+        archive=archive,
+        canonical=canonical,
+        source_registry=sources,
+    )
+
+    assert replayed_ingest == first
+    assert replayed_ingest.match_id == match.id
+    assert (
+        replay_official_lineup_contract(
+            first.contract_id,
+            archive=archive,
+            canonical=canonical,
+        ).contract_id
+        == first.contract_id
+    )
+
+
 def test_verified_fact_store_has_no_caller_lineup_bypass(tmp_path: Path) -> None:
     _, _, canonical, sources, _, _, _ = _context(tmp_path)
     facts = CanonicalFactStore(canonical, source_registry=sources)
