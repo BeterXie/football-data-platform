@@ -1196,6 +1196,39 @@ def test_finished_but_incomplete_archive_is_pending() -> None:
     assert assessment.reason_codes == ("post_match_archive_incomplete",)
 
 
+def test_team_baseline_readiness_requires_typed_team_fact_refs() -> None:
+    required = frozenset({"goals", "xg", "shots", "shots_on_target"})
+    starters = {
+        HOME.value: frozenset(f"player:home-{index}" for index in range(11)),
+        AWAY.value: frozenset(f"player:away-{index}" for index in range(11)),
+    }
+    availability = MatchAvailability(
+        match_status=MatchStatus.FINISHED,
+        team_ids=(HOME.value, AWAY.value),
+        snapshots=(),
+        result_90_present=True,
+        result_90_ref="fact:match_results_90:" + "0" * 64,
+        team_stat_fields={HOME.value: required, AWAY.value: required},
+        starters=starters,
+        player_observation_ids=frozenset().union(*starters.values()),
+        team_stats_known_at={HOME.value: OBSERVED_AT, AWAY.value: OBSERVED_AT},
+    )
+
+    assessment = assess_lifecycle(availability, evaluated_at=OBSERVED_AT)
+    qualification = next(
+        item
+        for item in assessment.qualifications
+        if item.qualification is Qualification.TEAM_BASELINE
+    )
+
+    assert not qualification.passed
+    assert assessment.state is LifecycleState.FINISHED_STATS_PENDING
+    assert qualification.reason_codes == (
+        f"missing_team_stat_ref:{HOME.value}",
+        f"missing_team_stat_ref:{AWAY.value}",
+    )
+
+
 def test_empty_team_stats_and_starters_cannot_archive_as_complete() -> None:
     assessment = assess_lifecycle(
         MatchAvailability(

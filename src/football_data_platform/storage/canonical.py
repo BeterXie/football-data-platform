@@ -7,7 +7,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -779,8 +779,13 @@ class CanonicalStore:
             )
             return match, version
 
-    def match_versions(self, match_id: MatchId) -> tuple[MatchVersion, ...]:
-        with self.connect() as connection:
+    def match_versions(
+        self,
+        match_id: MatchId,
+        *,
+        _connection: sqlite3.Connection | None = None,
+    ) -> tuple[MatchVersion, ...]:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             rows = connection.execute(
                 "SELECT match_id, version, round_name, kickoff_at, status, observed_at "
                 "FROM match_versions WHERE match_id = ? ORDER BY version",
@@ -788,8 +793,13 @@ class CanonicalStore:
             ).fetchall()
         return tuple(_match_version_from_row(row) for row in rows)
 
-    def match(self, match_id: MatchId) -> Match:
-        with self.connect() as connection:
+    def match(
+        self,
+        match_id: MatchId,
+        *,
+        _connection: sqlite3.Connection | None = None,
+    ) -> Match:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             return _load_match(connection, match_id)
 
     def mapped_team(
@@ -798,15 +808,17 @@ class CanonicalStore:
         source: str,
         source_id: str,
         as_of: datetime | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> ResolvedTeam:
         mapping = self.resolve_source_mapping(
             source=source,
             entity_type="team",
             source_id=source_id,
             as_of=as_of,
+            _connection=_connection,
         )
         entity_id = mapping.entity_id.value
-        with self.connect() as connection:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             row = connection.execute(
                 "SELECT canonical_name FROM teams WHERE team_id = ?", (entity_id,)
             ).fetchone()
@@ -844,6 +856,7 @@ class CanonicalStore:
         source_id: str,
         as_of: datetime | None = None,
         version: int | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> SourceMapping:
         """Resolve the current, historical-time, or explicit version of one mapping key."""
 
@@ -867,7 +880,7 @@ class CanonicalStore:
             parameters.extend((timestamp, timestamp))
         else:
             clauses.append("valid_to IS NULL")
-        with self.connect() as connection:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             row = connection.execute(
                 "SELECT * FROM source_mappings WHERE " + " AND ".join(clauses),
                 tuple(parameters),
@@ -1256,6 +1269,7 @@ class CanonicalStore:
         source: str,
         source_ids: Sequence[str],
         as_of: datetime | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> dict[str, MatchId]:
         """Resolve persisted provider mappings for a set of match identifiers."""
 
@@ -1270,7 +1284,7 @@ class CanonicalStore:
             validity = "valid_from <= ? AND (valid_to IS NULL OR ? < valid_to)"
             timestamp = _mapping_timestamp(as_of)
             parameters = (source, *source_ids, timestamp, timestamp)
-        with self.connect() as connection:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             rows = connection.execute(
                 "SELECT source_id, entity_id FROM source_mappings "
                 f"WHERE source = ? AND entity_type = 'match' AND source_id IN ({placeholders}) "
@@ -1485,11 +1499,16 @@ class CanonicalStore:
                 valid.append(evidence)
         return tuple(valid), tuple(diagnostics)
 
-    def match_report_contract(self, contract_id: str) -> MatchReportContractEvidence:
+    def match_report_contract(
+        self,
+        contract_id: str,
+        *,
+        _connection: sqlite3.Connection | None = None,
+    ) -> MatchReportContractEvidence:
         """Load and lineage-verify one persisted match-report parser contract."""
 
         _require_text(contract_id, "contract_id")
-        with self.connect() as connection:
+        with self.connect() if _connection is None else nullcontext(_connection) as connection:
             row = connection.execute(
                 "SELECT * FROM match_report_contracts WHERE contract_id = ?",
                 (contract_id,),
@@ -3649,6 +3668,13 @@ CREATE TABLE IF NOT EXISTS match_results_90 (
     UNIQUE (match_id, match_version, observation_version)
 );
 
+CREATE TRIGGER IF NOT EXISTS match_results_90_version_immutable
+BEFORE UPDATE OF observation_version ON match_results_90
+WHEN OLD.observation_version <> NEW.observation_version
+BEGIN
+    SELECT RAISE(ABORT, 'match result observation_version is immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS team_match_observations (
     record_id TEXT PRIMARY KEY,
     match_id TEXT NOT NULL,
@@ -3662,6 +3688,13 @@ CREATE TABLE IF NOT EXISTS team_match_observations (
     FOREIGN KEY (match_id, match_version) REFERENCES match_versions(match_id, version),
     UNIQUE (match_id, match_version, team_id, observation_version)
 );
+
+CREATE TRIGGER IF NOT EXISTS team_match_observations_version_immutable
+BEFORE UPDATE OF observation_version ON team_match_observations
+WHEN OLD.observation_version <> NEW.observation_version
+BEGIN
+    SELECT RAISE(ABORT, 'team observation observation_version is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS player_match_observations (
     record_id TEXT PRIMARY KEY,

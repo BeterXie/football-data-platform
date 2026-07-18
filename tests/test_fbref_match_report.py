@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import MatchId, RawAssetId
+from football_data_platform.domain.ids import CollectionAttemptId, MatchId, RawAssetId
+from football_data_platform.domain.lifecycle import Qualification, assess_lifecycle
 from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus
 from football_data_platform.pipelines.match_report import (
     PRODUCTION_COLLECTOR_VERSION,
@@ -26,14 +31,20 @@ from football_data_platform.sources.fbref_match_report import (
     REPORT_PARSER_VERSION,
     parse_match_report,
 )
+from football_data_platform.storage import match_report_contracts as contract_replay_module
 from football_data_platform.storage.canonical import CanonicalConflictError, CanonicalStore
-from football_data_platform.storage.facts import CanonicalFactStore
+from football_data_platform.storage.facts import (
+    CanonicalFactStore,
+    load_verified_match_result,
+    load_verified_team_observation,
+)
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.match_report_contracts import (
     MatchReportContractReplayError,
     verify_match_report_contract,
 )
 from football_data_platform.storage.raw import RawArchive
+from football_data_platform.storage.training import TrainingArtifactConflict, TrainingArtifactStore
 
 ROOT = Path(__file__).parents[1]
 OBSERVED_AT = datetime(2026, 7, 16, 6, 0, tzinfo=UTC)
@@ -99,6 +110,31 @@ def _complete_report_content() -> bytes:
         b"</tbody></table>"
     )
     return _report_content().replace(b"</body>", missing_tables + b"</body>")
+
+
+def _seed_team_observation_replay(
+    tmp_path: Path,
+    *,
+    content: bytes | None = None,
+    known_at: datetime = OBSERVED_AT,
+    observed_at: datetime = OBSERVED_AT,
+):
+    archive, canonical, season, schedule = _prepare_schedule(tmp_path)
+    result_ref = _seed_first_result(canonical, schedule)
+    ingest = ingest_fbref_match_report(
+        content or _report_content(),
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=known_at,
+        observed_at=observed_at,
+        archive=archive,
+        canonical=canonical,
+    )
+    return archive, canonical, season, schedule, result_ref, ingest
 
 
 def test_match_report_parses_normal_and_comment_wrapped_summary_tables() -> None:
@@ -657,6 +693,786 @@ def test_match_report_ingest_creates_canonical_team_and_player_facts(tmp_path: P
     assert result_count == 1
 
 
+def test_verified_team_observation_replays_raw_contract_and_team_mapping(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    match = canonical.match(match_id)
+
+    observations = tuple(
+        load_verified_team_observation(
+            reference,
+            archive=archive,
+            canonical=canonical,
+        )
+        for reference in ingest.team_fact_ids
+    )
+
+    assert {item.team_id for item in observations} == {
+        match.home_team_id,
+        match.away_team_id,
+    }
+    assert {item.record_id for item in observations} == set(ingest.team_fact_ids)
+    assert {item.raw_asset_id.value for item in observations} == {ingest.raw_asset_id}
+    assert all(item.match_id == match_id and item.match_version == 1 for item in observations)
+    assert all(item.known_at == OBSERVED_AT == item.observed_at for item in observations)
+    home = next(item for item in observations if item.team_id == match.home_team_id)
+    away = next(item for item in observations if item.team_id == match.away_team_id)
+    assert home.stats == {"goals": 2, "shots": 7.0, "shots_on_target": 4.0, "xg": 1.7}
+    assert away.stats == {"goals": 1, "shots": 4.0, "shots_on_target": 2.0, "xg": 0.8}
+    with pytest.raises(TypeError):
+        home.stats["xg"] = 99.0  # type: ignore[index]
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        match_id,
+        as_of=OBSERVED_AT,
+    )
+    assert availability.team_stat_refs == {
+        item.team_id.value: item.record_id for item in observations
+    }
+    assert availability.team_stat_pair_diagnostic is None
+    assert set(availability.team_stat_contract_ids.values()) == {ingest.contract_id}
+    assert set(availability.team_stat_raw_asset_ids.values()) == {ingest.raw_asset_id}
+    assert set(availability.team_stats_observed_at.values()) == {OBSERVED_AT}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("content_id", "content ID"),
+        ("stats_value", "content ID"),
+        ("stats_type", "finite number or None"),
+        ("stats_json", "not canonical"),
+        ("evidence", "exact raw evidence"),
+        ("raw_registration", "raw registration conflicts"),
+        ("temporal", "known_at cannot be later"),
+    ),
+)
+def test_verified_team_observation_rejects_canonical_fact_tampering(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    reference = ingest.team_fact_ids[0]
+    candidate = reference
+    with canonical.connect() as connection:
+        if mutation == "content_id":
+            candidate = "fact:team_match_observations:" + "0" * 64
+            connection.execute(
+                "UPDATE team_match_observations SET record_id = ? WHERE record_id = ?",
+                (candidate, reference),
+            )
+            connection.execute(
+                "UPDATE fact_evidence SET record_id = ? WHERE record_id = ?",
+                (candidate, reference),
+            )
+        elif mutation in {"stats_value", "stats_type", "stats_json"}:
+            stored = connection.execute(
+                "SELECT stats_json FROM team_match_observations WHERE record_id = ?",
+                (reference,),
+            ).fetchone()["stats_json"]
+            stats = json.loads(stored)
+            if mutation == "stats_value":
+                stats["xg"] = 99.0
+                replacement = json.dumps(stats, separators=(",", ":"), sort_keys=True)
+            elif mutation == "stats_type":
+                stats["xg"] = True
+                replacement = json.dumps(stats, separators=(",", ":"), sort_keys=True)
+            else:
+                replacement = stored + " "
+            connection.execute(
+                "UPDATE team_match_observations SET stats_json = ? WHERE record_id = ?",
+                (replacement, reference),
+            )
+        elif mutation == "evidence":
+            connection.execute("DELETE FROM fact_evidence WHERE record_id = ?", (reference,))
+        elif mutation == "raw_registration":
+            connection.execute(
+                "UPDATE raw_assets SET url = ? WHERE raw_asset_id = ?",
+                ("https://tampered.example/report", ingest.raw_asset_id),
+            )
+        else:
+            earlier = (OBSERVED_AT - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+            connection.execute(
+                "UPDATE team_match_observations SET observed_at = ? WHERE record_id = ?",
+                (earlier, reference),
+            )
+            connection.execute(
+                "UPDATE fact_evidence SET observed_at = ? WHERE record_id = ?",
+                (earlier, reference),
+            )
+
+    with pytest.raises(ValueError, match=message):
+        load_verified_team_observation(candidate, archive=archive, canonical=canonical)
+
+
+def test_verified_team_observation_rejects_modified_raw_bytes(tmp_path: Path) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    asset = archive.load(RawAssetId(ingest.raw_asset_id))
+    archive.layout.raw_object_path(asset.checksum).write_bytes(b"tampered report bytes")
+
+    with pytest.raises(ValueError, match="checksum"):
+        load_verified_team_observation(
+            ingest.team_fact_ids[0],
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tampered_field", "message"),
+    (("stats_json", "stats do not match"), ("known_at", "known_at does not match")),
+)
+def test_verified_team_observation_replays_raw_after_recomputed_fact_identity(
+    tmp_path: Path,
+    tampered_field: str,
+    message: str,
+) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    reference = ingest.team_fact_ids[0]
+    with canonical.connect() as connection:
+        row = connection.execute(
+            "SELECT match_id, match_version, team_id, known_at, observed_at, stats_json, "
+            "raw_asset_id FROM team_match_observations WHERE record_id = ?",
+            (reference,),
+        ).fetchone()
+        payload = dict(row)
+        if tampered_field == "stats_json":
+            stats = json.loads(payload["stats_json"])
+            stats["xg"] = 99.0
+            payload["stats_json"] = json.dumps(stats, separators=(",", ":"), sort_keys=True)
+        else:
+            payload["known_at"] = (
+                (OBSERVED_AT - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+            )
+        semantic = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"observed_at", "raw_asset_id"}
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                semantic,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        forged_ref = f"fact:team_match_observations:{digest}"
+        connection.execute(
+            f"UPDATE team_match_observations SET {tampered_field} = ?, record_id = ? "
+            "WHERE record_id = ?",
+            (payload[tampered_field], forged_ref, reference),
+        )
+        connection.execute(
+            "UPDATE fact_evidence SET record_id = ? WHERE record_id = ?",
+            (forged_ref, reference),
+        )
+
+    with pytest.raises(ValueError, match=message):
+        load_verified_team_observation(forged_ref, archive=archive, canonical=canonical)
+
+
+def test_verified_team_observation_allows_additional_semantic_evidence(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(minutes=1)
+    second = ingest_fbref_match_report(
+        _report_content(),
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+
+    assert second.team_fact_ids == first.team_fact_ids
+    with canonical.connect() as connection:
+        evidence_counts = {
+            reference: connection.execute(
+                "SELECT COUNT(*) FROM fact_evidence WHERE record_id = ?", (reference,)
+            ).fetchone()[0]
+            for reference in first.team_fact_ids
+        }
+    assert set(evidence_counts.values()) == {2}
+    for reference in first.team_fact_ids:
+        assert (
+            load_verified_team_observation(
+                reference,
+                archive=archive,
+                canonical=canonical,
+            ).record_id
+            == reference
+        )
+
+
+@pytest.mark.parametrize("contract_state", ("missing", "legacy", "duplicate"))
+def test_verified_team_observation_requires_one_current_replayable_contract(
+    tmp_path: Path,
+    contract_state: str,
+) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    contract = canonical.match_report_contract(ingest.contract_id)
+    if contract_state in {"missing", "legacy"}:
+        with canonical.connect() as connection:
+            connection.execute(
+                "DELETE FROM match_report_contracts WHERE contract_id = ?",
+                (contract.contract_id,),
+            )
+    if contract_state == "legacy":
+        canonical.record_match_report_contract(
+            collection_attempt_id=contract.collection_attempt_id,
+            match_id=contract.match_id,
+            match_version=contract.match_version,
+            raw_asset_id=contract.raw_asset_id,
+            source_match_id=contract.source_match_id,
+            parser_version="fbref-match-report/legacy",
+            required_tables=contract.required_tables,
+            team_tables=dict(contract.team_tables),
+            observed_at=contract.observed_at,
+        )
+    if contract_state == "duplicate":
+        duplicate_attempt_id = CollectionAttemptId("collection-attempt:duplicate-report")
+        with canonical.connect() as connection:
+            connection.execute(
+                "INSERT INTO collection_attempts("
+                "collection_attempt_id, match_id, source, source_id, target_url, outcome, "
+                "observed_at, collector_version, diagnostic_code, diagnostic_message, raw_asset_id"
+                ") SELECT ?, match_id, source, source_id, target_url, outcome, observed_at, "
+                "collector_version, diagnostic_code, diagnostic_message, raw_asset_id "
+                "FROM collection_attempts WHERE collection_attempt_id = ?",
+                (duplicate_attempt_id.value, contract.collection_attempt_id.value),
+            )
+        canonical.record_match_report_contract(
+            collection_attempt_id=duplicate_attempt_id,
+            match_id=contract.match_id,
+            match_version=contract.match_version,
+            raw_asset_id=contract.raw_asset_id,
+            source_match_id=contract.source_match_id,
+            parser_version=contract.parser_version,
+            required_tables=contract.required_tables,
+            team_tables=dict(contract.team_tables),
+            observed_at=contract.observed_at,
+        )
+
+    message = "exactly one" if contract_state != "legacy" else "parser output"
+    with pytest.raises(ValueError, match=message):
+        load_verified_team_observation(
+            ingest.team_fact_ids[0],
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+def test_verified_team_observation_recomputes_parser_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive, canonical, _, _, _, ingest = _seed_team_observation_replay(tmp_path)
+    original = contract_replay_module.parse_match_report
+
+    def altered_parser(*args, **kwargs):
+        parsed = original(*args, **kwargs)
+        home = parsed.teams[0]
+        stats = {**home.aggregated_stats, "xg": 99.0}
+        return replace(parsed, teams=(replace(home, aggregated_stats=stats), *parsed.teams[1:]))
+
+    monkeypatch.setattr(contract_replay_module, "parse_match_report", altered_parser)
+    with pytest.raises(ValueError, match="stats do not match replayed parser output"):
+        load_verified_team_observation(
+            ingest.team_fact_ids[0],
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+def test_verified_team_observation_rejects_persisted_parser_output_change(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    changed = _report_content().replace(b'data-stat="xg">1.7', b'data-stat="xg">1.9')
+    later = OBSERVED_AT + timedelta(minutes=1)
+    original_asset = archive.load(RawAssetId(ingest.raw_asset_id))
+    changed_asset = archive.archive(
+        changed,
+        source="fbref",
+        source_id="aaaaaaaa",
+        url=original_asset.url,
+        observed_at=later,
+        target_event_time=OBSERVED_AT,
+        collector_version=original_asset.collector_version,
+        media_type=original_asset.media_type,
+    )
+    canonical.register_raw_asset(changed_asset)
+    attempt = canonical.record_collection_attempt(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        source="fbref-match-report",
+        source_id="aaaaaaaa",
+        target_url=changed_asset.url,
+        outcome=CollectionAttemptOutcome.SUCCEEDED,
+        observed_at=later,
+        collector_version=changed_asset.collector_version,
+        raw_asset_id=changed_asset.id,
+    )
+    parsed = parse_match_report(changed, required_tables=("summary",))
+    canonical.record_match_report_contract(
+        collection_attempt_id=attempt.id,
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        raw_asset_id=changed_asset.id,
+        source_match_id="aaaaaaaa",
+        parser_version=parsed.parser_version,
+        required_tables=parsed.required_tables,
+        team_tables={team.source_team_id: team.tables_present for team in parsed.teams},
+        observed_at=later,
+    )
+    reference = ingest.team_fact_ids[0]
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE team_match_observations SET raw_asset_id = ?, observed_at = ? "
+            "WHERE record_id = ?",
+            (changed_asset.id.value, later.isoformat().replace("+00:00", "Z"), reference),
+        )
+        connection.execute(
+            "INSERT INTO fact_evidence(record_id, raw_asset_id, observed_at) VALUES (?, ?, ?)",
+            (
+                reference,
+                changed_asset.id.value,
+                later.isoformat().replace("+00:00", "Z"),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="stats do not match replayed parser output"):
+        load_verified_team_observation(reference, archive=archive, canonical=canonical)
+
+
+def test_verified_team_observation_rejects_tampered_historical_team_mapping(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    match = canonical.match(MatchId(schedule.canonical_match_ids[0]))
+    with canonical.connect() as connection:
+        connection.execute("DROP TRIGGER source_mappings_close_only_update")
+        connection.execute(
+            "UPDATE source_mappings SET entity_id = ? WHERE source = 'fbref' "
+            "AND entity_type = 'team' AND source_id = ?",
+            (match.away_team_id.value, "18bb7c10"),
+        )
+
+    with pytest.raises(ValueError, match="evidence is unavailable"):
+        load_verified_team_observation(
+            ingest.team_fact_ids[0],
+            archive=archive,
+            canonical=canonical,
+        )
+
+
+@pytest.mark.parametrize("second_known_at", (OBSERVED_AT, OBSERVED_AT + timedelta(hours=1)))
+def test_team_availability_applies_known_and_observed_as_of_boundaries(
+    tmp_path: Path,
+    second_known_at: datetime,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    changed = _report_content().replace(b'data-stat="xg">1.7', b'data-stat="xg">1.9')
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=second_known_at,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    facts = CanonicalFactStore(canonical, raw_archive=archive)
+    match_id = MatchId(schedule.canonical_match_ids[0])
+
+    historical = facts.availability(match_id, as_of=OBSERVED_AT + timedelta(minutes=30))
+    latest = facts.availability(match_id)
+
+    assert set(historical.team_stat_refs.values()) == set(first.team_fact_ids)
+    assert set(latest.team_stat_refs.values()) == set(second.team_fact_ids)
+
+
+def test_team_baseline_qualification_rejects_cross_contract_latest_pair(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, result_ref, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    changed = _report_content().replace(b'data-stat="xg">1.7', b'data-stat="xg">1.9')
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    match_id = MatchId(schedule.canonical_match_ids[0])
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        match_id,
+        as_of=later,
+    )
+
+    selected_refs = set(availability.team_stat_refs.values())
+    assert selected_refs == set(second.team_fact_ids)
+    assert selected_refs != set(first.team_fact_ids)
+    assert len(set(availability.team_stat_contract_ids.values())) == 2
+    assert availability.team_stat_pair_diagnostic == "typed_team_fact_pair_mismatch"
+    lifecycle = {
+        item.qualification: item
+        for item in assess_lifecycle(
+            replace(availability, team_stat_pair_diagnostic=None),
+            evaluated_at=later,
+        ).qualifications
+    }
+    assert not lifecycle[Qualification.TEAM_BASELINE].passed
+    assert "typed_team_fact_pair_mismatch" in lifecycle[Qualification.TEAM_BASELINE].reason_codes
+
+    store = TrainingArtifactStore(DataLayout(tmp_path / "data"))
+    artifact = store.create_training_qualification(
+        match_id=match_id,
+        match_version=1,
+        qualification=Qualification.TEAM_BASELINE,
+        ruleset_version="readiness/1",
+        evaluated_at=later,
+        snapshot_ref=None,
+        result_ref=result_ref,
+    )
+
+    assert not artifact.passed
+    assert "typed_team_fact_pair_mismatch" in artifact.reason_codes
+    assert selected_refs <= set(artifact.fact_refs)
+    assert store.load_training_qualification(artifact.qualification_id) == artifact
+
+
+def test_team_availability_does_not_fallback_from_corrupted_latest_observation(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    changed = _report_content().replace(b'data-stat="xg">1.7', b'data-stat="xg">1.9')
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=later,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    newest = next(
+        reference for reference in second.team_fact_ids if reference not in first.team_fact_ids
+    )
+    with canonical.connect() as connection:
+        team_id = connection.execute(
+            "SELECT team_id FROM team_match_observations WHERE record_id = ?", (newest,)
+        ).fetchone()["team_id"]
+        old_same_team = connection.execute(
+            "SELECT record_id FROM team_match_observations WHERE team_id = ? "
+            "AND record_id != ? ORDER BY observation_version DESC LIMIT 1",
+            (team_id, newest),
+        ).fetchone()["record_id"]
+        connection.execute(
+            "UPDATE team_match_observations SET stats_json = ? WHERE record_id = ?",
+            ('{"goals":2,"shots":7.0,"shots_on_target":4.0,"xg":99.0}', newest),
+        )
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0])
+    )
+    assert team_id not in availability.team_stat_fields
+    assert team_id not in availability.team_stat_refs
+    assert availability.team_stat_diagnostics == {team_id: "typed_team_fact_replay_invalid"}
+    assert old_same_team not in availability.team_stat_refs.values()
+    qualifications = {
+        item.qualification: item
+        for item in assess_lifecycle(availability, evaluated_at=later).qualifications
+    }
+    diagnostic = f"typed_team_fact_replay_invalid:{team_id}"
+    assert diagnostic in qualifications[Qualification.TEAM_BASELINE].reason_codes
+    assert diagnostic not in qualifications[Qualification.SCORE_MODEL].reason_codes
+
+
+def test_team_observation_version_history_rejects_latest_hijack(tmp_path: Path) -> None:
+    archive, canonical, _, schedule, _, first = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    changed = _report_content().replace(b'data-stat="xg">1.7', b'data-stat="xg">1.9')
+    second = ingest_fbref_match_report(
+        changed,
+        page_url="https://fbref.example/en/matches/aaaaaaaa/report",
+        source_match_id="aaaaaaaa",
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=2,
+        away_goals=1,
+        known_at=later,
+        observed_at=later,
+        archive=archive,
+        canonical=canonical,
+    )
+    newest = next(
+        reference for reference in second.team_fact_ids if reference not in first.team_fact_ids
+    )
+    with canonical.connect() as connection:
+        team_id = connection.execute(
+            "SELECT team_id FROM team_match_observations WHERE record_id = ?", (newest,)
+        ).fetchone()["team_id"]
+        oldest = connection.execute(
+            "SELECT record_id FROM team_match_observations WHERE team_id = ? "
+            "ORDER BY observation_version LIMIT 1",
+            (team_id,),
+        ).fetchone()["record_id"]
+        with pytest.raises(sqlite3.IntegrityError, match="observation_version is immutable"):
+            connection.execute(
+                "UPDATE team_match_observations SET observation_version = 3 WHERE record_id = ?",
+                (oldest,),
+            )
+        connection.execute("DROP TRIGGER team_match_observations_version_immutable")
+        connection.execute(
+            "UPDATE team_match_observations SET observation_version = 3 WHERE record_id = ?",
+            (oldest,),
+        )
+
+    with pytest.raises(ValueError, match="observation version history"):
+        load_verified_team_observation(oldest, archive=archive, canonical=canonical)
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0])
+    )
+    assert team_id not in availability.team_stat_refs
+    assert availability.team_stat_diagnostics[team_id] == "typed_team_fact_replay_invalid"
+
+
+def test_availability_rejects_result_without_exact_evidence_but_keeps_team_facts(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, result_ref, ingest = _seed_team_observation_replay(tmp_path)
+    with canonical.connect() as connection:
+        connection.execute("DELETE FROM fact_evidence WHERE record_id = ?", (result_ref,))
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=OBSERVED_AT,
+    )
+
+    assert not availability.result_90_present
+    assert availability.result_90_ref is None
+    assert availability.result_90_diagnostic == "typed_result_fact_replay_invalid"
+    assert set(availability.team_stat_refs.values()) == set(ingest.team_fact_ids)
+    qualifications = {
+        item.qualification: item
+        for item in assess_lifecycle(availability, evaluated_at=OBSERVED_AT).qualifications
+    }
+    for qualification in (Qualification.SCORE_MODEL, Qualification.TEAM_BASELINE):
+        assert "typed_result_fact_replay_invalid" in qualifications[qualification].reason_codes
+
+
+def test_availability_does_not_fallback_from_latest_result_with_tampered_raw(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, old_result_ref, ingest = _seed_team_observation_replay(
+        tmp_path
+    )
+    later = OBSERVED_AT + timedelta(hours=1)
+    correction_raw = archive.archive(
+        b"independent result correction",
+        source="result-correction-test",
+        source_id="aaaaaaaa-correction",
+        url="https://result.example/aaaaaaaa-correction",
+        observed_at=later,
+        target_event_time=later,
+        collector_version="result-correction/1",
+        media_type="application/octet-stream",
+    )
+    canonical.register_raw_asset(correction_raw)
+    correction = CanonicalFactStore(canonical).append_result_90(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=3,
+        away_goals=1,
+        known_at=later,
+        observed_at=later,
+        raw_asset_id=correction_raw.id,
+    )
+    archive.layout.raw_object_path(correction_raw.checksum).write_bytes(b"tampered correction")
+
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=later,
+    )
+
+    assert not availability.result_90_present
+    assert availability.result_90_ref is None
+    assert availability.result_90_diagnostic == "typed_result_fact_replay_invalid"
+    assert old_result_ref != correction.record_id
+    assert old_result_ref != availability.result_90_ref
+    assert set(availability.team_stat_refs.values()) == set(ingest.team_fact_ids)
+
+
+def test_result_observation_version_history_rejects_latest_hijack(tmp_path: Path) -> None:
+    archive, canonical, _, schedule, old_result_ref, _ = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    correction_raw = archive.archive(
+        b"versioned result correction",
+        source="result-correction-test",
+        source_id="aaaaaaaa-versioned-correction",
+        url="https://result.example/aaaaaaaa-versioned-correction",
+        observed_at=later,
+        target_event_time=later,
+        collector_version="result-correction/1",
+        media_type="application/octet-stream",
+    )
+    canonical.register_raw_asset(correction_raw)
+    CanonicalFactStore(canonical).append_result_90(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=3,
+        away_goals=1,
+        known_at=later,
+        observed_at=later,
+        raw_asset_id=correction_raw.id,
+    )
+    with canonical.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="observation_version is immutable"):
+            connection.execute(
+                "UPDATE match_results_90 SET observation_version = 3 WHERE record_id = ?",
+                (old_result_ref,),
+            )
+        connection.execute("DROP TRIGGER match_results_90_version_immutable")
+        connection.execute(
+            "UPDATE match_results_90 SET observation_version = 3 WHERE record_id = ?",
+            (old_result_ref,),
+        )
+
+    with pytest.raises(ValueError, match="observation version history"):
+        load_verified_match_result(old_result_ref, archive=archive, canonical=canonical)
+    availability = CanonicalFactStore(canonical, raw_archive=archive).availability(
+        MatchId(schedule.canonical_match_ids[0]),
+        as_of=later,
+    )
+    assert not availability.result_90_present
+    assert availability.result_90_ref is None
+    assert availability.result_90_diagnostic == "typed_result_fact_replay_invalid"
+
+
+@pytest.mark.parametrize("incomplete", (False, True))
+def test_team_baseline_qualification_binds_verified_latest_team_fact_refs(
+    tmp_path: Path,
+    incomplete: bool,
+) -> None:
+    content = _report_content()
+    if incomplete:
+        content = content.replace(b'data-stat="xg">0.8', b'data-stat="xg">')
+    _, _, _, schedule, result_ref, ingest = _seed_team_observation_replay(
+        tmp_path,
+        content=content,
+    )
+    layout = DataLayout(tmp_path / "data")
+    store = TrainingArtifactStore(layout)
+    artifact = store.create_training_qualification(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        qualification=Qualification.TEAM_BASELINE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=None,
+        result_ref=result_ref,
+    )
+
+    assert artifact.passed is not incomplete
+    if incomplete:
+        assert any(reason.endswith(":xg") for reason in artifact.reason_codes)
+    expected_team_refs = set(ingest.team_fact_ids)
+    assert expected_team_refs <= set(artifact.fact_refs)
+    assert set(artifact.fact_refs) == {result_ref, *expected_team_refs}
+    assert store.load_training_qualification(artifact.qualification_id) == artifact
+    manifest = store.derived._load_artifact_manifest_for_output_ref(artifact.qualification_id)
+    assert manifest.input_refs == artifact.input_refs
+    assert expected_team_refs <= set(manifest.input_refs)
+
+
+def test_team_baseline_qualification_requires_explicit_latest_result_ref(
+    tmp_path: Path,
+) -> None:
+    _, _, _, schedule, _, ingest = _seed_team_observation_replay(tmp_path)
+    store = TrainingArtifactStore(DataLayout(tmp_path / "data"))
+
+    artifact = store.create_training_qualification(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        qualification=Qualification.TEAM_BASELINE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=None,
+        result_ref=None,
+    )
+
+    assert not artifact.passed
+    assert "missing_bound_result_90" in artifact.reason_codes
+    assert set(ingest.team_fact_ids) <= set(artifact.fact_refs)
+
+
+def test_team_baseline_qualification_rejects_result_observed_after_evaluation(
+    tmp_path: Path,
+) -> None:
+    archive, canonical, _, schedule, _, _ = _seed_team_observation_replay(tmp_path)
+    later = OBSERVED_AT + timedelta(hours=1)
+    future_raw = archive.archive(
+        b"future result correction",
+        source="fbref",
+        source_id="future-result-correction",
+        url="https://fbref.example/future-result-correction",
+        observed_at=later,
+        target_event_time=OBSERVED_AT,
+        collector_version="test-result/1",
+        media_type="application/octet-stream",
+    )
+    canonical.register_raw_asset(future_raw)
+    future_result = CanonicalFactStore(canonical).append_result_90(
+        match_id=MatchId(schedule.canonical_match_ids[0]),
+        match_version=1,
+        home_goals=3,
+        away_goals=1,
+        known_at=OBSERVED_AT,
+        observed_at=later,
+        raw_asset_id=future_raw.id,
+    )
+
+    with pytest.raises(TrainingArtifactConflict, match="different match or version"):
+        TrainingArtifactStore(DataLayout(tmp_path / "data")).create_training_qualification(
+            match_id=MatchId(schedule.canonical_match_ids[0]),
+            match_version=1,
+            qualification=Qualification.TEAM_BASELINE,
+            ruleset_version="readiness/1",
+            evaluated_at=OBSERVED_AT + timedelta(minutes=30),
+            snapshot_ref=None,
+            result_ref=future_result.record_id,
+        )
+
+
 def test_historical_ingest_and_contract_replay_survive_later_mapping_revisions(
     tmp_path: Path,
 ) -> None:
@@ -727,6 +1543,14 @@ def test_historical_ingest_and_contract_replay_survive_later_mapping_revisions(
         ).contract_id
         == first.contract_id
     )
+    assert {
+        load_verified_team_observation(
+            reference,
+            archive=archive,
+            canonical=canonical,
+        ).record_id
+        for reference in first.team_fact_ids
+    } == set(first.team_fact_ids)
 
 
 @pytest.mark.parametrize(

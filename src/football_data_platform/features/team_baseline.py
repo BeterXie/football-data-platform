@@ -26,6 +26,7 @@ class TeamMatchProcess:
     home_xg: float
     away_xg: float
     source_ref: str
+    source_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         require_utc(self.kickoff_at, "kickoff_at")
@@ -33,6 +34,13 @@ class TeamMatchProcess:
         for name, value in (("home_xg", self.home_xg), ("away_xg", self.away_xg)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        refs = self.source_refs or (self.source_ref,)
+        if (
+            any(not isinstance(ref, str) or not ref or ref.strip() != ref for ref in refs)
+            or len(refs) != len(set(refs))
+            or self.source_ref not in refs
+        ):
+            raise ValueError("team match source refs must be unique canonical text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +96,12 @@ def build_team_baseline(
     )
     excluded = tuple(
         sorted(
-            observation.source_ref for observation in observations if observation not in eligible
+            {
+                reference
+                for observation in observations
+                if observation not in eligible
+                for reference in _observation_source_refs(observation)
+            }
         )
     )
     if not eligible:
@@ -163,7 +176,15 @@ def build_team_baseline(
         )
         for team_id in sorted(team_observations)
     )
-    input_refs = tuple(sorted({observation.source_ref for observation in eligible}))
+    input_refs = tuple(
+        sorted(
+            {
+                reference
+                for observation in eligible
+                for reference in _observation_source_refs(observation)
+            }
+        )
+    )
     identity = {
         "schema_version": TEAM_BASELINE_SCHEMA_VERSION,
         "coordinate_version": TEAM_BASELINE_COORDINATE_VERSION,
@@ -194,6 +215,10 @@ def build_team_baseline(
     )
     verify_team_baseline_artifact(artifact)
     return BaselineBuildResult(artifact, excluded)
+
+
+def _observation_source_refs(observation: TeamMatchProcess) -> tuple[str, ...]:
+    return observation.source_refs or (observation.source_ref,)
 
 
 def expected_goals_from_baseline(

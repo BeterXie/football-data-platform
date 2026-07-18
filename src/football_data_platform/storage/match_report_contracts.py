@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from football_data_platform.domain.ids import MatchId
 from football_data_platform.domain.models import Match, MatchStatus, MatchVersion, require_utc
@@ -18,6 +21,9 @@ from football_data_platform.storage.canonical import (
     ResolvedTeam,
 )
 from football_data_platform.storage.raw import RawArchive
+
+if TYPE_CHECKING:
+    from football_data_platform.storage.verification import VerificationSession
 
 MATCH_MAPPING_SOURCE = "fbref-schedule"
 _BLOCKING_DIAGNOSTICS = frozenset(
@@ -80,6 +86,14 @@ class MatchReportResultValidation:
     away_goals: int
 
 
+@dataclass(frozen=True, slots=True)
+class MatchReportContractReplay:
+    contract: MatchReportContractEvidence
+    parsed: MatchReportParseResult
+    identity: MatchReportIdentityValidation
+    result: MatchReportResultValidation
+
+
 def blocking_match_report_diagnostics(
     parsed: MatchReportParseResult,
 ) -> tuple[ParseDiagnostic, ...]:
@@ -96,13 +110,45 @@ def verify_match_report_contract(
     *,
     archive: RawArchive,
     canonical: CanonicalStore,
+    verification_session: VerificationSession | None = None,
 ) -> MatchReportContractEvidence:
     """Load one contract and replay its raw parser, fixture, and result boundaries."""
 
+    return replay_match_report_contract(
+        contract_id,
+        archive=archive,
+        canonical=canonical,
+        verification_session=verification_session,
+    ).contract
+
+
+def replay_match_report_contract(
+    contract_id: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    verification_session: VerificationSession | None = None,
+) -> MatchReportContractReplay:
+    """Replay one contract and retain the parser and historical identity results."""
+
+    connection = (
+        None if verification_session is None else verification_session.canonical_connection()
+    )
+    if verification_session is not None:
+        cached = verification_session.cached_match_report_replay(contract_id)
+        if cached is not None:
+            return cached
     try:
-        contract = canonical.match_report_contract(contract_id)
+        contract = canonical.match_report_contract(contract_id, _connection=connection)
+        if verification_session is not None:
+            verification_session.file_proof(archive.layout.raw_manifest_path(contract.raw_asset_id))
         archive.verify(contract.raw_asset_id)
         raw_asset = archive.load(contract.raw_asset_id)
+        if verification_session is not None:
+            verification_session.file_proof(
+                archive.layout.raw_object_path(raw_asset.checksum),
+                expected_sha256=raw_asset.checksum,
+            )
         content = archive.read(raw_asset)
         parsed = parse_match_report(content, required_tables=contract.required_tables)
     except (OSError, RuntimeError, TypeError, ValueError, KeyError) as error:
@@ -138,21 +184,23 @@ def verify_match_report_contract(
             code="report_known_at_missing",
         )
     try:
-        validate_match_report_identity(
+        identity = validate_match_report_identity(
             parsed,
             source_match_id=contract.source_match_id,
             match_id=contract.match_id,
             match_version=contract.match_version,
             canonical=canonical,
             mapping_as_of=contract.observed_at,
+            _connection=connection,
         )
-        validate_match_report_result(
+        result = validate_match_report_result(
             parsed,
             match_id=contract.match_id,
             match_version=contract.match_version,
             known_at=raw_asset.target_event_time,
             observed_at=contract.observed_at,
             canonical=canonical,
+            _connection=connection,
         )
     except MatchReportCanonicalValidationError as error:
         raise MatchReportContractReplayError(
@@ -160,7 +208,10 @@ def verify_match_report_contract(
             "match report parser output conflicts with canonical fixture state",
             code=error.code,
         ) from error
-    return contract
+    replay = MatchReportContractReplay(contract, parsed, identity, result)
+    if verification_session is not None:
+        verification_session.remember_match_report_replay(contract_id, replay)
+    return replay
 
 
 def validate_match_report_identity(
@@ -171,6 +222,7 @@ def validate_match_report_identity(
     match_version: int,
     canonical: CanonicalStore,
     mapping_as_of: datetime,
+    _connection: sqlite3.Connection | None = None,
 ) -> MatchReportIdentityValidation:
     """Validate raw report identity against one canonical match version."""
 
@@ -179,6 +231,7 @@ def validate_match_report_identity(
         source=MATCH_MAPPING_SOURCE,
         source_ids=(source_match_id,),
         as_of=mapping_as_of,
+        _connection=_connection,
     ).get(source_match_id)
     if mapped_match_id is None:
         raise MatchReportCanonicalValidationError(
@@ -191,7 +244,10 @@ def validate_match_report_identity(
             f"mapped match is {mapped_match_id}, contract identifies {match_id}",
         )
 
-    versions = {version.version: version for version in canonical.match_versions(match_id)}
+    versions = {
+        version.version: version
+        for version in canonical.match_versions(match_id, _connection=_connection)
+    }
     version = versions.get(match_version)
     if version is None:
         raise MatchReportCanonicalValidationError(
@@ -223,7 +279,10 @@ def validate_match_report_identity(
     try:
         for source_team_id in source_team_ids:
             resolved_teams[source_team_id] = canonical.mapped_team(
-                source="fbref", source_id=source_team_id, as_of=mapping_as_of
+                source="fbref",
+                source_id=source_team_id,
+                as_of=mapping_as_of,
+                _connection=_connection,
             )
     except KeyError as error:
         raise MatchReportCanonicalValidationError(
@@ -231,7 +290,7 @@ def validate_match_report_identity(
             str(error),
         ) from error
 
-    match = canonical.match(match_id)
+    match = canonical.match(match_id, _connection=_connection)
     expected_team_ids = {match.home_team_id, match.away_team_id}
     report_team_ids = {team.id for team in resolved_teams.values()}
     if report_team_ids != expected_team_ids:
@@ -254,6 +313,7 @@ def validate_match_report_identity(
         canonical,
         match,
         as_of=mapping_as_of,
+        _connection=_connection,
     )
     if expected_competition_id is None:
         raise MatchReportCanonicalValidationError(
@@ -269,7 +329,9 @@ def validate_match_report_identity(
             ),
         )
 
-    expected_season_id = _expected_season_source_id(canonical, match, as_of=mapping_as_of)
+    expected_season_id = _expected_season_source_id(
+        canonical, match, as_of=mapping_as_of, _connection=_connection
+    )
     if expected_season_id is None:
         raise MatchReportCanonicalValidationError(
             "report_season_identity_unverifiable",
@@ -291,10 +353,16 @@ def validate_match_report_identity(
         )
     try:
         identity_home = canonical.mapped_team(
-            source="fbref", source_id=identity.home_source_id, as_of=mapping_as_of
+            source="fbref",
+            source_id=identity.home_source_id,
+            as_of=mapping_as_of,
+            _connection=_connection,
         )
         identity_away = canonical.mapped_team(
-            source="fbref", source_id=identity.away_source_id, as_of=mapping_as_of
+            source="fbref",
+            source_id=identity.away_source_id,
+            as_of=mapping_as_of,
+            _connection=_connection,
         )
     except KeyError as error:
         raise MatchReportCanonicalValidationError(
@@ -337,6 +405,7 @@ def validate_match_report_result(
     observed_at: datetime,
     canonical: CanonicalStore,
     claimed_score: tuple[int, int] | None = None,
+    _connection: sqlite3.Connection | None = None,
 ) -> MatchReportResultValidation:
     """Validate the raw 90-minute score at the report knowledge boundary."""
 
@@ -351,6 +420,7 @@ def validate_match_report_result(
         match_version=match_version,
         known_at=known_at,
         observed_at=observed_at,
+        _connection=_connection,
     )
     if canonical_result is None:
         raise MatchReportCanonicalValidationError(
@@ -393,9 +463,10 @@ def _expected_competition_source_id(
     match: Match,
     *,
     as_of: datetime,
+    _connection: sqlite3.Connection | None = None,
 ) -> str | None:
     timestamp = as_of.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    with canonical.connect() as connection:
+    with canonical.connect() if _connection is None else nullcontext(_connection) as connection:
         row = connection.execute(
             "SELECT source_id FROM source_mappings "
             "WHERE source = 'fbref' AND entity_type = 'season' AND entity_id = ? "
@@ -412,9 +483,10 @@ def _expected_season_source_id(
     match: Match,
     *,
     as_of: datetime,
+    _connection: sqlite3.Connection | None = None,
 ) -> str | None:
     timestamp = as_of.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    with canonical.connect() as connection:
+    with canonical.connect() if _connection is None else nullcontext(_connection) as connection:
         row = connection.execute(
             "SELECT source_id FROM source_mappings "
             "WHERE source = 'fbref' AND entity_type = 'season' AND entity_id = ? "
@@ -434,8 +506,9 @@ def _result_as_of(
     match_version: int,
     known_at: datetime,
     observed_at: datetime,
+    _connection: sqlite3.Connection | None = None,
 ) -> tuple[str, int, int] | None:
-    with canonical.connect() as connection:
+    with canonical.connect() if _connection is None else nullcontext(_connection) as connection:
         row = connection.execute(
             "SELECT record_id, home_goals, away_goals FROM match_results_90 "
             "WHERE match_id = ? AND match_version = ? AND known_at <= ? AND observed_at <= ? "

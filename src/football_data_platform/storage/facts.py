@@ -6,9 +6,12 @@ import hashlib
 import json
 import math
 import sqlite3
+from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from football_data_platform.domain.ids import MatchId, PlayerId, RawAssetId, TeamId
 from football_data_platform.domain.lifecycle import (
@@ -40,13 +43,31 @@ from football_data_platform.storage.canonical import (
     build_official_lineup_contract,
 )
 from football_data_platform.storage.layout import DataLayout
+from football_data_platform.storage.match_report_contracts import replay_match_report_contract
 from football_data_platform.storage.raw import RawArchive
+
+if TYPE_CHECKING:
+    from football_data_platform.storage.verification import VerificationSession
 
 
 @dataclass(frozen=True, slots=True)
 class StoredFact:
     record_id: str
     observation_version: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class TeamMatchObservation:
+    record_id: str
+    match_id: MatchId
+    match_version: int
+    team_id: TeamId
+    observation_version: int
+    stats: Mapping[str, float | int | None]
+    known_at: datetime
+    observed_at: datetime
+    raw_asset_id: RawAssetId
+    contract_id: str
 
 
 class OfficialLineupRawParseError(ValueError):
@@ -125,7 +146,7 @@ class CanonicalFactStore:
         observed_at: datetime,
         raw_asset_id: RawAssetId,
     ) -> StoredFact:
-        _validate_metrics(stats, "stats")
+        _validate_team_stats(stats, "stats")
         with self.canonical.connect() as connection:
             match_row = _require_match_version(
                 connection,
@@ -755,11 +776,22 @@ class CanonicalFactStore:
         *,
         snapshots: tuple[SnapshotAvailability, ...] = (),
         as_of: datetime | None = None,
+        verification_session: VerificationSession | None = None,
     ) -> MatchAvailability:
         if as_of is not None:
             require_utc(as_of, "as_of")
         as_of_text = _timestamp(as_of) if as_of is not None else None
-        with self.canonical.connect() as connection:
+        archive = self.raw_archive or RawArchive(DataLayout(self.canonical.path.parent.parent))
+        if verification_session is None:
+            from football_data_platform.storage.verification import active_verification_session
+
+            verification_session = active_verification_session(archive.layout)
+        connection_scope = (
+            self.canonical.connect()
+            if verification_session is None
+            else nullcontext(verification_session.canonical_connection())
+        )
+        with connection_scope as connection:
             match = connection.execute(
                 "SELECT home_team_id, away_team_id FROM matches WHERE match_id = ?",
                 (match_id.value,),
@@ -777,35 +809,115 @@ class CanonicalFactStore:
                 suffix = " by as_of" if as_of_text is not None else ""
                 raise KeyError(f"match {match_id} has no versions{suffix}")
             result_query = (
-                "SELECT known_at FROM match_results_90 WHERE match_id = ? AND match_version = ?"
+                "SELECT record_id, known_at FROM match_results_90 "
+                "WHERE match_id = ? AND match_version = ?"
             )
             result_parameters: list[object] = [match_id.value, version["version"]]
             if as_of_text is not None:
-                result_query += " AND known_at <= ?"
-                result_parameters.append(as_of_text)
+                result_query += " AND known_at <= ? AND observed_at <= ?"
+                result_parameters.extend((as_of_text, as_of_text))
             result_query += " ORDER BY observation_version DESC LIMIT 1"
             result_row = connection.execute(result_query, tuple(result_parameters)).fetchone()
-            result_present = result_row is not None
-            result_known_at = _parse_timestamp(result_row["known_at"]) if result_row else None
+            result_present = False
+            result_known_at = None
+            result_ref = None
+            result_diagnostic = None
+            if result_row is not None:
+                try:
+                    verified_result = load_verified_match_result(
+                        str(result_row["record_id"]),
+                        archive=archive,
+                        canonical=self.canonical,
+                        _connection=connection,
+                        verification_session=verification_session,
+                    )
+                except (
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    sqlite3.Error,
+                ):
+                    result_diagnostic = "typed_result_fact_replay_invalid"
+                else:
+                    if verified_result.match_id == match_id:
+                        result_present = True
+                        result_known_at = verified_result.known_at
+                        result_ref = verified_result.source_ref
+                    else:
+                        result_diagnostic = "typed_result_fact_replay_invalid"
             team_query = (
-                "SELECT team_id, stats_json, known_at FROM team_match_observations "
+                "SELECT record_id, team_id FROM team_match_observations "
                 "WHERE match_id = ? AND match_version = ?"
             )
             team_parameters: list[object] = [match_id.value, version["version"]]
             if as_of_text is not None:
-                team_query += " AND known_at <= ?"
-                team_parameters.append(as_of_text)
+                team_query += " AND known_at <= ? AND observed_at <= ?"
+                team_parameters.extend((as_of_text, as_of_text))
             team_query += " ORDER BY observation_version DESC"
             team_stats_rows = connection.execute(team_query, tuple(team_parameters)).fetchall()
             team_fields: dict[str, frozenset[str]] = {}
             team_stats_known_at: dict[str, datetime] = {}
+            team_stat_refs: dict[str, str] = {}
+            team_stat_match_ids: dict[str, str] = {}
+            team_stat_match_versions: dict[str, int] = {}
+            team_stat_contract_ids: dict[str, str] = {}
+            team_stat_raw_asset_ids: dict[str, str] = {}
+            team_stats_observed_at: dict[str, datetime] = {}
+            team_stat_diagnostics: dict[str, str] = {}
+            selected_teams: set[str] = set()
             for row in team_stats_rows:
-                if row["team_id"] not in team_fields:
-                    values = json.loads(row["stats_json"])
-                    team_fields[row["team_id"]] = frozenset(
-                        key for key, value in values.items() if value is not None
+                team_id = str(row["team_id"])
+                if team_id not in selected_teams:
+                    selected_teams.add(team_id)
+                    try:
+                        observation = load_verified_team_observation(
+                            row["record_id"],
+                            archive=archive,
+                            canonical=self.canonical,
+                            _connection=connection,
+                            verification_session=verification_session,
+                        )
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                        KeyError,
+                        sqlite3.Error,
+                    ):
+                        team_stat_diagnostics[team_id] = "typed_team_fact_replay_invalid"
+                        continue
+                    if (
+                        observation.match_id != match_id
+                        or observation.match_version != version["version"]
+                        or observation.team_id.value != team_id
+                    ):
+                        team_stat_diagnostics[team_id] = "typed_team_fact_replay_invalid"
+                        continue
+                    team_fields[team_id] = frozenset(
+                        key for key, value in observation.stats.items() if value is not None
                     )
-                    team_stats_known_at[row["team_id"]] = _parse_timestamp(row["known_at"])
+                    team_stats_known_at[team_id] = observation.known_at
+                    team_stat_refs[team_id] = observation.record_id
+                    team_stat_match_ids[team_id] = observation.match_id.value
+                    team_stat_match_versions[team_id] = observation.match_version
+                    team_stat_contract_ids[team_id] = observation.contract_id
+                    team_stat_raw_asset_ids[team_id] = observation.raw_asset_id.value
+                    team_stats_observed_at[team_id] = observation.observed_at
+            team_stat_pair_diagnostic = _team_observation_pair_diagnostic(
+                (str(match["home_team_id"]), str(match["away_team_id"])),
+                match_id=match_id.value,
+                match_version=int(version["version"]),
+                refs=team_stat_refs,
+                match_ids=team_stat_match_ids,
+                match_versions=team_stat_match_versions,
+                contract_ids=team_stat_contract_ids,
+                raw_asset_ids=team_stat_raw_asset_ids,
+                observed_at=team_stats_observed_at,
+                known_at=team_stats_known_at,
+            )
             lineup_query = (
                 "SELECT team_id, player_id FROM lineup_facts WHERE match_id = ? AND "
                 "match_version = ? AND lineup_role = 'starter' AND official = 1"
@@ -853,7 +965,17 @@ class CanonicalFactStore:
             match_id=match_id.value,
             match_version=int(version["version"]),
             result_90_known_at=result_known_at,
+            result_90_ref=result_ref,
+            result_90_diagnostic=result_diagnostic,
             team_stats_known_at=team_stats_known_at,
+            team_stat_refs=team_stat_refs,
+            team_stat_match_ids=team_stat_match_ids,
+            team_stat_match_versions=team_stat_match_versions,
+            team_stat_contract_ids=team_stat_contract_ids,
+            team_stat_raw_asset_ids=team_stat_raw_asset_ids,
+            team_stats_observed_at=team_stats_observed_at,
+            team_stat_diagnostics=team_stat_diagnostics,
+            team_stat_pair_diagnostic=team_stat_pair_diagnostic,
             player_observations=player_observations,
             as_of=as_of,
         )
@@ -932,16 +1054,64 @@ class CanonicalFactStore:
                 )
 
 
+def _team_observation_pair_diagnostic(
+    team_ids: tuple[str, str],
+    *,
+    match_id: str,
+    match_version: int,
+    refs: Mapping[str, str],
+    match_ids: Mapping[str, str],
+    match_versions: Mapping[str, int],
+    contract_ids: Mapping[str, str],
+    raw_asset_ids: Mapping[str, str],
+    observed_at: Mapping[str, datetime],
+    known_at: Mapping[str, datetime],
+) -> str | None:
+    expected = set(team_ids)
+    if set(refs) != expected:
+        return None
+    metadata = (match_ids, match_versions, contract_ids, raw_asset_ids, observed_at, known_at)
+    if any(set(values) != expected for values in metadata):
+        return "typed_team_fact_pair_metadata_incomplete"
+    signatures = {
+        (
+            match_ids[team_id],
+            match_versions[team_id],
+            contract_ids[team_id],
+            raw_asset_ids[team_id],
+            observed_at[team_id],
+            known_at[team_id],
+        )
+        for team_id in team_ids
+    }
+    if len(signatures) != 1 or any(
+        selected_match_id != match_id or selected_match_version != match_version
+        for selected_match_id, selected_match_version, *_ in signatures
+    ):
+        return "typed_team_fact_pair_mismatch"
+    return None
+
+
 def load_verified_match_result(
     source_ref: str,
     *,
     archive: RawArchive,
     canonical: CanonicalStore,
     _connection: sqlite3.Connection | None = None,
+    verification_session: VerificationSession | None = None,
 ) -> MatchResult90:
     """Verify result identity, exact evidence binding, and registered raw bytes/timestamp."""
 
     _require_text(source_ref, "source_ref")
+    if verification_session is None:
+        from football_data_platform.storage.verification import active_verification_session
+
+        verification_session = active_verification_session(archive.layout)
+    if verification_session is not None:
+        cached = verification_session.cached_match_result(source_ref)
+        if cached is not None:
+            return cached
+        _connection = verification_session.canonical_connection()
     if _connection is None:
         with canonical.connect() as connection:
             row, raw_row, evidence_row = _match_result_rows(source_ref, connection)
@@ -952,7 +1122,8 @@ def load_verified_match_result(
         not isinstance(row[field], str)
         for field in ("record_id", "match_id", "known_at", "observed_at", "raw_asset_id")
     ) or any(
-        type(row[field]) is not int for field in ("match_version", "home_goals", "away_goals")
+        type(row[field]) is not int
+        for field in ("match_version", "observation_version", "home_goals", "away_goals")
     ):
         raise ValueError("canonical result fact contains invalid persisted field types")
     payload = {
@@ -993,7 +1164,14 @@ def load_verified_match_result(
         raise ValueError("canonical result raw registration contains invalid field types")
 
     asset_id = RawAssetId(payload["raw_asset_id"])
+    if verification_session is not None:
+        verification_session.file_proof(archive.layout.raw_manifest_path(asset_id))
     asset = archive.load(asset_id)
+    if verification_session is not None:
+        verification_session.file_proof(
+            archive.layout.raw_object_path(asset.checksum),
+            expected_sha256=asset.checksum,
+        )
     archive.verify(asset)
     persisted_raw = (
         raw_row["source"],
@@ -1022,13 +1200,252 @@ def load_verified_match_result(
     if payload["observed_at"] != _timestamp(asset.observed_at):
         raise ValueError("canonical result observed_at does not match its raw evidence")
 
-    return MatchResult90(
+    result = MatchResult90(
         match_id=MatchId(payload["match_id"]),
         home_goals=payload["home_goals"],
         away_goals=payload["away_goals"],
         known_at=_parse_timestamp(payload["known_at"]),
         source_ref=source_ref,
     )
+    if verification_session is not None:
+        verification_session.remember_match_result(source_ref, result)
+    return result
+
+
+def load_verified_team_observation(
+    source_ref: str,
+    *,
+    archive: RawArchive,
+    canonical: CanonicalStore,
+    _connection: sqlite3.Connection | None = None,
+    verification_session: VerificationSession | None = None,
+) -> TeamMatchObservation:
+    """Replay one team observation from canonical bytes through its report contract."""
+
+    _require_text(source_ref, "source_ref")
+    if verification_session is None:
+        from football_data_platform.storage.verification import active_verification_session
+
+        verification_session = active_verification_session(archive.layout)
+    if verification_session is not None:
+        cached = verification_session.cached_team_observation(source_ref)
+        if cached is not None:
+            return cached
+        _connection = verification_session.canonical_connection()
+    if _connection is None:
+        with canonical.connect() as connection:
+            row, raw_row, evidence_rows, contract_rows = _team_observation_rows(
+                source_ref, connection
+            )
+    else:
+        row, raw_row, evidence_rows, contract_rows = _team_observation_rows(source_ref, _connection)
+
+    text_fields = (
+        "record_id",
+        "match_id",
+        "team_id",
+        "known_at",
+        "observed_at",
+        "stats_json",
+        "raw_asset_id",
+    )
+    integer_fields = ("match_version", "observation_version")
+    if any(not isinstance(row[field], str) for field in text_fields) or any(
+        type(row[field]) is not int for field in integer_fields
+    ):
+        raise ValueError("canonical team observation contains invalid persisted field types")
+    if row["match_version"] < 1 or row["observation_version"] < 1:
+        raise ValueError("canonical team observation versions must be positive")
+
+    stats = _parse_canonical_team_stats(row["stats_json"])
+    payload = {
+        "match_id": row["match_id"],
+        "match_version": row["match_version"],
+        "team_id": row["team_id"],
+        "known_at": row["known_at"],
+        "observed_at": row["observed_at"],
+        "stats_json": row["stats_json"],
+        "raw_asset_id": row["raw_asset_id"],
+    }
+    if _record_id("team_match_observations", _semantic_payload(payload)) != source_ref:
+        raise ValueError("canonical team observation content ID does not match persisted semantics")
+
+    expected_evidence = (source_ref, row["raw_asset_id"], row["observed_at"])
+    actual_evidence = {
+        (item["record_id"], item["raw_asset_id"], item["observed_at"]) for item in evidence_rows
+    }
+    if expected_evidence not in actual_evidence:
+        raise ValueError("canonical team observation lacks its exact raw evidence binding")
+    if raw_row is None:
+        raise ValueError("canonical team observation raw asset is not registered")
+    if (
+        any(
+            not isinstance(raw_row[field], str)
+            for field in (
+                "source",
+                "source_id",
+                "url",
+                "observed_at",
+                "checksum",
+                "collector_version",
+                "media_type",
+            )
+        )
+        or (
+            raw_row["target_event_time"] is not None
+            and not isinstance(raw_row["target_event_time"], str)
+        )
+        or type(raw_row["size_bytes"]) is not int
+    ):
+        raise ValueError("canonical team observation raw registration has invalid field types")
+
+    known_at = _parse_timestamp(row["known_at"])
+    observed_at = _parse_timestamp(row["observed_at"])
+    _require_temporal_order(known_at, observed_at)
+    asset_id = RawAssetId(row["raw_asset_id"])
+    if verification_session is not None:
+        verification_session.file_proof(archive.layout.raw_manifest_path(asset_id))
+    asset = archive.load(asset_id)
+    if verification_session is not None:
+        verification_session.file_proof(
+            archive.layout.raw_object_path(asset.checksum),
+            expected_sha256=asset.checksum,
+        )
+    archive.verify(asset)
+    persisted_raw = (
+        raw_row["source"],
+        raw_row["source_id"],
+        raw_row["url"],
+        raw_row["observed_at"],
+        raw_row["target_event_time"],
+        raw_row["checksum"],
+        raw_row["collector_version"],
+        raw_row["media_type"],
+        raw_row["size_bytes"],
+    )
+    archived_raw = (
+        asset.source,
+        asset.source_id,
+        asset.url,
+        _timestamp(asset.observed_at),
+        _timestamp(asset.target_event_time) if asset.target_event_time is not None else None,
+        asset.checksum,
+        asset.collector_version,
+        asset.media_type,
+        asset.size_bytes,
+    )
+    if persisted_raw != archived_raw:
+        raise ValueError("canonical team observation raw registration conflicts with the archive")
+    if observed_at != asset.observed_at:
+        raise ValueError("canonical team observation observed_at does not match its raw evidence")
+    if asset.target_event_time is None or known_at != asset.target_event_time:
+        raise ValueError("canonical team observation known_at does not match its raw evidence")
+
+    if len(contract_rows) != 1:
+        raise ValueError(
+            "canonical team observation requires exactly one matching match-report contract"
+        )
+    contract_id = str(contract_rows[0]["contract_id"])
+    replay = replay_match_report_contract(
+        contract_id,
+        archive=archive,
+        canonical=canonical,
+        verification_session=verification_session,
+    )
+    match_id = MatchId(row["match_id"])
+    team_id = TeamId(row["team_id"])
+    if (
+        replay.contract.match_id != match_id
+        or replay.contract.match_version != row["match_version"]
+        or replay.contract.raw_asset_id != asset_id
+        or replay.contract.observed_at != observed_at
+    ):
+        raise ValueError("canonical team observation does not match its report contract")
+    reports = tuple(
+        report
+        for report in replay.parsed.teams
+        if replay.identity.resolved_teams[report.source_team_id].id == team_id
+    )
+    if len(reports) != 1:
+        raise ValueError("canonical team observation team mapping does not match parser output")
+    match = replay.identity.match
+    goals = replay.result.home_goals if team_id == match.home_team_id else replay.result.away_goals
+    expected_stats = {**reports[0].aggregated_stats, "goals": goals}
+    if row["stats_json"] != _json_text(expected_stats):
+        raise ValueError("canonical team observation stats do not match replayed parser output")
+
+    observation = TeamMatchObservation(
+        record_id=source_ref,
+        match_id=match_id,
+        match_version=row["match_version"],
+        team_id=team_id,
+        observation_version=row["observation_version"],
+        stats=MappingProxyType(dict(stats)),
+        known_at=known_at,
+        observed_at=observed_at,
+        raw_asset_id=asset_id,
+        contract_id=contract_id,
+    )
+    if verification_session is not None:
+        verification_session.remember_team_observation(source_ref, observation)
+    return observation
+
+
+def _team_observation_rows(
+    source_ref: str,
+    connection: sqlite3.Connection,
+) -> tuple[sqlite3.Row, sqlite3.Row | None, list[sqlite3.Row], list[sqlite3.Row]]:
+    row = connection.execute(
+        "SELECT record_id, match_id, match_version, team_id, observation_version, "
+        "known_at, observed_at, stats_json, raw_asset_id FROM team_match_observations "
+        "WHERE record_id = ?",
+        (source_ref,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("team observation source_ref does not identify a canonical fact")
+    _validate_team_observation_version_history(connection, row)
+    raw_row = connection.execute(
+        "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
+        "collector_version, media_type, size_bytes FROM raw_assets WHERE raw_asset_id = ?",
+        (row["raw_asset_id"],),
+    ).fetchone()
+    evidence_rows = connection.execute(
+        "SELECT record_id, raw_asset_id, observed_at FROM fact_evidence WHERE record_id = ?",
+        (source_ref,),
+    ).fetchall()
+    contract_rows = connection.execute(
+        "SELECT contract_id FROM match_report_contracts WHERE raw_asset_id = ? "
+        "AND match_id = ? AND match_version = ? AND observed_at = ? ORDER BY contract_id",
+        (
+            row["raw_asset_id"],
+            row["match_id"],
+            row["match_version"],
+            row["observed_at"],
+        ),
+    ).fetchall()
+    return row, raw_row, evidence_rows, contract_rows
+
+
+def _validate_team_observation_version_history(
+    connection: sqlite3.Connection,
+    observation: sqlite3.Row,
+) -> None:
+    versions = [
+        item["observation_version"]
+        for item in connection.execute(
+            "SELECT observation_version FROM team_match_observations "
+            "WHERE match_id = ? AND match_version = ? AND team_id = ? ORDER BY rowid",
+            (
+                observation["match_id"],
+                observation["match_version"],
+                observation["team_id"],
+            ),
+        ).fetchall()
+    ]
+    if any(type(version) is not int for version in versions) or versions != list(
+        range(1, len(versions) + 1)
+    ):
+        raise ValueError("canonical team observation has invalid observation version history")
 
 
 def _match_result_rows(
@@ -1036,13 +1453,14 @@ def _match_result_rows(
     connection: sqlite3.Connection,
 ) -> tuple[sqlite3.Row, sqlite3.Row | None, sqlite3.Row | None]:
     row = connection.execute(
-        "SELECT record_id, match_id, match_version, home_goals, away_goals, "
+        "SELECT record_id, match_id, match_version, observation_version, home_goals, away_goals, "
         "known_at, observed_at, raw_asset_id FROM match_results_90 "
         "WHERE record_id = ?",
         (source_ref,),
     ).fetchone()
     if row is None:
         raise ValueError("result source_ref does not identify a canonical fact")
+    _validate_match_result_version_history(connection, row)
     raw_row = connection.execute(
         "SELECT source, source_id, url, observed_at, target_event_time, checksum, "
         "collector_version, media_type, size_bytes FROM raw_assets "
@@ -1054,6 +1472,24 @@ def _match_result_rows(
         (source_ref, row["raw_asset_id"], row["observed_at"]),
     ).fetchone()
     return row, raw_row, evidence_row
+
+
+def _validate_match_result_version_history(
+    connection: sqlite3.Connection,
+    result: sqlite3.Row,
+) -> None:
+    versions = [
+        item["observation_version"]
+        for item in connection.execute(
+            "SELECT observation_version FROM match_results_90 "
+            "WHERE match_id = ? AND match_version = ? ORDER BY rowid",
+            (result["match_id"], result["match_version"]),
+        ).fetchall()
+    ]
+    if any(type(version) is not int for version in versions) or versions != list(
+        range(1, len(versions) + 1)
+    ):
+        raise ValueError("canonical result fact has invalid observation version history")
 
 
 def verify_official_lineup_contract(
@@ -1222,6 +1658,30 @@ def _validate_metrics(values: dict[str, float | int | None], name: str) -> None:
         if value is not None and not math.isfinite(float(value)):
             raise ValueError(f"{name} value {key!r} must be finite or None")
     _json_text(values)
+
+
+def _validate_team_stats(values: Any, name: str) -> None:
+    if not isinstance(values, dict):
+        raise ValueError(f"{name} must be an object")
+    for key, value in values.items():
+        if not isinstance(key, str) or not key or key.strip() != key:
+            raise ValueError(f"{name} contains an invalid key")
+        if value is not None and (
+            type(value) not in {int, float} or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"{name} value {key!r} must be a finite number or None")
+    _json_text(values)
+
+
+def _parse_canonical_team_stats(value: str) -> dict[str, float | int | None]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("canonical team observation stats_json is invalid") from error
+    _validate_team_stats(parsed, "canonical team observation stats")
+    if value != _json_text(parsed):
+        raise ValueError("canonical team observation stats_json is not canonical")
+    return parsed
 
 
 def _require_match(connection, match_id: MatchId):

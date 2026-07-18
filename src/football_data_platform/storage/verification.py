@@ -12,6 +12,9 @@ import json
 import re
 import sqlite3
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -24,6 +27,10 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _DERIVED_ARTIFACT = re.compile(r"^derived-artifact:([0-9a-f]{64})$")
 _TRAINING_DATASET = re.compile(r"^training-dataset:([0-9a-f]{64})$")
 _ENTITY_NAMESPACES = frozenset({"competition", "season", "team", "player", "match"})
+_ACTIVE_SESSION: ContextVar[VerificationSession | None] = ContextVar(
+    "football_data_platform_verification_session",
+    default=None,
+)
 
 
 class VerificationConflict(ArchiveConflictError):
@@ -148,6 +155,11 @@ class VerificationSession:
         self._proofs: dict[Path, FileProof] = {}
         self._directory_snapshots: dict[Path, tuple[str, ...]] = {}
         self._sidecar_snapshots: dict[Path, tuple[Path, ...]] = {}
+        self._artifact_manifests: dict[str, Any] = {}
+        self._team_observations: dict[str, Any] = {}
+        self._match_results: dict[str, Any] = {}
+        self._match_report_replays: dict[str, Any] = {}
+        self._resolving_manifests: set[str] = set()
 
     def __enter__(self) -> VerificationSession:
         if self._closed:
@@ -339,6 +351,49 @@ class VerificationSession:
         self._proofs[resolved] = proof
         return proof
 
+    def cached_artifact_manifest(self, artifact_id: str) -> Any | None:
+        self._ensure_open()
+        return self._artifact_manifests.get(artifact_id)
+
+    def remember_artifact_manifest(self, artifact_id: str, manifest: Any) -> None:
+        self._ensure_open()
+        self._artifact_manifests[artifact_id] = manifest
+
+    def cached_team_observation(self, source_ref: str) -> Any | None:
+        self._ensure_open()
+        return self._team_observations.get(source_ref)
+
+    def remember_team_observation(self, source_ref: str, observation: Any) -> None:
+        self._ensure_open()
+        self._team_observations[source_ref] = observation
+
+    def cached_match_result(self, source_ref: str) -> Any | None:
+        self._ensure_open()
+        return self._match_results.get(source_ref)
+
+    def remember_match_result(self, source_ref: str, result: Any) -> None:
+        self._ensure_open()
+        self._match_results[source_ref] = result
+
+    def cached_match_report_replay(self, contract_id: str) -> Any | None:
+        self._ensure_open()
+        return self._match_report_replays.get(contract_id)
+
+    def remember_match_report_replay(self, contract_id: str, replay: Any) -> None:
+        self._ensure_open()
+        self._match_report_replays[contract_id] = replay
+
+    @contextmanager
+    def resolving_artifact_manifest(self, artifact_id: str) -> Iterator[None]:
+        self._ensure_open()
+        if artifact_id in self._resolving_manifests:
+            raise VerificationConflict(f"recursive derived artifact lineage: {artifact_id}")
+        self._resolving_manifests.add(artifact_id)
+        try:
+            yield
+        finally:
+            self._resolving_manifests.discard(artifact_id)
+
     def assert_stable(self) -> None:
         """Verify every read file and catalog directory before request completion."""
 
@@ -447,6 +502,29 @@ class VerificationSession:
             raise VerificationConflict("verification session is closed")
         if not self._entered:
             raise VerificationConflict("verification session must be entered before reading")
+
+
+def active_verification_session(layout: DataLayout | str | Path) -> VerificationSession | None:
+    session = _ACTIVE_SESSION.get()
+    if session is None or not session._entered or session._closed:
+        return None
+    candidate = layout if isinstance(layout, DataLayout) else DataLayout(Path(layout))
+    if session.layout.root.resolve() != candidate.root.resolve():
+        return None
+    return session
+
+
+@contextmanager
+def verification_session_scope(session: VerificationSession) -> Iterator[VerificationSession]:
+    existing = active_verification_session(session.layout)
+    if existing is not None:
+        yield existing
+        return
+    token = _ACTIVE_SESSION.set(session)
+    try:
+        yield session
+    finally:
+        _ACTIVE_SESSION.reset(token)
 
 
 def _hash_file(path: Path) -> str:

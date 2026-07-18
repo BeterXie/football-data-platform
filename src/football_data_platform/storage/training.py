@@ -55,7 +55,11 @@ from football_data_platform.storage.derived import (
     DerivedArchive,
     DerivedArtifactManifest,
 )
-from football_data_platform.storage.facts import CanonicalFactStore, load_verified_match_result
+from football_data_platform.storage.facts import (
+    CanonicalFactStore,
+    load_verified_match_result,
+    load_verified_team_observation,
+)
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 
@@ -458,15 +462,27 @@ class TrainingArtifactStore:
         verification_session: VerificationSession | None = None,
     ) -> tuple[ScorePrediction, PreMatchSnapshot]:
         if require_current and verification_session is None:
-            from football_data_platform.storage.verification import VerificationSession
+            from football_data_platform.storage.verification import (
+                VerificationSession,
+                active_verification_session,
+                verification_session_scope,
+            )
 
             try:
-                with VerificationSession(self.layout) as session:
+                active_session = active_verification_session(self.layout)
+                if active_session is not None:
                     return self._load_prediction_replay(
                         reference,
                         require_current=True,
-                        verification_session=session,
+                        verification_session=active_session,
                     )
+                with VerificationSession(self.layout) as session:
+                    with verification_session_scope(session):
+                        return self._load_prediction_replay(
+                            reference,
+                            require_current=True,
+                            verification_session=session,
+                        )
             except TrainingArtifactConflict:
                 raise
             except ArchiveConflictError as error:
@@ -770,13 +786,25 @@ class TrainingArtifactStore:
         # Build one request-local, fail-closed catalog.  The normal archive loader remains the
         # authority for typed manifest and lineage validation after the catalog selects a path.
         if verification_session is None:
-            from football_data_platform.storage.verification import VerificationSession
+            from football_data_platform.storage.verification import (
+                VerificationSession,
+                active_verification_session,
+                verification_session_scope,
+            )
 
             try:
-                with VerificationSession(self.layout) as session:
+                active_session = active_verification_session(self.layout)
+                if active_session is not None:
                     return self._load_unique_manifest_for_output_ref(
-                        output_ref, verification_session=session
+                        output_ref,
+                        verification_session=active_session,
                     )
+                with VerificationSession(self.layout) as session:
+                    with verification_session_scope(session):
+                        return self._load_unique_manifest_for_output_ref(
+                            output_ref,
+                            verification_session=session,
+                        )
             except TrainingArtifactConflict:
                 raise
             except (OSError, RuntimeError, TypeError, ValueError, ArchiveConflictError) as error:
@@ -862,9 +890,14 @@ class TrainingArtifactStore:
                 ).fetchone()
                 latest = connection.execute(
                     "SELECT record_id FROM match_results_90 WHERE match_id = ? "
-                    "AND match_version = ? AND known_at <= ? "
+                    "AND match_version = ? AND known_at <= ? AND observed_at <= ? "
                     "ORDER BY observation_version DESC LIMIT 1",
-                    (match_id.value, match_version, _timestamp(evaluated_at)),
+                    (
+                        match_id.value,
+                        match_version,
+                        _timestamp(evaluated_at),
+                        _timestamp(evaluated_at),
+                    ),
                 ).fetchone()
             if (
                 row is None
@@ -898,13 +931,20 @@ class TrainingArtifactStore:
         result = next(
             item for item in assessment.qualifications if item.qualification is qualification
         )
+        if qualification is Qualification.TEAM_BASELINE:
+            selected_team_refs = {
+                availability.team_stat_refs[team_id]
+                for team_id in availability.team_ids
+                if team_id in availability.team_stat_refs
+            }
+            fact_refs = tuple(sorted({*fact_refs, *selected_team_refs}))
         reasons = list(result.reason_codes)
-        if qualification is Qualification.SCORE_MODEL and result_ref is None:
+        if qualification in {Qualification.SCORE_MODEL, Qualification.TEAM_BASELINE} and (
+            result_ref is None
+        ):
             reasons.append("missing_bound_result_90")
         if qualification is Qualification.SCORE_MODEL and snapshot_ref is None:
             reasons.append("missing_bound_prematch_snapshot")
-        if qualification is Qualification.TEAM_BASELINE:
-            reasons.append("typed_team_fact_replay_unavailable")
         if qualification is Qualification.PLAYER_PROFILE:
             reasons.append("typed_player_fact_replay_unavailable")
         normalized_reasons = tuple(sorted(set(reasons)))
@@ -1086,7 +1126,12 @@ class TrainingArtifactStore:
         reference: str,
         *,
         _manifest_lineage: frozenset[str] = frozenset(),
+        verification_session: VerificationSession | None = None,
     ) -> _TrainingReferenceAvailability:
+        if verification_session is None:
+            from football_data_platform.storage.verification import active_verification_session
+
+            verification_session = active_verification_session(self.layout)
         if not isinstance(reference, str) or not reference or reference.strip() != reference:
             raise ValueError("reference must be non-empty text")
         if reference.startswith("raw-asset:"):
@@ -1096,7 +1141,10 @@ class TrainingArtifactStore:
             return _TrainingReferenceAvailability(reference, asset.observed_at)
         if reference.startswith("derived-source:"):
             _require_digest_reference(reference, "derived-source:")
-            source = self.derived.validate_snapshot_source(reference)
+            source = self.derived.validate_snapshot_source(
+                reference,
+                verification_session=verification_session,
+            )
             return _TrainingReferenceAvailability(reference, source.observed_at, source.known_at)
         if reference.startswith("team-baseline:"):
             baseline = self.derived.load_team_baseline(reference)
@@ -1125,6 +1173,7 @@ class TrainingArtifactStore:
             return self._verify_derived_artifact_reference(
                 reference,
                 lineage=_manifest_lineage,
+                verification_session=verification_session,
             )
         if reference.startswith("training-qualification:"):
             qualification = self.load_training_qualification(reference)
@@ -1145,6 +1194,18 @@ class TrainingArtifactStore:
             if reference.startswith("fact:match_results_90:"):
                 _, availability = self._load_result_reference_availability(reference)
                 return availability
+            if reference.startswith("fact:team_match_observations:"):
+                observation = load_verified_team_observation(
+                    reference,
+                    archive=RawArchive(self.layout),
+                    canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+                    verification_session=verification_session,
+                )
+                return _TrainingReferenceAvailability(
+                    reference,
+                    observation.observed_at,
+                    observation.known_at,
+                )
             self._verify_canonical_reference(reference)
             return _TrainingReferenceAvailability(reference, None)
         raise ValueError(f"unsupported training reference type: {reference}")
@@ -1154,12 +1215,16 @@ class TrainingArtifactStore:
         reference: str,
         *,
         lineage: frozenset[str],
+        verification_session: VerificationSession | None = None,
     ) -> _TrainingReferenceAvailability:
         if reference in lineage:
             raise TrainingArtifactConflict(
                 f"recursive derived artifact training lineage: {reference}"
             )
-        manifest = self.derived.load_artifact_manifest(reference)
+        manifest = self.derived.load_artifact_manifest(
+            reference,
+            verification_session=verification_session,
+        )
         if manifest.status not in {"succeeded", "partial"}:
             raise TrainingArtifactConflict(
                 f"training input derived artifact is not usable: {reference}"
@@ -1170,6 +1235,7 @@ class TrainingArtifactStore:
             availability = self._verify_training_reference(
                 input_reference,
                 _manifest_lineage=nested_lineage,
+                verification_session=verification_session,
             )
             if availability.available_at is None:
                 raise TrainingArtifactConflict(

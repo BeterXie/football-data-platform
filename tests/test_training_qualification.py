@@ -483,21 +483,30 @@ def test_non_score_qualifications_and_captured_snapshots_fail_closed(tmp_path: P
     _, second_match, _, second_result, snapshot_ref = _seed_formal_training(layout)
     store = TrainingArtifactStore(layout)
 
-    for qualification, reason in (
-        (Qualification.TEAM_BASELINE, "typed_team_fact_replay_unavailable"),
-        (Qualification.PLAYER_PROFILE, "typed_player_fact_replay_unavailable"),
-    ):
-        artifact = store.create_training_qualification(
-            match_id=second_match,
-            match_version=1,
-            qualification=qualification,
-            ruleset_version="readiness/1",
-            evaluated_at=OBSERVED_AT,
-            snapshot_ref=snapshot_ref,
-            result_ref=second_result,
-        )
-        assert not artifact.passed
-        assert reason in artifact.reason_codes
+    team_baseline = store.create_training_qualification(
+        match_id=second_match,
+        match_version=1,
+        qualification=Qualification.TEAM_BASELINE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=snapshot_ref,
+        result_ref=second_result,
+    )
+    assert not team_baseline.passed
+    assert any(reason.startswith("missing_team_stat:") for reason in team_baseline.reason_codes)
+    assert "typed_team_fact_replay_unavailable" not in team_baseline.reason_codes
+
+    player_profile = store.create_training_qualification(
+        match_id=second_match,
+        match_version=1,
+        qualification=Qualification.PLAYER_PROFILE,
+        ruleset_version="readiness/1",
+        evaluated_at=OBSERVED_AT,
+        snapshot_ref=snapshot_ref,
+        result_ref=second_result,
+    )
+    assert not player_profile.passed
+    assert "typed_player_fact_replay_unavailable" in player_profile.reason_codes
 
     derived = DerivedArchive(layout)
     snapshot_path = next(

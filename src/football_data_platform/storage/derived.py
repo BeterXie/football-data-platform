@@ -55,6 +55,7 @@ from football_data_platform.features.team_baseline import (
 from football_data_platform.storage.canonical import CanonicalStore
 from football_data_platform.storage.facts import (
     load_verified_match_result,
+    load_verified_team_observation,
     verify_official_lineup_contract,
 )
 from football_data_platform.storage.layout import DataLayout
@@ -574,11 +575,27 @@ class DerivedArchive:
         """Write one immutable derived artifact manifest and recheck its identity."""
 
         _verify_artifact_manifest(manifest)
-        _ManifestReferenceResolver(self).verify(
-            input_refs=manifest.input_refs,
-            output_refs=manifest.output_refs,
-            status=manifest.status,
+        from football_data_platform.storage.verification import (
+            VerificationSession,
+            active_verification_session,
+            verification_session_scope,
         )
+
+        session = active_verification_session(self.layout)
+        if session is not None:
+            _ManifestReferenceResolver(self, session).verify(
+                input_refs=manifest.input_refs,
+                output_refs=manifest.output_refs,
+                status=manifest.status,
+            )
+        else:
+            with VerificationSession(self.layout) as owned_session:
+                with verification_session_scope(owned_session):
+                    _ManifestReferenceResolver(self, owned_session).verify(
+                        input_refs=manifest.input_refs,
+                        output_refs=manifest.output_refs,
+                        status=manifest.status,
+                    )
         return self._write_json(
             self.artifact_manifest_path(manifest.artifact_id), manifest.to_payload()
         )
@@ -589,22 +606,42 @@ class DerivedArchive:
         *,
         verification_session: VerificationSession | None = None,
     ) -> DerivedArtifactManifest:
-        path = self.artifact_manifest_path(artifact_id)
-        if verification_session is not None:
-            verification_session.file_proof(path)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ArchiveConflictError(f"cannot load derived artifact manifest: {path}") from error
-        manifest = _parse_artifact_manifest(payload)
-        if manifest.artifact_id != artifact_id:
-            raise ArchiveConflictError("derived artifact manifest ID does not match path")
-        _verify_artifact_manifest(manifest)
-        _ManifestReferenceResolver(self, verification_session).verify(
-            input_refs=manifest.input_refs,
-            output_refs=manifest.output_refs,
-            status=manifest.status,
+        from football_data_platform.storage.verification import (
+            VerificationSession,
+            active_verification_session,
+            verification_session_scope,
         )
+
+        if verification_session is None:
+            verification_session = active_verification_session(self.layout)
+        if verification_session is None:
+            with VerificationSession(self.layout) as session:
+                with verification_session_scope(session):
+                    return self.load_artifact_manifest(
+                        artifact_id,
+                        verification_session=session,
+                    )
+        path = self.artifact_manifest_path(artifact_id)
+        verification_session.file_proof(path)
+        manifest = verification_session.cached_artifact_manifest(artifact_id)
+        if manifest is None:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ArchiveConflictError(
+                    f"cannot load derived artifact manifest: {path}"
+                ) from error
+            manifest = _parse_artifact_manifest(payload)
+            if manifest.artifact_id != artifact_id:
+                raise ArchiveConflictError("derived artifact manifest ID does not match path")
+            _verify_artifact_manifest(manifest)
+            verification_session.remember_artifact_manifest(artifact_id, manifest)
+        with verification_session.resolving_artifact_manifest(artifact_id):
+            _ManifestReferenceResolver(self, verification_session).verify(
+                input_refs=manifest.input_refs,
+                output_refs=manifest.output_refs,
+                status=manifest.status,
+            )
         return manifest
 
     def write_derived_artifact(self, **kwargs: Any) -> DerivedArtifactManifest:
@@ -622,15 +659,49 @@ class DerivedArchive:
         """Persist a successful, partial, running, or failed run immutably."""
 
         _verify_run_manifest(manifest)
-        _ManifestReferenceResolver(self).verify(
-            input_refs=manifest.input_refs,
-            output_refs=manifest.output_refs,
-            status=manifest.status,
+        from football_data_platform.storage.verification import (
+            VerificationSession,
+            active_verification_session,
+            verification_session_scope,
         )
+
+        session = active_verification_session(self.layout)
+        if session is not None:
+            _ManifestReferenceResolver(self, session).verify(
+                input_refs=manifest.input_refs,
+                output_refs=manifest.output_refs,
+                status=manifest.status,
+            )
+        else:
+            with VerificationSession(self.layout) as owned_session:
+                with verification_session_scope(owned_session):
+                    _ManifestReferenceResolver(self, owned_session).verify(
+                        input_refs=manifest.input_refs,
+                        output_refs=manifest.output_refs,
+                        status=manifest.status,
+                    )
         return self._write_json(self.run_manifest_path(manifest.run_id), manifest.to_payload())
 
-    def load_run_manifest(self, run_id: str) -> RunManifest:
+    def load_run_manifest(
+        self,
+        run_id: str,
+        *,
+        verification_session: VerificationSession | None = None,
+    ) -> RunManifest:
+        from football_data_platform.storage.verification import (
+            VerificationSession,
+            active_verification_session,
+            verification_session_scope,
+        )
+
+        if verification_session is None:
+            verification_session = active_verification_session(self.layout)
+        if verification_session is None:
+            with VerificationSession(self.layout) as session:
+                with verification_session_scope(session):
+                    return self.load_run_manifest(run_id, verification_session=session)
         path = self.run_manifest_path(run_id)
+        verification_session.file_proof(path)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -639,7 +710,7 @@ class DerivedArchive:
         if manifest.run_id != run_id:
             raise ArchiveConflictError("run manifest ID does not match path")
         _verify_run_manifest(manifest)
-        _ManifestReferenceResolver(self).verify(
+        _ManifestReferenceResolver(self, verification_session).verify(
             input_refs=manifest.input_refs,
             output_refs=manifest.output_refs,
             status=manifest.status,
@@ -1025,6 +1096,10 @@ class DerivedArchive:
     ) -> SnapshotSourceValidation:
         """Verify a raw or derived snapshot source against immutable storage."""
 
+        if verification_session is None:
+            from football_data_platform.storage.verification import active_verification_session
+
+            verification_session = active_verification_session(self.layout)
         if not source_ref.startswith("derived-source:"):
             raise ValueError(f"snapshot source is not available in derived storage: {source_ref}")
         path = self._snapshot_source_path(source_ref)
@@ -1563,6 +1638,10 @@ class DerivedArchive:
     ) -> list[DerivedArtifactManifest]:
         """Load every valid manifest file that claims one logical output ref."""
 
+        if verification_session is None:
+            from football_data_platform.storage.verification import active_verification_session
+
+            verification_session = active_verification_session(self.layout)
         if verification_session is not None:
             return [
                 self.load_artifact_manifest(
@@ -1630,12 +1709,20 @@ class DerivedArchive:
             return asset.observed_at
         if reference.startswith("official-lineup-contract:"):
             return self._replay_official_lineup_contract(reference).observed_at
+        if reference.startswith("fact:team_match_observations:"):
+            return load_verified_team_observation(
+                reference,
+                archive=RawArchive(self.layout),
+                canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+                verification_session=verification_session,
+            ).observed_at
         if reference.startswith("fact:match_results_90:"):
             canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
             load_verified_match_result(
                 reference,
                 archive=RawArchive(self.layout),
                 canonical=canonical,
+                verification_session=verification_session,
             )
             with canonical.connect() as connection:
                 row = connection.execute(
@@ -2022,6 +2109,17 @@ class DerivedArchive:
                     f"team baseline input follows feature cutoff: {reference}"
                 )
             return
+        if reference.startswith("fact:team_match_observations:"):
+            observation = load_verified_team_observation(
+                reference,
+                archive=RawArchive(self.layout),
+                canonical=CanonicalStore(self.layout.canonical / "platform.sqlite3"),
+            )
+            if observation.known_at > as_of:
+                raise ArchiveConflictError(
+                    f"team baseline input known after feature cutoff: {reference}"
+                )
+            return
         if reference.startswith("fact:match_results_90:"):
             canonical = CanonicalStore(self.layout.canonical / "platform.sqlite3")
             result = load_verified_match_result(
@@ -2366,7 +2464,10 @@ class _ManifestReferenceResolver:
             )
             return
         if namespace == "run":
-            self.archive.load_run_manifest(reference)
+            self.archive.load_run_manifest(
+                reference,
+                verification_session=self.verification_session,
+            )
             return
         if namespace == "player-profile":
             self.archive.load_player_profile(reference)
@@ -2432,7 +2533,10 @@ class _ManifestReferenceResolver:
         from football_data_platform.storage.training import TrainingArtifactStore
 
         store = TrainingArtifactStore(self.archive.layout)
-        store._verify_training_reference(reference)
+        store._verify_training_reference(
+            reference,
+            verification_session=self.verification_session,
+        )
 
     def _resolve_prediction_reference(self, reference: str) -> None:
         digest = reference.removeprefix("prediction:")
@@ -2497,6 +2601,15 @@ class _ManifestReferenceResolver:
                 reference,
                 archive=RawArchive(self.archive.layout),
                 canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+                verification_session=self.verification_session,
+            )
+            return
+        if namespace == "fact" and reference.startswith("fact:team_match_observations:"):
+            load_verified_team_observation(
+                reference,
+                archive=RawArchive(self.archive.layout),
+                canonical=CanonicalStore(self.archive.layout.canonical / "platform.sqlite3"),
+                verification_session=self.verification_session,
             )
             return
         path = self.archive.layout.canonical / "platform.sqlite3"

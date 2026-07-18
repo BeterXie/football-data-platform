@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from football_data_platform.config import load_competition_registry
-from football_data_platform.domain.ids import MatchId, RawAssetId
+from football_data_platform.domain.ids import MatchId, RawAssetId, TeamId
 from football_data_platform.domain.lifecycle import (
     Qualification,
     SnapshotAvailability,
@@ -71,7 +71,11 @@ from football_data_platform.storage.derived import (
     DerivedArtifactManifest,
     RunManifest,
 )
-from football_data_platform.storage.facts import CanonicalFactStore
+from football_data_platform.storage.facts import (
+    CanonicalFactStore,
+    TeamMatchObservation,
+    load_verified_team_observation,
+)
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import ArchiveConflictError, RawArchive
 from football_data_platform.storage.training import TrainingArtifactStore
@@ -270,24 +274,40 @@ def _run_offline_vertical_slice(
             )
         )
 
-    first_teams = {team.source_team_id: team for team in report_ingest.parsed.teams}
-    first_home = canonical.mapped_team(source="fbref", source_id=first_fixture.home_source_id)
-    first_away = canonical.mapped_team(source="fbref", source_id=first_fixture.away_source_id)
+    first_match = canonical.match(first_match_id)
+    first_version = next(
+        version for version in canonical.match_versions(first_match_id) if version.version == 1
+    )
+    if first_version.kickoff_at is None:
+        raise ValueError("golden baseline match lacks a canonical kickoff")
+    verified_team_facts = tuple(
+        load_verified_team_observation(
+            reference,
+            archive=archive,
+            canonical=canonical,
+        )
+        for reference in report_ingest.team_fact_ids
+    )
+    first_home_fact, first_away_fact = _paired_baseline_team_facts(
+        verified_team_facts,
+        match_id=first_match_id,
+        match_version=first_version.version,
+        home_team_id=first_match.home_team_id,
+        away_team_id=first_match.away_team_id,
+    )
+    baseline_fact_refs = tuple(sorted(report_ingest.team_fact_ids))
     baseline_result = build_team_baseline(
         (
             TeamMatchProcess(
                 match_id=first_match_id.value,
-                home_team_id=first_home.id.value,
-                away_team_id=first_away.id.value,
-                kickoff_at=first_fixture.kickoff_at,
-                known_at=first_report_known_at,
-                home_xg=_required_stat(
-                    first_teams[first_fixture.home_source_id].aggregated_stats, "xg"
-                ),
-                away_xg=_required_stat(
-                    first_teams[first_fixture.away_source_id].aggregated_stats, "xg"
-                ),
-                source_ref=report_ingest.raw_asset_id,
+                home_team_id=first_match.home_team_id.value,
+                away_team_id=first_match.away_team_id.value,
+                kickoff_at=first_version.kickoff_at,
+                known_at=first_home_fact.known_at,
+                home_xg=_required_stat(dict(first_home_fact.stats), "xg"),
+                away_xg=_required_stat(dict(first_away_fact.stats), "xg"),
+                source_ref=baseline_fact_refs[0],
+                source_refs=baseline_fact_refs,
             ),
         ),
         as_of=second_fixture.kickoff_at - timedelta(hours=24),
@@ -829,7 +849,7 @@ def _register_static_outputs(
         ended_at=generated_at,
         transform_version="vertical-slice-report/1",
         code_version=DERIVED_CODE_VERSION,
-        input_refs=(run_manifest.run_id, *run_manifest.input_refs),
+        input_refs=(run_manifest.run_id,),
         output_refs=(summary_logical_ref, summary_ref),
         quality=run_manifest.quality,
     )
@@ -845,7 +865,7 @@ def _register_static_outputs(
         ended_at=generated_at,
         transform_version="vertical-slice-report/1",
         code_version=DERIVED_CODE_VERSION,
-        input_refs=(run_manifest.run_id, summary_artifact.artifact_id),
+        input_refs=(summary_artifact.artifact_id,),
         output_refs=(report_logical_ref, report_ref),
         quality=run_manifest.quality,
     )
@@ -858,7 +878,7 @@ def _register_static_outputs(
         generated_at=generated_at,
         transform_version="vertical-slice-report/1",
         code_version=DERIVED_CODE_VERSION,
-        input_refs=(run_manifest.run_id, summary_logical_ref, report_logical_ref),
+        input_refs=(run_manifest.run_id,),
         output_refs=(summary_artifact.artifact_id, report_artifact.artifact_id),
         status="succeeded",
         error=None,
@@ -883,6 +903,33 @@ def _snapshot_summary(snapshot) -> dict[str, Any]:
         "quality_status": snapshot.quality_status,
         "missing_fields": list(snapshot.missing_fields),
     }
+
+
+def _paired_baseline_team_facts(
+    observations: tuple[TeamMatchObservation, ...],
+    *,
+    match_id: MatchId,
+    match_version: int,
+    home_team_id: TeamId,
+    away_team_id: TeamId,
+) -> tuple[TeamMatchObservation, TeamMatchObservation]:
+    facts_by_team = {observation.team_id: observation for observation in observations}
+    if len(observations) != 2 or set(facts_by_team) != {home_team_id, away_team_id}:
+        raise ValueError("golden baseline facts do not cover both canonical match teams")
+    home = facts_by_team[home_team_id]
+    away = facts_by_team[away_team_id]
+    if (
+        home.match_id != match_id
+        or away.match_id != match_id
+        or home.match_version != match_version
+        or away.match_version != match_version
+        or home.known_at != away.known_at
+        or home.observed_at != away.observed_at
+        or home.raw_asset_id != away.raw_asset_id
+        or home.contract_id != away.contract_id
+    ):
+        raise ValueError("golden baseline facts do not share one canonical match observation")
+    return home, away
 
 
 def _write_failed_run_manifest(

@@ -82,7 +82,17 @@ class MatchAvailability:
     match_id: str | None = None
     match_version: int | None = None
     result_90_known_at: datetime | None = None
+    result_90_ref: str | None = None
+    result_90_diagnostic: str | None = None
     team_stats_known_at: dict[str, datetime] = field(default_factory=dict)
+    team_stat_refs: dict[str, str] = field(default_factory=dict)
+    team_stat_match_ids: dict[str, str] = field(default_factory=dict)
+    team_stat_match_versions: dict[str, int] = field(default_factory=dict)
+    team_stat_contract_ids: dict[str, str] = field(default_factory=dict)
+    team_stat_raw_asset_ids: dict[str, str] = field(default_factory=dict)
+    team_stats_observed_at: dict[str, datetime] = field(default_factory=dict)
+    team_stat_diagnostics: dict[str, str] = field(default_factory=dict)
+    team_stat_pair_diagnostic: str | None = None
     player_observations: dict[str, PlayerObservationAvailability] | None = None
     as_of: datetime | None = None
 
@@ -185,6 +195,10 @@ def _score_model_qualification(
         reasons.append("availability_as_of_after_evaluation")
     if not availability.result_90_present:
         reasons.append("missing_result_90")
+    if availability.result_90_ref is None:
+        reasons.append("missing_result_90_ref")
+    if availability.result_90_diagnostic is not None:
+        reasons.append(availability.result_90_diagnostic)
     if not ready_snapshots:
         reasons.append("missing_ready_prematch_snapshot")
         if has_unverified_ready_snapshot:
@@ -206,15 +220,44 @@ def _team_baseline_qualification(
         reasons.append("availability_as_of_after_evaluation")
     if not availability.result_90_present:
         reasons.append("missing_result_90")
+    if availability.result_90_ref is None:
+        reasons.append("missing_result_90_ref")
+    if availability.result_90_diagnostic is not None:
+        reasons.append(availability.result_90_diagnostic)
     if _known_after(availability.result_90_known_at, evaluated_at):
         reasons.append("result_known_after_evaluation")
+    expected_team_ids = set(availability.team_ids)
+    unexpected_team_ids = (
+        set(availability.team_stat_fields)
+        | set(availability.team_stat_refs)
+        | set(availability.team_stat_match_ids)
+        | set(availability.team_stat_match_versions)
+        | set(availability.team_stat_contract_ids)
+        | set(availability.team_stat_raw_asset_ids)
+        | set(availability.team_stats_observed_at)
+    ) - expected_team_ids
+    reasons.extend(f"unexpected_team_stat:{team_id}" for team_id in sorted(unexpected_team_ids))
+    reasons.extend(
+        f"{diagnostic}:{team_id}"
+        for team_id, diagnostic in sorted(availability.team_stat_diagnostics.items())
+    )
     for team_id in availability.team_ids:
+        if team_id not in availability.team_stat_refs:
+            reasons.append(f"missing_team_stat_ref:{team_id}")
         missing = sorted(
             _REQUIRED_TEAM_STAT_FIELDS - availability.team_stat_fields.get(team_id, frozenset())
         )
         reasons.extend(f"missing_team_stat:{team_id}:{field}" for field in missing)
         if _known_after(availability.team_stats_known_at.get(team_id), evaluated_at):
             reasons.append(f"team_stats_known_after_evaluation:{team_id}")
+    pair_reason = _team_stat_pair_reason(availability)
+    if pair_reason is not None:
+        reasons.append(pair_reason)
+    if (
+        availability.team_stat_pair_diagnostic is not None
+        and availability.team_stat_pair_diagnostic != pair_reason
+    ):
+        reasons.append(availability.team_stat_pair_diagnostic)
     return _qualification(Qualification.TEAM_BASELINE, reasons, evaluated_at, ruleset_version)
 
 
@@ -290,11 +333,21 @@ def _qualification(
 def _archive_complete(availability: MatchAvailability, *, evaluated_at: datetime) -> bool:
     if availability.match_status is not MatchStatus.FINISHED or not availability.result_90_present:
         return False
+    if availability.result_90_ref is None or availability.result_90_diagnostic is not None:
+        return False
     if _known_after(availability.as_of, evaluated_at):
         return False
     if _known_after(availability.result_90_known_at, evaluated_at):
         return False
     if set(availability.team_stat_fields) - set(availability.team_ids):
+        return False
+    if set(availability.team_stat_refs) != set(availability.team_ids):
+        return False
+    if availability.team_stat_pair_diagnostic is not None:
+        return False
+    if _team_stat_pair_reason(availability) is not None:
+        return False
+    if availability.team_stat_diagnostics:
         return False
     if set(availability.starters) - set(availability.team_ids):
         return False
@@ -310,6 +363,44 @@ def _archive_complete(availability: MatchAvailability, *, evaluated_at: datetime
         if not starters <= availability.player_observation_ids:
             return False
     return True
+
+
+def _team_stat_pair_reason(availability: MatchAvailability) -> str | None:
+    expected = set(availability.team_ids)
+    if set(availability.team_stat_refs) != expected:
+        return None
+    metadata = (
+        availability.team_stat_match_ids,
+        availability.team_stat_match_versions,
+        availability.team_stat_contract_ids,
+        availability.team_stat_raw_asset_ids,
+        availability.team_stats_observed_at,
+        availability.team_stats_known_at,
+    )
+    if any(set(values) != expected for values in metadata):
+        return "typed_team_fact_pair_metadata_incomplete"
+    signatures = {
+        (
+            availability.team_stat_match_ids[team_id],
+            availability.team_stat_match_versions[team_id],
+            availability.team_stat_contract_ids[team_id],
+            availability.team_stat_raw_asset_ids[team_id],
+            availability.team_stats_observed_at[team_id],
+            availability.team_stats_known_at[team_id],
+        )
+        for team_id in availability.team_ids
+    }
+    if (
+        len(signatures) != 1
+        or availability.match_id is None
+        or availability.match_version is None
+        or any(
+            match_id != availability.match_id or match_version != availability.match_version
+            for match_id, match_version, *_ in signatures
+        )
+    ):
+        return "typed_team_fact_pair_mismatch"
+    return None
 
 
 def _verified_ready_snapshot_types(

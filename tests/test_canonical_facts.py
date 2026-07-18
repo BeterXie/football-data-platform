@@ -8,7 +8,11 @@ import pytest
 
 from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import CompetitionId, SeasonId
-from football_data_platform.domain.lifecycle import Qualification, assess_lifecycle
+from football_data_platform.domain.lifecycle import (
+    MatchAvailability,
+    Qualification,
+    assess_lifecycle,
+)
 from football_data_platform.domain.models import MatchStatus
 from football_data_platform.domain.predictions import MatchResult90
 from football_data_platform.sources.prematch import SourceDescriptor, SourceKind, SourceRegistry
@@ -189,6 +193,39 @@ def test_missing_is_preserved_and_readiness_explains_it(fact_context) -> None:
     assert any(reason.endswith(":xg") for reason in result.reason_codes)
 
 
+def test_team_baseline_rejects_unexpected_team_stats_and_diagnostics() -> None:
+    required = frozenset({"goals", "xg", "shots", "shots_on_target"})
+    availability = MatchAvailability(
+        match_status=MatchStatus.FINISHED,
+        team_ids=("team:home", "team:away"),
+        snapshots=(),
+        result_90_present=True,
+        team_stat_fields={
+            "team:home": required,
+            "team:away": required,
+            "team:third": required,
+        },
+        starters={},
+        player_observation_ids=frozenset(),
+        team_stat_refs={
+            "team:home": "fact:team_match_observations:home",
+            "team:away": "fact:team_match_observations:away",
+            "team:third": "fact:team_match_observations:third",
+        },
+        team_stat_diagnostics={"team:fourth": "typed_team_fact_replay_invalid"},
+    )
+
+    result = next(
+        item
+        for item in assess_lifecycle(availability, evaluated_at=NOW).qualifications
+        if item.qualification is Qualification.TEAM_BASELINE
+    )
+
+    assert not result.passed
+    assert "unexpected_team_stat:team:third" in result.reason_codes
+    assert "typed_team_fact_replay_invalid:team:fourth" in result.reason_codes
+
+
 def test_unconfirmed_event_cannot_modify_features(fact_context) -> None:
     canonical, facts, asset, teams, match, _ = fact_context
     evidence = facts.add_news_evidence(
@@ -234,8 +271,20 @@ def test_fact_observation_cannot_predate_when_it_became_known(fact_context) -> N
 
 
 def test_availability_excludes_facts_known_after_as_of(fact_context) -> None:
-    _, facts, asset, teams, match, version = fact_context
+    canonical, facts, asset, teams, match, version = fact_context
     future = NOW + timedelta(hours=1)
+    archive = RawArchive(DataLayout(canonical.path.parent.parent))
+    future_asset = archive.archive(
+        b"future result",
+        source="result-test",
+        source_id="future-result",
+        url="https://result.example/future-result",
+        observed_at=future,
+        target_event_time=future,
+        collector_version="result-test/1",
+        media_type="application/octet-stream",
+    )
+    canonical.register_raw_asset(future_asset)
     facts.append_result_90(
         match_id=match.id,
         match_version=version.version,
@@ -243,7 +292,7 @@ def test_availability_excludes_facts_known_after_as_of(fact_context) -> None:
         away_goals=0,
         known_at=future,
         observed_at=future,
-        raw_asset_id=asset.id,
+        raw_asset_id=future_asset.id,
     )
     facts.append_team_observation(
         match_id=match.id,
@@ -262,7 +311,8 @@ def test_availability_excludes_facts_known_after_as_of(fact_context) -> None:
     assert teams[0].id.value not in historical.team_stat_fields
     assert historical.as_of == NOW
     assert latest.result_90_present
-    assert teams[0].id.value in latest.team_stat_fields
+    assert teams[0].id.value not in latest.team_stat_fields
+    assert latest.team_stat_diagnostics == {teams[0].id.value: "typed_team_fact_replay_invalid"}
 
 
 def test_result_requires_a_finished_match_version(fact_context) -> None:
