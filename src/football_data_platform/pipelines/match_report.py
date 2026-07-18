@@ -194,6 +194,7 @@ def ingest_fbref_match_report(
             match_id=mapped_match_id,
             match_version=match_version,
             canonical=canonical,
+            mapping_as_of=observed_at,
         )
     except MatchReportCanonicalValidationError as error:
         raise _record_failure(

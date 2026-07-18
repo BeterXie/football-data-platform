@@ -36,6 +36,9 @@ from football_data_platform.domain.models import (
     MatchVersion,
     RawAsset,
     SourceMapping,
+    SourceMappingConflict,
+    SourceMappingDecision,
+    SourceMappingEvidence,
 )
 from football_data_platform.domain.predictions import (
     MarketSnapshotValidator,
@@ -98,6 +101,9 @@ __all__ = [
     "RiskConfig",
     "SeasonId",
     "SourceMapping",
+    "SourceMappingConflict",
+    "SourceMappingDecision",
+    "SourceMappingEvidence",
     "SettlementComputation",
     "SettlementOutcome",
     "SettlementRule",

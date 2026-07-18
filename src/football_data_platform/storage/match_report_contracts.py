@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from football_data_platform.domain.ids import MatchId
-from football_data_platform.domain.models import Match, MatchStatus, MatchVersion
+from football_data_platform.domain.models import Match, MatchStatus, MatchVersion, require_utc
 from football_data_platform.sources.fbref import ParseDiagnostic
 from football_data_platform.sources.fbref_match_report import (
     MatchReportParseResult,
@@ -144,6 +144,7 @@ def verify_match_report_contract(
             match_id=contract.match_id,
             match_version=contract.match_version,
             canonical=canonical,
+            mapping_as_of=contract.observed_at,
         )
         validate_match_report_result(
             parsed,
@@ -169,12 +170,15 @@ def validate_match_report_identity(
     match_id: MatchId,
     match_version: int,
     canonical: CanonicalStore,
+    mapping_as_of: datetime,
 ) -> MatchReportIdentityValidation:
     """Validate raw report identity against one canonical match version."""
 
+    require_utc(mapping_as_of, "mapping_as_of")
     mapped_match_id = canonical.mapped_match_ids(
         source=MATCH_MAPPING_SOURCE,
         source_ids=(source_match_id,),
+        as_of=mapping_as_of,
     ).get(source_match_id)
     if mapped_match_id is None:
         raise MatchReportCanonicalValidationError(
@@ -211,7 +215,7 @@ def validate_match_report_identity(
     try:
         for source_team_id in source_team_ids:
             resolved_teams[source_team_id] = canonical.mapped_team(
-                source="fbref", source_id=source_team_id
+                source="fbref", source_id=source_team_id, as_of=mapping_as_of
             )
     except KeyError as error:
         raise MatchReportCanonicalValidationError(
@@ -238,7 +242,11 @@ def validate_match_report_identity(
             f"raw report identifies {identity.source_match_id}, expected {source_match_id}",
         )
 
-    expected_competition_id = _expected_competition_source_id(canonical, match)
+    expected_competition_id = _expected_competition_source_id(
+        canonical,
+        match,
+        as_of=mapping_as_of,
+    )
     if expected_competition_id is None:
         raise MatchReportCanonicalValidationError(
             "report_competition_identity_unverifiable",
@@ -253,7 +261,7 @@ def validate_match_report_identity(
             ),
         )
 
-    expected_season_id = _expected_season_source_id(canonical, match)
+    expected_season_id = _expected_season_source_id(canonical, match, as_of=mapping_as_of)
     if expected_season_id is None:
         raise MatchReportCanonicalValidationError(
             "report_season_identity_unverifiable",
@@ -274,8 +282,12 @@ def validate_match_report_identity(
             "raw report does not identify canonical home and away teams",
         )
     try:
-        identity_home = canonical.mapped_team(source="fbref", source_id=identity.home_source_id)
-        identity_away = canonical.mapped_team(source="fbref", source_id=identity.away_source_id)
+        identity_home = canonical.mapped_team(
+            source="fbref", source_id=identity.home_source_id, as_of=mapping_as_of
+        )
+        identity_away = canonical.mapped_team(
+            source="fbref", source_id=identity.away_source_id, as_of=mapping_as_of
+        )
     except KeyError as error:
         raise MatchReportCanonicalValidationError(
             "report_team_identity_mapping_missing",
@@ -368,26 +380,38 @@ def validate_match_report_result(
     )
 
 
-def _expected_competition_source_id(canonical: CanonicalStore, match: Match) -> str | None:
+def _expected_competition_source_id(
+    canonical: CanonicalStore,
+    match: Match,
+    *,
+    as_of: datetime,
+) -> str | None:
+    timestamp = as_of.isoformat(timespec="microseconds").replace("+00:00", "Z")
     with canonical.connect() as connection:
         row = connection.execute(
             "SELECT source_id FROM source_mappings "
             "WHERE source = 'fbref' AND entity_type = 'season' AND entity_id = ? "
-            "AND valid_to IS NULL LIMIT 1",
-            (match.season_id.value,),
+            "AND valid_from <= ? AND (valid_to IS NULL OR ? < valid_to) LIMIT 1",
+            (match.season_id.value, timestamp, timestamp),
         ).fetchone()
     if row is None:
         return None
     return str(row["source_id"]).split(":", 1)[0]
 
 
-def _expected_season_source_id(canonical: CanonicalStore, match: Match) -> str | None:
+def _expected_season_source_id(
+    canonical: CanonicalStore,
+    match: Match,
+    *,
+    as_of: datetime,
+) -> str | None:
+    timestamp = as_of.isoformat(timespec="microseconds").replace("+00:00", "Z")
     with canonical.connect() as connection:
         row = connection.execute(
             "SELECT source_id FROM source_mappings "
             "WHERE source = 'fbref' AND entity_type = 'season' AND entity_id = ? "
-            "AND valid_to IS NULL LIMIT 1",
-            (match.season_id.value,),
+            "AND valid_from <= ? AND (valid_to IS NULL OR ? < valid_to) LIMIT 1",
+            (match.season_id.value, timestamp, timestamp),
         ).fetchone()
     if row is None:
         return None

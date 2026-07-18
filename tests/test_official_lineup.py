@@ -469,6 +469,9 @@ def _tamper_contract_chain(
                 (result.fact_ids[0], result.raw_asset_id),
             )
         elif tamper == "source-player-mapping-swap":
+            # Simulate storage tampering below the v7 API boundary; normal SQL updates are
+            # rejected before the downstream replay validator gets a chance to inspect them.
+            connection.execute("DROP TRIGGER source_mappings_close_only_update")
             rows = connection.execute(
                 "SELECT source_id, entity_id FROM source_mappings "
                 "WHERE source = ? AND entity_type = 'player' "

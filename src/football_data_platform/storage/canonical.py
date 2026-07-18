@@ -31,10 +31,14 @@ from football_data_platform.domain.models import (
     MatchStatus,
     MatchVersion,
     RawAsset,
+    SourceMapping,
+    SourceMappingConflict,
+    SourceMappingDecision,
+    SourceMappingEvidence,
     require_utc,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OFFICIAL_LINEUP_CONTRACT_VERSION = 2
 LEGACY_OFFICIAL_LINEUP_CONTRACT_VERSION = 1
 _ID_NAMESPACE = uuid.UUID("c62a4fc0-2e72-4d9c-b4b3-113b31c31982")
@@ -42,6 +46,10 @@ _ID_NAMESPACE = uuid.UUID("c62a4fc0-2e72-4d9c-b4b3-113b31c31982")
 
 class CanonicalConflictError(RuntimeError):
     """Raised when an input contradicts an existing canonical fact."""
+
+
+class SourceMappingCASConflict(CanonicalConflictError):
+    """Raised when a mapping changed after an operator loaded it for review."""
 
 
 class CanonicalRebuildRequiredError(CanonicalConflictError):
@@ -236,7 +244,8 @@ class CanonicalStore:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
-            connection.executescript(_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            _execute_sql_script(connection, _SCHEMA)
             row = connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
             ).fetchone()
@@ -245,31 +254,25 @@ class CanonicalStore:
                     "INSERT INTO schema_meta(singleton, version) VALUES (1, ?)",
                     (SCHEMA_VERSION,),
                 )
-            elif row["version"] == 1:
-                _migrate_v1_to_v2(connection)
-                _migrate_v2_to_v3(connection)
-                _migrate_v3_to_v4(connection)
-                _migrate_v4_to_v5(connection)
-                _migrate_v5_to_v6(connection)
-            elif row["version"] == 2:
-                _migrate_v2_to_v3(connection)
-                _migrate_v3_to_v4(connection)
-                _migrate_v4_to_v5(connection)
-                _migrate_v5_to_v6(connection)
-            elif row["version"] == 3:
-                _migrate_v3_to_v4(connection)
-                _migrate_v4_to_v5(connection)
-                _migrate_v5_to_v6(connection)
-            elif row["version"] == 4:
-                _migrate_v4_to_v5(connection)
-                _migrate_v5_to_v6(connection)
-            elif row["version"] == 5:
-                _migrate_v5_to_v6(connection)
-            elif row["version"] != SCHEMA_VERSION:
+            elif row["version"] not in range(1, SCHEMA_VERSION + 1):
                 raise RuntimeError(
                     f"canonical schema {row['version']} is not supported by "
                     f"this code (expected {SCHEMA_VERSION})"
                 )
+            elif row["version"] < SCHEMA_VERSION:
+                version = int(row["version"])
+                if version <= 1:
+                    _migrate_v1_to_v2(connection)
+                if version <= 2:
+                    _migrate_v2_to_v3(connection)
+                if version <= 3:
+                    _migrate_v3_to_v4(connection)
+                if version <= 4:
+                    _migrate_v4_to_v5(connection)
+                if version <= 5:
+                    _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection)
+            _create_source_mapping_v7_auxiliary(connection)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -331,7 +334,7 @@ class CanonicalStore:
                                 datetime.min.time(),
                                 tzinfo=UTC,
                             ),
-                            match_rule=MappingRule.MANUAL_OVERRIDE,
+                            match_rule=MappingRule.SOURCE_ID,
                             confidence=1.0,
                             created_at=registered_at,
                             audit_note="competition registry",
@@ -481,7 +484,7 @@ class CanonicalStore:
                 entity_id=team_id,
                 entity_type="team",
                 valid_from=observed_at,
-                match_rule=MappingRule.MANUAL_OVERRIDE,
+                match_rule=MappingRule.EXACT_ALIAS,
                 confidence=1.0,
                 created_at=observed_at,
                 audit_note=f"season registry mapping; observed alias {observed_name!r}",
@@ -771,11 +774,21 @@ class CanonicalStore:
         with self.connect() as connection:
             return _load_match(connection, match_id)
 
-    def mapped_team(self, *, source: str, source_id: str) -> ResolvedTeam:
+    def mapped_team(
+        self,
+        *,
+        source: str,
+        source_id: str,
+        as_of: datetime | None = None,
+    ) -> ResolvedTeam:
+        mapping = self.resolve_source_mapping(
+            source=source,
+            entity_type="team",
+            source_id=source_id,
+            as_of=as_of,
+        )
+        entity_id = mapping.entity_id.value
         with self.connect() as connection:
-            entity_id = _current_mapping(connection, source, "team", source_id)
-            if entity_id is None:
-                raise KeyError(f"team mapping {source}:{source_id} does not exist")
             row = connection.execute(
                 "SELECT canonical_name FROM teams WHERE team_id = ?", (entity_id,)
             ).fetchone()
@@ -783,11 +796,21 @@ class CanonicalStore:
                 raise CanonicalConflictError(f"mapped team does not exist: {entity_id}")
         return ResolvedTeam(TeamId(entity_id), row["canonical_name"])
 
-    def mapped_player(self, *, source: str, source_id: str) -> ResolvedPlayer:
+    def mapped_player(
+        self,
+        *,
+        source: str,
+        source_id: str,
+        as_of: datetime | None = None,
+    ) -> ResolvedPlayer:
+        mapping = self.resolve_source_mapping(
+            source=source,
+            entity_type="player",
+            source_id=source_id,
+            as_of=as_of,
+        )
+        entity_id = mapping.entity_id.value
         with self.connect() as connection:
-            entity_id = _current_mapping(connection, source, "player", source_id)
-            if entity_id is None:
-                raise KeyError(f"player mapping {source}:{source_id} does not exist")
             row = connection.execute(
                 "SELECT canonical_name FROM players WHERE player_id = ?", (entity_id,)
             ).fetchone()
@@ -795,23 +818,446 @@ class CanonicalStore:
                 raise CanonicalConflictError(f"mapped player does not exist: {entity_id}")
         return ResolvedPlayer(PlayerId(entity_id), row["canonical_name"])
 
+    def resolve_source_mapping(
+        self,
+        *,
+        source: str,
+        entity_type: str,
+        source_id: str,
+        as_of: datetime | None = None,
+        version: int | None = None,
+    ) -> SourceMapping:
+        """Resolve the current, historical-time, or explicit version of one mapping key."""
+
+        _validate_mapping_key(source, entity_type, source_id)
+        if as_of is not None and version is not None:
+            raise ValueError("source mapping resolution accepts either as_of or version")
+        if as_of is not None:
+            require_utc(as_of, "as_of")
+        if version is not None and (
+            isinstance(version, bool) or not isinstance(version, int) or version < 1
+        ):
+            raise ValueError("source mapping version must be a positive integer")
+        clauses = ["source = ?", "entity_type = ?", "source_id = ?"]
+        parameters: list[object] = [source, entity_type, source_id]
+        if version is not None:
+            clauses.append("version = ?")
+            parameters.append(version)
+        elif as_of is not None:
+            clauses.extend(("valid_from <= ?", "(valid_to IS NULL OR ? < valid_to)"))
+            timestamp = _mapping_timestamp(as_of)
+            parameters.extend((timestamp, timestamp))
+        else:
+            clauses.append("valid_to IS NULL")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM source_mappings WHERE " + " AND ".join(clauses),
+                tuple(parameters),
+            ).fetchone()
+        if row is None:
+            selector = f"version={version}" if version is not None else f"as_of={as_of}"
+            raise KeyError(
+                f"source mapping {source}:{entity_type}:{source_id} ({selector}) does not exist"
+            )
+        return _source_mapping_from_row(row)
+
+    def mapping_history(
+        self,
+        *,
+        source: str,
+        entity_type: str,
+        source_id: str,
+    ) -> tuple[SourceMapping, ...]:
+        _validate_mapping_key(source, entity_type, source_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM source_mappings WHERE source = ? AND entity_type = ? "
+                "AND source_id = ? ORDER BY version",
+                (source, entity_type, source_id),
+            ).fetchall()
+        return tuple(_source_mapping_from_row(row) for row in rows)
+
+    def propose_source_mapping(
+        self,
+        *,
+        source: str,
+        entity_type: str,
+        source_id: str,
+        candidate_entity_id: EntityId,
+        proposed_at: datetime,
+        actor: str,
+        reason: str,
+        evidence_refs: Sequence[str],
+    ) -> SourceMapping | SourceMappingConflict:
+        """Persist evidence for the current target or queue a contradictory candidate."""
+
+        _validate_mapping_key(source, entity_type, source_id)
+        require_utc(proposed_at, "proposed_at")
+        _require_text(actor, "actor")
+        _require_text(reason, "reason")
+        normalized_evidence = _normalize_mapping_evidence_refs(evidence_refs)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _require_entity(connection, candidate_entity_id, entity_type)
+            current = connection.execute(
+                "SELECT * FROM source_mappings WHERE source = ? AND entity_type = ? "
+                "AND source_id = ? AND valid_to IS NULL",
+                (source, entity_type, source_id),
+            ).fetchone()
+            if current is not None and current["entity_id"] == candidate_entity_id.value:
+                for evidence_ref in normalized_evidence:
+                    _insert_source_mapping_evidence(
+                        connection,
+                        mapping_id=str(current["mapping_id"]),
+                        conflict_id=None,
+                        evidence_ref=evidence_ref,
+                        recorded_at=proposed_at,
+                        recorded_by=actor,
+                        reason=reason,
+                    )
+                return _source_mapping_from_row(current)
+
+            conflict = connection.execute(
+                "SELECT conflict.*, COALESCE(decision.decision_id, obsolete.decision_id) "
+                "AS decision_id, current.entity_id AS current_entity_id "
+                "FROM source_mapping_conflicts AS conflict "
+                "LEFT JOIN source_mappings AS current "
+                "ON current.mapping_id = conflict.current_mapping_id "
+                "LEFT JOIN source_mapping_decisions AS decision "
+                "ON decision.conflict_id = conflict.conflict_id "
+                "LEFT JOIN source_mapping_conflict_obsoletions AS obsolete "
+                "ON obsolete.conflict_id = conflict.conflict_id "
+                "WHERE conflict.source = ? AND conflict.entity_type = ? "
+                "AND conflict.source_id = ? AND conflict.candidate_entity_id = ? "
+                "AND ((? IS NULL AND conflict.current_mapping_id IS NULL) "
+                "OR conflict.current_mapping_id = ?) "
+                "AND decision.decision_id IS NULL AND obsolete.obsoletion_id IS NULL",
+                (
+                    source,
+                    entity_type,
+                    source_id,
+                    candidate_entity_id.value,
+                    None if current is None else current["mapping_id"],
+                    None if current is None else current["mapping_id"],
+                ),
+            ).fetchone()
+            if conflict is None:
+                conflict_id = _stable_id(
+                    "source-mapping-conflict",
+                    source,
+                    "|".join(
+                        (
+                            entity_type,
+                            source_id,
+                            "unmapped" if current is None else str(current["mapping_id"]),
+                            candidate_entity_id.value,
+                        )
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO source_mapping_conflicts("
+                    "conflict_id, source, entity_type, source_id, current_mapping_id, "
+                    "candidate_entity_id, proposed_at, proposed_by, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        conflict_id,
+                        source,
+                        entity_type,
+                        source_id,
+                        None if current is None else current["mapping_id"],
+                        candidate_entity_id.value,
+                        _mapping_timestamp(proposed_at),
+                        actor,
+                        reason,
+                    ),
+                )
+                conflict = connection.execute(
+                    "SELECT conflict.*, NULL AS decision_id, "
+                    "current.entity_id AS current_entity_id "
+                    "FROM source_mapping_conflicts AS conflict "
+                    "LEFT JOIN source_mappings AS current "
+                    "ON current.mapping_id = conflict.current_mapping_id "
+                    "WHERE conflict.conflict_id = ?",
+                    (conflict_id,),
+                ).fetchone()
+                assert conflict is not None
+            for evidence_ref in normalized_evidence:
+                _insert_source_mapping_evidence(
+                    connection,
+                    mapping_id=None,
+                    conflict_id=str(conflict["conflict_id"]),
+                    evidence_ref=evidence_ref,
+                    recorded_at=proposed_at,
+                    recorded_by=actor,
+                    reason=reason,
+                )
+            return _source_mapping_conflict_from_row(conflict)
+
+    def revise_source_mapping(
+        self,
+        *,
+        source: str,
+        entity_type: str,
+        source_id: str,
+        conflict_id: str,
+        expected_current_mapping_id: str | None,
+        candidate_entity_id: EntityId,
+        effective_at: datetime,
+        actor: str,
+        reason: str,
+        evidence_refs: Sequence[str],
+    ) -> tuple[SourceMapping, SourceMappingDecision]:
+        """Accept one reviewed conflict using a compare-and-swap mapping revision."""
+
+        _validate_mapping_key(source, entity_type, source_id)
+        for value, field_name in (
+            (conflict_id, "conflict_id"),
+            (actor, "actor"),
+            (reason, "reason"),
+        ):
+            _require_text(value, field_name)
+        if expected_current_mapping_id is not None:
+            _require_text(expected_current_mapping_id, "expected_current_mapping_id")
+        require_utc(effective_at, "effective_at")
+        normalized_evidence = _normalize_mapping_evidence_refs(evidence_refs)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _require_entity(connection, candidate_entity_id, entity_type)
+            prior_decision = connection.execute(
+                "SELECT * FROM source_mapping_decisions WHERE conflict_id = ?",
+                (conflict_id,),
+            ).fetchone()
+            if prior_decision is not None:
+                prior_mapping = connection.execute(
+                    "SELECT * FROM source_mappings WHERE mapping_id = ?",
+                    (prior_decision["new_mapping_id"],),
+                ).fetchone()
+                assert prior_mapping is not None
+                expected_evidence_ids = {
+                    _source_mapping_evidence_id(
+                        mapping_id=str(prior_mapping["mapping_id"]),
+                        conflict_id=None,
+                        evidence_ref=evidence_ref,
+                        recorded_at=effective_at,
+                        recorded_by=actor,
+                        reason=reason,
+                    )
+                    for evidence_ref in normalized_evidence
+                }
+                decided_evidence_ids = set(json.loads(str(prior_decision["evidence_ids_json"])))
+                if (
+                    prior_decision["previous_mapping_id"] == expected_current_mapping_id
+                    and prior_mapping["source"] == source
+                    and prior_mapping["entity_type"] == entity_type
+                    and prior_mapping["source_id"] == source_id
+                    and prior_mapping["entity_id"] == candidate_entity_id.value
+                    and prior_mapping["valid_from"] == _mapping_timestamp(effective_at)
+                    and prior_decision["decided_at"] == _mapping_timestamp(effective_at)
+                    and prior_decision["decided_by"] == actor
+                    and prior_decision["reason"] == reason
+                    and expected_evidence_ids == decided_evidence_ids
+                ):
+                    return (
+                        _source_mapping_from_row(prior_mapping),
+                        _source_mapping_decision_from_row(prior_decision),
+                    )
+                raise SourceMappingCASConflict(
+                    "source mapping conflict was already resolved by a different decision"
+                )
+            current = connection.execute(
+                "SELECT * FROM source_mappings WHERE source = ? AND entity_type = ? "
+                "AND source_id = ? AND valid_to IS NULL",
+                (source, entity_type, source_id),
+            ).fetchone()
+            if (current is None) != (expected_current_mapping_id is None) or (
+                current is not None and current["mapping_id"] != expected_current_mapping_id
+            ):
+                actual = None if current is None else str(current["mapping_id"])
+                raise SourceMappingCASConflict(
+                    f"source mapping changed during review: expected "
+                    f"{expected_current_mapping_id!r}, current={actual!r}"
+                )
+            conflict = connection.execute(
+                "SELECT conflict.*, decision.decision_id "
+                "FROM source_mapping_conflicts AS conflict "
+                "LEFT JOIN source_mapping_decisions AS decision "
+                "ON decision.conflict_id = conflict.conflict_id "
+                "WHERE conflict.conflict_id = ?",
+                (conflict_id,),
+            ).fetchone()
+            if (
+                conflict is None
+                or conflict["decision_id"] is not None
+                or conflict["source"] != source
+                or conflict["entity_type"] != entity_type
+                or conflict["source_id"] != source_id
+                or conflict["current_mapping_id"] != expected_current_mapping_id
+                or conflict["candidate_entity_id"] != candidate_entity_id.value
+            ):
+                raise CanonicalConflictError(
+                    "manual override must match one open conflict and its reviewed candidate"
+                )
+            if effective_at < _parse_timestamp(str(conflict["proposed_at"])):
+                raise CanonicalConflictError("mapping revision cannot predate its conflict")
+            if current is not None and effective_at <= _parse_timestamp(str(current["valid_from"])):
+                raise CanonicalConflictError(
+                    "mapping revision must follow the current validity start"
+                )
+            new_version = 1 if current is None else int(current["version"]) + 1
+            new_mapping_id = _source_mapping_id(source, entity_type, source_id, new_version)
+            decision_id = _stable_id(
+                "source-mapping-decision",
+                source,
+                f"{conflict_id}|{new_mapping_id}",
+            )
+            revision_event_id = _stable_id(
+                "source-mapping-revision-event",
+                source,
+                f"{conflict_id}|{decision_id}",
+            )
+            evidence_payload = tuple(
+                {
+                    "evidence_id": _source_mapping_evidence_id(
+                        mapping_id=new_mapping_id,
+                        conflict_id=None,
+                        evidence_ref=evidence_ref,
+                        recorded_at=effective_at,
+                        recorded_by=actor,
+                        reason=reason,
+                    ),
+                    "evidence_ref": evidence_ref,
+                }
+                for evidence_ref in normalized_evidence
+            )
+            connection.execute(
+                "INSERT INTO source_mapping_revision_events("
+                "revision_event_id, decision_id, conflict_id, source, entity_type, source_id, "
+                "expected_current_mapping_id, candidate_entity_id, new_mapping_id, "
+                "new_version, effective_at, actor, reason, evidence_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    revision_event_id,
+                    decision_id,
+                    conflict_id,
+                    source,
+                    entity_type,
+                    source_id,
+                    expected_current_mapping_id,
+                    candidate_entity_id.value,
+                    new_mapping_id,
+                    new_version,
+                    _mapping_timestamp(effective_at),
+                    actor,
+                    reason,
+                    json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            new_row = connection.execute(
+                "SELECT * FROM source_mappings WHERE mapping_id = ?", (new_mapping_id,)
+            ).fetchone()
+            decision_row = connection.execute(
+                "SELECT * FROM source_mapping_decisions WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+            assert new_row is not None and decision_row is not None
+            return (
+                _source_mapping_from_row(new_row),
+                _source_mapping_decision_from_row(decision_row),
+            )
+
+    def list_source_mapping_conflicts(
+        self,
+        *,
+        source: str | None = None,
+        entity_type: str | None = None,
+        source_id: str | None = None,
+        include_resolved: bool = False,
+    ) -> tuple[SourceMappingConflict, ...]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, value in (
+            ("conflict.source", source),
+            ("conflict.entity_type", entity_type),
+            ("conflict.source_id", source_id),
+        ):
+            if value is not None:
+                _require_text(value, column.removeprefix("conflict."))
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        if entity_type is not None and entity_type not in {
+            "competition",
+            "season",
+            "team",
+            "player",
+            "match",
+        }:
+            raise ValueError(f"unsupported source mapping entity_type {entity_type!r}")
+        if not include_resolved:
+            clauses.extend(("decision.decision_id IS NULL", "obsolete.obsoletion_id IS NULL"))
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT conflict.*, COALESCE(decision.decision_id, obsolete.decision_id) "
+                "AS decision_id, "
+                "current.entity_id AS current_entity_id "
+                "FROM source_mapping_conflicts AS conflict "
+                "LEFT JOIN source_mappings AS current "
+                "ON current.mapping_id = conflict.current_mapping_id "
+                "LEFT JOIN source_mapping_decisions AS decision "
+                "ON decision.conflict_id = conflict.conflict_id "
+                "LEFT JOIN source_mapping_conflict_obsoletions AS obsolete "
+                "ON obsolete.conflict_id = conflict.conflict_id "
+                f"{where} ORDER BY conflict.proposed_at, conflict.conflict_id",
+                tuple(parameters),
+            ).fetchall()
+        return tuple(_source_mapping_conflict_from_row(row) for row in rows)
+
+    def source_mapping_evidence(
+        self,
+        *,
+        mapping_id: str | None = None,
+        conflict_id: str | None = None,
+    ) -> tuple[SourceMappingEvidence, ...]:
+        if (mapping_id is None) == (conflict_id is None):
+            raise ValueError("select evidence by exactly one mapping_id or conflict_id")
+        column, value = (
+            ("mapping_id", mapping_id) if mapping_id is not None else ("conflict_id", conflict_id)
+        )
+        assert value is not None
+        _require_text(value, column)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM source_mapping_evidence WHERE {column} = ? "
+                "ORDER BY recorded_at, evidence_id",
+                (value,),
+            ).fetchall()
+        return tuple(_source_mapping_evidence_from_row(row) for row in rows)
+
     def mapped_match_ids(
         self,
         *,
         source: str,
         source_ids: Sequence[str],
+        as_of: datetime | None = None,
     ) -> dict[str, MatchId]:
         """Resolve persisted provider mappings for a set of match identifiers."""
 
         if not source_ids:
             return {}
+        if as_of is not None:
+            require_utc(as_of, "as_of")
         placeholders = ", ".join("?" for _ in source_ids)
+        validity = "valid_to IS NULL"
+        parameters: tuple[object, ...] = (source, *source_ids)
+        if as_of is not None:
+            validity = "valid_from <= ? AND (valid_to IS NULL OR ? < valid_to)"
+            timestamp = _mapping_timestamp(as_of)
+            parameters = (source, *source_ids, timestamp, timestamp)
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT source_id, entity_id FROM source_mappings "
-                "WHERE source = ? AND entity_type = 'match' AND valid_to IS NULL "
-                f"AND source_id IN ({placeholders})",
-                (source, *source_ids),
+                f"WHERE source = ? AND entity_type = 'match' AND source_id IN ({placeholders}) "
+                f"AND {validity}",
+                parameters,
             ).fetchall()
         return {str(row["source_id"]): MatchId(row["entity_id"]) for row in rows}
 
@@ -1084,9 +1530,11 @@ class CanonicalStore:
         confidence: float,
         created_at: datetime,
         audit_note: str,
+        created_by: str = "canonical-store",
     ) -> None:
         _require_text(source, "source")
         _require_text(source_id, "source_id")
+        _require_text(created_by, "created_by")
         require_utc(valid_from, "valid_from")
         require_utc(created_at, "created_at")
         existing = _current_mapping(connection, source, entity_type, source_id)
@@ -1097,18 +1545,21 @@ class CanonicalStore:
                 )
             return
         connection.execute(
-            "INSERT INTO source_mappings(source, entity_type, source_id, entity_id, "
-            "valid_from, valid_to, match_rule, confidence, created_at, audit_note) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            "INSERT INTO source_mappings(mapping_id, source, entity_type, source_id, "
+            "entity_id, version, valid_from, valid_to, match_rule, confidence, created_at, "
+            "created_by, audit_note, supersedes_mapping_id) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?, NULL)",
             (
+                _source_mapping_id(source, entity_type, source_id, 1),
                 source,
                 entity_type,
                 source_id,
                 entity_id.value,
-                _timestamp(valid_from),
+                _mapping_timestamp(valid_from),
                 match_rule.value,
                 confidence,
-                _timestamp(created_at),
+                _mapping_timestamp(created_at),
+                created_by,
                 audit_note,
             ),
         )
@@ -1133,6 +1584,21 @@ def _insert_entity(
         "INSERT INTO entities(entity_id, entity_type, created_at) VALUES (?, ?, ?)",
         (entity_id.value, entity_type, created_at),
     )
+
+
+def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
+    """Execute schema DDL without the implicit commit performed by executescript()."""
+
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                connection.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("canonical schema contains an incomplete SQL statement")
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -1250,6 +1716,757 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
     connection.execute("UPDATE schema_meta SET version = 6 WHERE singleton = 1")
 
 
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(source_mappings)").fetchall()
+    }
+    if "mapping_id" in columns:
+        _validate_existing_source_mappings_v7(connection)
+        connection.execute("UPDATE schema_meta SET version = 7 WHERE singleton = 1")
+        return
+    rows = connection.execute(
+        "SELECT source, entity_type, source_id, entity_id, valid_from, valid_to, "
+        "match_rule, confidence, created_at, audit_note FROM source_mappings "
+        "ORDER BY source, entity_type, source_id, valid_from"
+    ).fetchall()
+    grouped: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        source = str(row["source"])
+        entity_type = str(row["entity_type"])
+        source_id = str(row["source_id"])
+        audit_note = str(row["audit_note"])
+        _require_text(source, "source")
+        _require_text(source_id, "source_id")
+        _require_text(audit_note, "audit_note")
+        if entity_type not in {"competition", "season", "team", "player", "match"}:
+            raise CanonicalConflictError(
+                f"cannot migrate source mapping with invalid entity type {entity_type!r}"
+            )
+        entity = connection.execute(
+            "SELECT entity_type FROM entities WHERE entity_id = ?", (row["entity_id"],)
+        ).fetchone()
+        if entity is None or entity["entity_type"] != entity_type:
+            raise CanonicalConflictError(
+                f"cannot migrate {source}:{entity_type}:{source_id}: entity type mismatch"
+            )
+        if str(row["match_rule"]) not in {rule.value for rule in MappingRule}:
+            raise CanonicalConflictError(
+                f"cannot migrate {source}:{entity_type}:{source_id}: invalid match rule"
+            )
+        confidence = float(row["confidence"])
+        if not 0.0 <= confidence <= 1.0:
+            raise CanonicalConflictError(
+                f"cannot migrate {source}:{entity_type}:{source_id}: invalid confidence"
+            )
+        valid_from = _parse_timestamp(str(row["valid_from"]))
+        _parse_timestamp(str(row["created_at"]))
+        if row["valid_to"] is not None:
+            valid_to = _parse_timestamp(str(row["valid_to"]))
+            if valid_to <= valid_from:
+                raise CanonicalConflictError(
+                    f"cannot migrate {source}:{entity_type}:{source_id}: invalid validity range"
+                )
+        grouped.setdefault((source, entity_type, source_id), []).append(row)
+
+    connection.execute("DROP TABLE IF EXISTS source_mappings_v7")
+    connection.execute(_source_mappings_v7_table_sql("source_mappings_v7"))
+    for (source, entity_type, source_id), history in grouped.items():
+        history.sort(key=lambda item: _parse_timestamp(str(item["valid_from"])))
+        previous_valid_to: datetime | None = None
+        previous_mapping_id: str | None = None
+        for index, row in enumerate(history, start=1):
+            valid_from = _parse_timestamp(str(row["valid_from"]))
+            valid_to = None if row["valid_to"] is None else _parse_timestamp(str(row["valid_to"]))
+            if index > 1 and previous_valid_to != valid_from:
+                raise CanonicalConflictError(
+                    f"cannot migrate {source}:{entity_type}:{source_id}: "
+                    "validity intervals are not contiguous"
+                )
+            mapping_id = _source_mapping_id(source, entity_type, source_id, index)
+            connection.execute(
+                "INSERT INTO source_mappings_v7("
+                "mapping_id, source, entity_type, source_id, entity_id, version, valid_from, "
+                "valid_to, match_rule, confidence, created_at, created_by, audit_note, "
+                "supersedes_mapping_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mapping_id,
+                    source,
+                    entity_type,
+                    source_id,
+                    row["entity_id"],
+                    index,
+                    _mapping_timestamp(valid_from),
+                    None if valid_to is None else _mapping_timestamp(valid_to),
+                    row["match_rule"],
+                    float(row["confidence"]),
+                    _mapping_timestamp(_parse_timestamp(str(row["created_at"]))),
+                    "legacy-v6-migration",
+                    row["audit_note"],
+                    previous_mapping_id,
+                ),
+            )
+            previous_valid_to = valid_to
+            previous_mapping_id = mapping_id
+
+    connection.execute("DROP TABLE source_mappings")
+    connection.execute("ALTER TABLE source_mappings_v7 RENAME TO source_mappings")
+    connection.execute(
+        "CREATE UNIQUE INDEX source_mappings_current "
+        "ON source_mappings(source, entity_type, source_id) WHERE valid_to IS NULL"
+    )
+    _create_source_mapping_v7_auxiliary(connection)
+    connection.execute("UPDATE schema_meta SET version = 7 WHERE singleton = 1")
+
+
+def _validate_existing_source_mappings_v7(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT * FROM source_mappings ORDER BY source, entity_type, source_id, version"
+    ).fetchall()
+    previous_by_key: dict[tuple[str, str, str], SourceMapping] = {}
+    for row in rows:
+        mapping = _source_mapping_from_row(row)
+        assert mapping.mapping_id is not None
+        assert mapping.entity_type is not None
+        key = (mapping.source, mapping.entity_type, mapping.source_id)
+        previous = previous_by_key.get(key)
+        expected_version = 1 if previous is None else previous.version + 1
+        expected_supersedes = None if previous is None else previous.mapping_id
+        if (
+            mapping.version != expected_version
+            or mapping.mapping_id != _source_mapping_id(*key, mapping.version)
+            or mapping.supersedes_mapping_id != expected_supersedes
+            or (previous is not None and previous.valid_to != mapping.valid_from)
+        ):
+            raise CanonicalConflictError(
+                f"cannot accept malformed v7 source mapping history for {':'.join(key)}"
+            )
+        entity = connection.execute(
+            "SELECT entity_type FROM entities WHERE entity_id = ?",
+            (mapping.entity_id.value,),
+        ).fetchone()
+        if entity is None or entity["entity_type"] != mapping.entity_type:
+            raise CanonicalConflictError(f"cannot accept {':'.join(key)}: entity type mismatch")
+        previous_by_key[key] = mapping
+
+
+def _source_mappings_v7_table_sql(table_name: str) -> str:
+    if table_name not in {"source_mappings", "source_mappings_v7"}:
+        raise ValueError("unsupported source mappings table name")
+    return f"""
+        CREATE TABLE {table_name} (
+            mapping_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL CHECK (
+                length(trim(source)) > 0 AND source = trim(source)
+            ),
+            entity_type TEXT NOT NULL CHECK (
+                entity_type IN ('competition', 'season', 'team', 'player', 'match')
+            ),
+            source_id TEXT NOT NULL CHECK (
+                length(trim(source_id)) > 0 AND source_id = trim(source_id)
+            ),
+            entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+            version INTEGER NOT NULL CHECK (version > 0),
+            valid_from TEXT NOT NULL CHECK (
+                length(valid_from) = 27
+                AND substr(valid_from, 11, 1) = 'T'
+                AND substr(valid_from, 20, 1) = '.'
+                AND substr(valid_from, 27, 1) = 'Z'
+                AND julianday(valid_from) IS NOT NULL
+            ),
+            valid_to TEXT,
+            match_rule TEXT NOT NULL CHECK (
+                match_rule IN ('source_id', 'exact_alias', 'fuzzy_alias', 'manual_override')
+            ),
+            confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+            created_at TEXT NOT NULL CHECK (
+                length(created_at) = 27
+                AND substr(created_at, 11, 1) = 'T'
+                AND substr(created_at, 20, 1) = '.'
+                AND substr(created_at, 27, 1) = 'Z'
+                AND julianday(created_at) IS NOT NULL
+            ),
+            created_by TEXT NOT NULL CHECK (
+                length(trim(created_by)) > 0 AND created_by = trim(created_by)
+            ),
+            audit_note TEXT NOT NULL CHECK (
+                length(trim(audit_note)) > 0 AND audit_note = trim(audit_note)
+            ),
+            supersedes_mapping_id TEXT REFERENCES {table_name}(mapping_id),
+            CHECK (
+                valid_to IS NULL OR (
+                    length(valid_to) = 27
+                    AND substr(valid_to, 11, 1) = 'T'
+                    AND substr(valid_to, 20, 1) = '.'
+                    AND substr(valid_to, 27, 1) = 'Z'
+                    AND julianday(valid_to) IS NOT NULL
+                    AND valid_to > valid_from
+                )
+            ),
+            CHECK (
+                (version = 1 AND supersedes_mapping_id IS NULL)
+                OR (version > 1 AND supersedes_mapping_id IS NOT NULL)
+            ),
+            UNIQUE (source, entity_type, source_id, version)
+        )
+    """
+
+
+def _create_source_mapping_v7_auxiliary(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS source_mappings_current "
+        "ON source_mappings(source, entity_type, source_id) WHERE valid_to IS NULL"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_mapping_conflicts (
+            conflict_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
+            entity_type TEXT NOT NULL CHECK (
+                entity_type IN ('competition', 'season', 'team', 'player', 'match')
+            ),
+            source_id TEXT NOT NULL CHECK (
+                length(trim(source_id)) > 0 AND source_id = trim(source_id)
+            ),
+            current_mapping_id TEXT REFERENCES source_mappings(mapping_id),
+            candidate_entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+            proposed_at TEXT NOT NULL CHECK (
+                length(proposed_at) = 27 AND substr(proposed_at, 27, 1) = 'Z'
+                AND julianday(proposed_at) IS NOT NULL
+            ),
+            proposed_by TEXT NOT NULL CHECK (
+                length(trim(proposed_by)) > 0 AND proposed_by = trim(proposed_by)
+            ),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND reason = trim(reason)),
+            UNIQUE (current_mapping_id, candidate_entity_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS source_mapping_conflicts_unmapped_candidate "
+        "ON source_mapping_conflicts(source, entity_type, source_id, candidate_entity_id) "
+        "WHERE current_mapping_id IS NULL"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_mapping_revision_events (
+            revision_event_id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL UNIQUE,
+            conflict_id TEXT NOT NULL UNIQUE REFERENCES source_mapping_conflicts(conflict_id),
+            source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
+            entity_type TEXT NOT NULL CHECK (
+                entity_type IN ('competition', 'season', 'team', 'player', 'match')
+            ),
+            source_id TEXT NOT NULL CHECK (
+                length(trim(source_id)) > 0 AND source_id = trim(source_id)
+            ),
+            expected_current_mapping_id TEXT REFERENCES source_mappings(mapping_id),
+            candidate_entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+            new_mapping_id TEXT NOT NULL UNIQUE,
+            new_version INTEGER NOT NULL CHECK (new_version > 0),
+            effective_at TEXT NOT NULL CHECK (
+                length(effective_at) = 27 AND substr(effective_at, 27, 1) = 'Z'
+                AND julianday(effective_at) IS NOT NULL
+            ),
+            actor TEXT NOT NULL CHECK (length(trim(actor)) > 0 AND actor = trim(actor)),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND reason = trim(reason)),
+            evidence_json TEXT NOT NULL CHECK (
+                json_valid(evidence_json) AND json_type(evidence_json) = 'array'
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_mapping_evidence (
+            evidence_id TEXT PRIMARY KEY,
+            mapping_id TEXT REFERENCES source_mappings(mapping_id),
+            conflict_id TEXT REFERENCES source_mapping_conflicts(conflict_id),
+            evidence_ref TEXT NOT NULL CHECK (
+                length(trim(evidence_ref)) > 0 AND evidence_ref = trim(evidence_ref)
+            ),
+            recorded_at TEXT NOT NULL CHECK (
+                length(recorded_at) = 27 AND substr(recorded_at, 27, 1) = 'Z'
+                AND julianday(recorded_at) IS NOT NULL
+            ),
+            recorded_by TEXT NOT NULL CHECK (
+                length(trim(recorded_by)) > 0 AND recorded_by = trim(recorded_by)
+            ),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND reason = trim(reason)),
+            CHECK ((mapping_id IS NULL) <> (conflict_id IS NULL))
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_mapping_decisions (
+            decision_id TEXT PRIMARY KEY,
+            revision_event_id TEXT NOT NULL UNIQUE
+                REFERENCES source_mapping_revision_events(revision_event_id),
+            conflict_id TEXT NOT NULL UNIQUE
+                REFERENCES source_mapping_conflicts(conflict_id),
+            previous_mapping_id TEXT REFERENCES source_mappings(mapping_id),
+            new_mapping_id TEXT NOT NULL UNIQUE REFERENCES source_mappings(mapping_id),
+            decided_at TEXT NOT NULL CHECK (
+                length(decided_at) = 27 AND substr(decided_at, 27, 1) = 'Z'
+                AND julianday(decided_at) IS NOT NULL
+            ),
+            decided_by TEXT NOT NULL CHECK (
+                length(trim(decided_by)) > 0 AND decided_by = trim(decided_by)
+            ),
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND reason = trim(reason)),
+            evidence_ids_json TEXT NOT NULL CHECK (
+                json_valid(evidence_ids_json) AND json_type(evidence_ids_json) = 'array'
+                AND json_array_length(evidence_ids_json) > 0
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_mapping_conflict_obsoletions (
+            obsoletion_id TEXT PRIMARY KEY,
+            conflict_id TEXT NOT NULL UNIQUE REFERENCES source_mapping_conflicts(conflict_id),
+            revision_event_id TEXT NOT NULL REFERENCES source_mapping_revision_events(
+                revision_event_id
+            ),
+            decision_id TEXT NOT NULL REFERENCES source_mapping_decisions(decision_id),
+            obsoleted_at TEXT NOT NULL,
+            reason TEXT NOT NULL CHECK (length(trim(reason)) > 0 AND reason = trim(reason))
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS source_mapping_conflicts_key "
+        "ON source_mapping_conflicts(source, entity_type, source_id, proposed_at)"
+    )
+    _create_source_mapping_v7_triggers(connection)
+
+
+def _create_source_mapping_v7_triggers(connection: sqlite3.Connection) -> None:
+    trigger_names = (
+        "source_mappings_entity_type_insert",
+        "source_mappings_revision_insert",
+        "source_mappings_history_insert",
+        "source_mappings_overlap_insert",
+        "source_mappings_close_only_update",
+        "source_mappings_no_delete",
+        "source_mapping_conflicts_validate_insert",
+        "source_mapping_revision_events_require_evidence",
+        "source_mapping_revision_events_validate_evidence",
+        "source_mapping_revision_events_validate_insert",
+        "source_mapping_revision_events_apply_insert",
+        "source_mapping_decisions_validate_insert",
+        "source_mapping_conflict_obsoletions_validate_insert",
+    )
+    append_only_tables = (
+        "source_mapping_evidence",
+        "source_mapping_conflicts",
+        "source_mapping_revision_events",
+        "source_mapping_decisions",
+        "source_mapping_conflict_obsoletions",
+    )
+    for trigger_name in trigger_names:
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    for table in append_only_tables:
+        connection.execute(f"DROP TRIGGER IF EXISTS {table}_no_update")
+        connection.execute(f"DROP TRIGGER IF EXISTS {table}_no_delete")
+
+    statements = (
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mappings_entity_type_insert
+        BEFORE INSERT ON source_mappings
+        WHEN NOT EXISTS (
+            SELECT 1 FROM entities
+            WHERE entity_id = NEW.entity_id AND entity_type = NEW.entity_type
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping entity type mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER source_mappings_revision_insert
+        BEFORE INSERT ON source_mappings
+        WHEN (NEW.version > 1 OR NEW.match_rule = 'manual_override') AND NOT EXISTS (
+            SELECT 1 FROM source_mapping_revision_events AS event
+            WHERE event.new_mapping_id = NEW.mapping_id
+                AND event.source = NEW.source
+                AND event.entity_type = NEW.entity_type
+                AND event.source_id = NEW.source_id
+                AND event.expected_current_mapping_id IS NEW.supersedes_mapping_id
+                AND event.candidate_entity_id = NEW.entity_id
+                AND event.new_version = NEW.version
+                AND event.effective_at = NEW.valid_from
+                AND event.actor = NEW.created_by
+                AND event.reason = NEW.audit_note
+                AND NEW.valid_to IS NULL
+                AND NEW.match_rule = 'manual_override'
+                AND NEW.confidence = 1.0
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping revision requires a matching revision event');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mappings_history_insert
+        BEFORE INSERT ON source_mappings
+        WHEN (
+            NEW.version = 1 AND EXISTS (
+                SELECT 1 FROM source_mappings
+                WHERE source = NEW.source AND entity_type = NEW.entity_type
+                    AND source_id = NEW.source_id
+            )
+        ) OR (
+            NEW.version > 1 AND NOT EXISTS (
+                SELECT 1 FROM source_mappings AS previous
+                WHERE previous.mapping_id = NEW.supersedes_mapping_id
+                    AND previous.source = NEW.source
+                    AND previous.entity_type = NEW.entity_type
+                    AND previous.source_id = NEW.source_id
+                    AND previous.version = NEW.version - 1
+                    AND previous.valid_to = NEW.valid_from
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping version history is not continuous');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mappings_overlap_insert
+        BEFORE INSERT ON source_mappings
+        WHEN EXISTS (
+            SELECT 1 FROM source_mappings AS existing
+            WHERE existing.source = NEW.source
+                AND existing.entity_type = NEW.entity_type
+                AND existing.source_id = NEW.source_id
+                AND existing.valid_from < COALESCE(NEW.valid_to, '9999-12-31T23:59:59Z')
+                AND NEW.valid_from < COALESCE(existing.valid_to, '9999-12-31T23:59:59Z')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping validity intervals overlap');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mappings_close_only_update
+        BEFORE UPDATE ON source_mappings
+        WHEN NOT (
+            OLD.valid_to IS NULL AND NEW.valid_to IS NOT NULL
+            AND OLD.mapping_id IS NEW.mapping_id
+            AND OLD.source IS NEW.source
+            AND OLD.entity_type IS NEW.entity_type
+            AND OLD.source_id IS NEW.source_id
+            AND OLD.entity_id IS NEW.entity_id
+            AND OLD.version IS NEW.version
+            AND OLD.valid_from IS NEW.valid_from
+            AND OLD.match_rule IS NEW.match_rule
+            AND OLD.confidence IS NEW.confidence
+            AND OLD.created_at IS NEW.created_at
+            AND OLD.created_by IS NEW.created_by
+            AND OLD.audit_note IS NEW.audit_note
+            AND OLD.supersedes_mapping_id IS NEW.supersedes_mapping_id
+            AND EXISTS (
+                SELECT 1 FROM source_mapping_revision_events AS event
+                WHERE event.expected_current_mapping_id = OLD.mapping_id
+                    AND event.source = OLD.source
+                    AND event.entity_type = OLD.entity_type
+                    AND event.source_id = OLD.source_id
+                    AND event.effective_at = NEW.valid_to
+            )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'source mappings may only close through a matching revision event'
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mappings_no_delete
+        BEFORE DELETE ON source_mappings
+        BEGIN
+            SELECT RAISE(ABORT, 'source mappings are append-only');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mapping_conflicts_validate_insert
+        BEFORE INSERT ON source_mapping_conflicts
+        WHEN NOT EXISTS (
+            SELECT 1 FROM entities AS candidate
+            WHERE candidate.entity_id = NEW.candidate_entity_id
+                AND candidate.entity_type = NEW.entity_type
+                AND (
+                    (
+                        NEW.current_mapping_id IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM source_mappings AS current
+                            WHERE current.source = NEW.source
+                                AND current.entity_type = NEW.entity_type
+                                AND current.source_id = NEW.source_id
+                                AND current.valid_to IS NULL
+                        )
+                    ) OR EXISTS (
+                        SELECT 1 FROM source_mappings AS current
+                        WHERE current.mapping_id = NEW.current_mapping_id
+                            AND current.source = NEW.source
+                            AND current.entity_type = NEW.entity_type
+                            AND current.source_id = NEW.source_id
+                            AND current.valid_to IS NULL
+                            AND current.entity_id <> NEW.candidate_entity_id
+                    )
+                )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping conflict candidate is invalid');
+        END
+        """,
+        """
+        CREATE TRIGGER source_mapping_revision_events_require_evidence
+        BEFORE INSERT ON source_mapping_revision_events
+        WHEN json_array_length(NEW.evidence_json) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping revision requires at least one evidence');
+        END
+        """,
+        """
+        CREATE TRIGGER source_mapping_revision_events_validate_evidence
+        BEFORE INSERT ON source_mapping_revision_events
+        WHEN json_array_length(NEW.evidence_json) > 0 AND (
+            EXISTS (
+                SELECT 1 FROM json_each(NEW.evidence_json) AS item
+                WHERE json_type(item.value) <> 'object'
+                    OR json_type(item.value, '$.evidence_id') <> 'text'
+                    OR length(trim(json_extract(item.value, '$.evidence_id'))) = 0
+                    OR json_extract(item.value, '$.evidence_id') <>
+                        trim(json_extract(item.value, '$.evidence_id'))
+                    OR json_type(item.value, '$.evidence_ref') <> 'text'
+                    OR length(trim(json_extract(item.value, '$.evidence_ref'))) = 0
+                    OR json_extract(item.value, '$.evidence_ref') <>
+                        trim(json_extract(item.value, '$.evidence_ref'))
+            )
+            OR (SELECT COUNT(*) FROM json_each(NEW.evidence_json)) <>
+                (
+                    SELECT COUNT(DISTINCT json_extract(value, '$.evidence_id'))
+                    FROM json_each(NEW.evidence_json)
+                )
+            OR (SELECT COUNT(*) FROM json_each(NEW.evidence_json)) <>
+                (
+                    SELECT COUNT(DISTINCT json_extract(value, '$.evidence_ref'))
+                    FROM json_each(NEW.evidence_json)
+                )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping revision evidence payload is invalid');
+        END
+        """,
+        """
+        CREATE TRIGGER source_mapping_revision_events_validate_insert
+        BEFORE INSERT ON source_mapping_revision_events
+        WHEN NOT EXISTS (
+            SELECT 1 FROM source_mapping_conflicts AS conflict
+            JOIN entities AS candidate
+                ON candidate.entity_id = NEW.candidate_entity_id
+                AND candidate.entity_type = NEW.entity_type
+            LEFT JOIN source_mappings AS current
+                ON current.mapping_id = conflict.current_mapping_id
+            LEFT JOIN source_mapping_decisions AS decision
+                ON decision.conflict_id = conflict.conflict_id
+            LEFT JOIN source_mapping_conflict_obsoletions AS obsolete
+                ON obsolete.conflict_id = conflict.conflict_id
+            WHERE conflict.conflict_id = NEW.conflict_id
+                AND conflict.source = NEW.source
+                AND conflict.entity_type = NEW.entity_type
+                AND conflict.source_id = NEW.source_id
+                AND conflict.current_mapping_id IS NEW.expected_current_mapping_id
+                AND conflict.candidate_entity_id = NEW.candidate_entity_id
+                AND decision.decision_id IS NULL
+                AND obsolete.obsoletion_id IS NULL
+                AND NEW.effective_at >= conflict.proposed_at
+                AND (
+                    (
+                        NEW.expected_current_mapping_id IS NULL
+                        AND current.mapping_id IS NULL
+                        AND NEW.new_version = 1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM source_mappings AS active
+                            WHERE active.source = NEW.source
+                                AND active.entity_type = NEW.entity_type
+                                AND active.source_id = NEW.source_id
+                                AND active.valid_to IS NULL
+                        )
+                    ) OR (
+                        NEW.expected_current_mapping_id IS NOT NULL
+                        AND current.mapping_id = NEW.expected_current_mapping_id
+                        AND current.valid_to IS NULL
+                        AND NEW.new_version = current.version + 1
+                        AND NEW.effective_at > current.valid_from
+                    )
+                )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'source mapping revision event failed CAS or reviewed conflict validation'
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER source_mapping_revision_events_apply_insert
+        AFTER INSERT ON source_mapping_revision_events
+        BEGIN
+            UPDATE source_mappings
+            SET valid_to = NEW.effective_at
+            WHERE mapping_id = NEW.expected_current_mapping_id AND valid_to IS NULL;
+
+            INSERT INTO source_mappings(
+                mapping_id, source, entity_type, source_id, entity_id, version, valid_from,
+                valid_to, match_rule, confidence, created_at, created_by, audit_note,
+                supersedes_mapping_id
+            ) VALUES (
+                NEW.new_mapping_id, NEW.source, NEW.entity_type, NEW.source_id,
+                NEW.candidate_entity_id, NEW.new_version, NEW.effective_at, NULL,
+                'manual_override', 1.0, NEW.effective_at, NEW.actor, NEW.reason,
+                NEW.expected_current_mapping_id
+            );
+
+            INSERT INTO source_mapping_evidence(
+                evidence_id, mapping_id, conflict_id, evidence_ref, recorded_at,
+                recorded_by, reason
+            )
+            SELECT
+                json_extract(item.value, '$.evidence_id'), NEW.new_mapping_id, NULL,
+                json_extract(item.value, '$.evidence_ref'), NEW.effective_at, NEW.actor,
+                NEW.reason
+            FROM json_each(NEW.evidence_json) AS item;
+
+            INSERT INTO source_mapping_decisions(
+                decision_id, revision_event_id, conflict_id, previous_mapping_id,
+                new_mapping_id, decided_at, decided_by, reason, evidence_ids_json
+            ) VALUES (
+                NEW.decision_id, NEW.revision_event_id, NEW.conflict_id,
+                NEW.expected_current_mapping_id, NEW.new_mapping_id, NEW.effective_at,
+                NEW.actor, NEW.reason,
+                (
+                    SELECT json_group_array(json_extract(item.value, '$.evidence_id'))
+                    FROM json_each(NEW.evidence_json) AS item
+                )
+            );
+
+            INSERT INTO source_mapping_conflict_obsoletions(
+                obsoletion_id, conflict_id, revision_event_id, decision_id,
+                obsoleted_at, reason
+            )
+            SELECT
+                'source-mapping-conflict-obsoletion:' || conflict.conflict_id || ':' ||
+                    NEW.revision_event_id,
+                conflict.conflict_id, NEW.revision_event_id, NEW.decision_id,
+                NEW.effective_at, 'superseded by accepted sibling candidate'
+            FROM source_mapping_conflicts AS conflict
+            LEFT JOIN source_mapping_decisions AS decision
+                ON decision.conflict_id = conflict.conflict_id
+            LEFT JOIN source_mapping_conflict_obsoletions AS obsolete
+                ON obsolete.conflict_id = conflict.conflict_id
+            WHERE conflict.conflict_id <> NEW.conflict_id
+                AND conflict.current_mapping_id IS NEW.expected_current_mapping_id
+                AND decision.decision_id IS NULL
+                AND obsolete.obsoletion_id IS NULL;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS source_mapping_decisions_validate_insert
+        BEFORE INSERT ON source_mapping_decisions
+        WHEN NOT EXISTS (
+            SELECT 1 FROM source_mapping_revision_events AS event
+            JOIN source_mapping_conflicts AS conflict
+                ON conflict.conflict_id = event.conflict_id
+            LEFT JOIN source_mappings AS previous
+                ON previous.mapping_id = event.expected_current_mapping_id
+            JOIN source_mappings AS replacement
+                ON replacement.mapping_id = event.new_mapping_id
+            WHERE event.revision_event_id = NEW.revision_event_id
+                AND event.decision_id = NEW.decision_id
+                AND event.conflict_id = NEW.conflict_id
+                AND event.expected_current_mapping_id IS NEW.previous_mapping_id
+                AND event.new_mapping_id = NEW.new_mapping_id
+                AND event.effective_at = NEW.decided_at
+                AND event.actor = NEW.decided_by
+                AND event.reason = NEW.reason
+                AND conflict.current_mapping_id IS NEW.previous_mapping_id
+                AND replacement.supersedes_mapping_id IS NEW.previous_mapping_id
+                AND replacement.source = event.source
+                AND replacement.entity_type = event.entity_type
+                AND replacement.source_id = event.source_id
+                AND replacement.entity_id = event.candidate_entity_id
+                AND replacement.valid_from = event.effective_at
+                AND (previous.mapping_id IS NULL OR previous.valid_to = replacement.valid_from)
+                AND NEW.evidence_ids_json = (
+                    SELECT json_group_array(json_extract(item.value, '$.evidence_id'))
+                    FROM json_each(event.evidence_json) AS item
+                )
+                AND (SELECT COUNT(*) FROM source_mapping_evidence AS evidence
+                    WHERE evidence.mapping_id = NEW.new_mapping_id) =
+                    json_array_length(event.evidence_json)
+                AND NOT EXISTS (
+                    SELECT 1 FROM json_each(event.evidence_json) AS item
+                    LEFT JOIN source_mapping_evidence AS evidence
+                        ON evidence.evidence_id = json_extract(item.value, '$.evidence_id')
+                    WHERE evidence.mapping_id <> NEW.new_mapping_id
+                        OR evidence.evidence_ref <>
+                            json_extract(item.value, '$.evidence_ref')
+                        OR evidence.recorded_at <> event.effective_at
+                        OR evidence.recorded_by <> event.actor
+                        OR evidence.reason <> event.reason
+                )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'source mapping decision requires its exact revision event evidence'
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER source_mapping_conflict_obsoletions_validate_insert
+        BEFORE INSERT ON source_mapping_conflict_obsoletions
+        WHEN NOT EXISTS (
+            SELECT 1 FROM source_mapping_revision_events AS event
+            JOIN source_mapping_decisions AS decision
+                ON decision.revision_event_id = event.revision_event_id
+            JOIN source_mapping_conflicts AS obsolete
+                ON obsolete.conflict_id = NEW.conflict_id
+            WHERE event.revision_event_id = NEW.revision_event_id
+                AND decision.decision_id = NEW.decision_id
+                AND obsolete.conflict_id <> event.conflict_id
+                AND obsolete.current_mapping_id IS event.expected_current_mapping_id
+                AND NEW.obsoleted_at = event.effective_at
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'source mapping conflict obsoletion is invalid');
+        END
+        """,
+    )
+    for statement in statements:
+        connection.execute(statement)
+    for table in append_only_tables:
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_update
+            BEFORE UPDATE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} is append-only');
+            END
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {table}_no_delete
+            BEFORE DELETE ON {table}
+            BEGIN
+                SELECT RAISE(ABORT, '{table} is append-only');
+            END
+            """
+        )
+
+
 def _ensure_competition_team(
     connection: sqlite3.Connection,
     *,
@@ -1303,6 +2520,183 @@ def _current_mapping(
         (source, entity_type, source_id),
     ).fetchone()
     return None if row is None else str(row["entity_id"])
+
+
+def _mapping_as_of(
+    connection: sqlite3.Connection,
+    source: str,
+    entity_type: str,
+    source_id: str,
+    as_of: datetime,
+) -> str | None:
+    timestamp = _mapping_timestamp(as_of)
+    row = connection.execute(
+        "SELECT entity_id FROM source_mappings WHERE source = ? AND entity_type = ? "
+        "AND source_id = ? AND valid_from <= ? AND (valid_to IS NULL OR ? < valid_to)",
+        (source, entity_type, source_id, timestamp, timestamp),
+    ).fetchone()
+    return None if row is None else str(row["entity_id"])
+
+
+def _validate_mapping_key(source: str, entity_type: str, source_id: str) -> None:
+    _require_text(source, "source")
+    _require_text(source_id, "source_id")
+    if entity_type not in {"competition", "season", "team", "player", "match"}:
+        raise ValueError(f"unsupported source mapping entity_type {entity_type!r}")
+
+
+def _entity_id_from_value(entity_type: str, value: str) -> EntityId:
+    constructors = {
+        "competition": CompetitionId,
+        "season": SeasonId,
+        "team": TeamId,
+        "player": PlayerId,
+        "match": MatchId,
+    }
+    try:
+        constructor = constructors[entity_type]
+    except KeyError as error:
+        raise ValueError(f"unsupported source mapping entity_type {entity_type!r}") from error
+    return constructor(value)
+
+
+def _source_mapping_from_row(row: sqlite3.Row) -> SourceMapping:
+    entity_type = str(row["entity_type"])
+    return SourceMapping(
+        source=str(row["source"]),
+        source_id=str(row["source_id"]),
+        entity_id=_entity_id_from_value(entity_type, str(row["entity_id"])),
+        version=int(row["version"]),
+        valid_from=_parse_timestamp(str(row["valid_from"])),
+        valid_to=(None if row["valid_to"] is None else _parse_timestamp(str(row["valid_to"]))),
+        match_rule=MappingRule(str(row["match_rule"])),
+        confidence=float(row["confidence"]),
+        created_at=_parse_timestamp(str(row["created_at"])),
+        created_by=str(row["created_by"]),
+        audit_note=str(row["audit_note"]),
+        mapping_id=str(row["mapping_id"]),
+        entity_type=entity_type,
+        supersedes_mapping_id=(
+            None if row["supersedes_mapping_id"] is None else str(row["supersedes_mapping_id"])
+        ),
+    )
+
+
+def _source_mapping_conflict_from_row(row: sqlite3.Row) -> SourceMappingConflict:
+    entity_type = str(row["entity_type"])
+    return SourceMappingConflict(
+        conflict_id=str(row["conflict_id"]),
+        source=str(row["source"]),
+        entity_type=entity_type,
+        source_id=str(row["source_id"]),
+        current_mapping_id=(
+            None if row["current_mapping_id"] is None else str(row["current_mapping_id"])
+        ),
+        current_entity_id=(
+            None
+            if row["current_entity_id"] is None
+            else _entity_id_from_value(entity_type, str(row["current_entity_id"]))
+        ),
+        candidate_entity_id=_entity_id_from_value(entity_type, str(row["candidate_entity_id"])),
+        proposed_at=_parse_timestamp(str(row["proposed_at"])),
+        proposed_by=str(row["proposed_by"]),
+        reason=str(row["reason"]),
+        decision_id=None if row["decision_id"] is None else str(row["decision_id"]),
+    )
+
+
+def _source_mapping_decision_from_row(row: sqlite3.Row) -> SourceMappingDecision:
+    return SourceMappingDecision(
+        decision_id=str(row["decision_id"]),
+        conflict_id=str(row["conflict_id"]),
+        previous_mapping_id=(
+            None if row["previous_mapping_id"] is None else str(row["previous_mapping_id"])
+        ),
+        new_mapping_id=str(row["new_mapping_id"]),
+        decided_at=_parse_timestamp(str(row["decided_at"])),
+        decided_by=str(row["decided_by"]),
+        reason=str(row["reason"]),
+        revision_event_id=str(row["revision_event_id"]),
+        evidence_ids=tuple(str(value) for value in json.loads(str(row["evidence_ids_json"]))),
+    )
+
+
+def _source_mapping_evidence_from_row(row: sqlite3.Row) -> SourceMappingEvidence:
+    return SourceMappingEvidence(
+        evidence_id=str(row["evidence_id"]),
+        mapping_id=None if row["mapping_id"] is None else str(row["mapping_id"]),
+        conflict_id=None if row["conflict_id"] is None else str(row["conflict_id"]),
+        evidence_ref=str(row["evidence_ref"]),
+        recorded_at=_parse_timestamp(str(row["recorded_at"])),
+        recorded_by=str(row["recorded_by"]),
+        reason=str(row["reason"]),
+    )
+
+
+def _normalize_mapping_evidence_refs(evidence_refs: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(evidence_refs, (str, bytes)):
+        raise TypeError("evidence_refs must be a sequence of evidence identifiers")
+    normalized: list[str] = []
+    for evidence_ref in evidence_refs:
+        if not isinstance(evidence_ref, str):
+            raise TypeError("mapping evidence references must be strings")
+        _require_text(evidence_ref, "evidence_ref")
+        normalized.append(evidence_ref)
+    if not normalized:
+        raise ValueError("source mapping review requires at least one evidence reference")
+    return tuple(sorted(set(normalized)))
+
+
+def _insert_source_mapping_evidence(
+    connection: sqlite3.Connection,
+    *,
+    mapping_id: str | None,
+    conflict_id: str | None,
+    evidence_ref: str,
+    recorded_at: datetime,
+    recorded_by: str,
+    reason: str,
+) -> None:
+    evidence_id = _source_mapping_evidence_id(
+        mapping_id=mapping_id,
+        conflict_id=conflict_id,
+        evidence_ref=evidence_ref,
+        recorded_at=recorded_at,
+        recorded_by=recorded_by,
+        reason=reason,
+    )
+    _insert_exact(
+        connection,
+        "source_mapping_evidence",
+        {
+            "evidence_id": evidence_id,
+            "mapping_id": mapping_id,
+            "conflict_id": conflict_id,
+            "evidence_ref": evidence_ref,
+            "recorded_at": _mapping_timestamp(recorded_at),
+            "recorded_by": recorded_by,
+            "reason": reason,
+        },
+        "evidence_id",
+    )
+
+
+def _source_mapping_evidence_id(
+    *,
+    mapping_id: str | None,
+    conflict_id: str | None,
+    evidence_ref: str,
+    recorded_at: datetime,
+    recorded_by: str,
+    reason: str,
+) -> str:
+    target = mapping_id if mapping_id is not None else conflict_id
+    assert target is not None
+    return _stable_id(
+        "source-mapping-evidence",
+        "canonical",
+        "|".join((target, evidence_ref, _mapping_timestamp(recorded_at), recorded_by, reason)),
+    )
 
 
 def _append_match_version(
@@ -1499,7 +2893,13 @@ def _validate_match_report_contract_lineage(
     match = _load_match(connection, evidence.match_id)
     resolved_team_ids = set()
     for source_team_id, _ in evidence.team_tables:
-        mapped = _current_mapping(connection, "fbref", "team", source_team_id)
+        mapped = _mapping_as_of(
+            connection,
+            "fbref",
+            "team",
+            source_team_id,
+            evidence.observed_at,
+        )
         if mapped is None:
             raise CanonicalConflictError("match report contract team mapping is missing")
         resolved_team_ids.add(mapped)
@@ -1833,9 +3233,21 @@ def _stable_id(entity_type: str, source: str, source_id: str) -> str:
     return f"{entity_type}:{uuid.uuid5(_ID_NAMESPACE, f'{entity_type}|{source}|{source_id}')}"
 
 
+def _source_mapping_id(source: str, entity_type: str, source_id: str, version: int) -> str:
+    identity = f"{entity_type}|{source_id}|{version}"
+    return _stable_id("source-mapping", source, identity)
+
+
 def _timestamp(value: datetime) -> str:
     require_utc(value)
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _mapping_timestamp(value: datetime) -> str:
+    """Use fixed-width UTC text so SQLite range constraints preserve microsecond order."""
+
+    require_utc(value)
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -1946,22 +3358,58 @@ CREATE TABLE IF NOT EXISTS raw_assets (
 );
 
 CREATE TABLE IF NOT EXISTS source_mappings (
-    source TEXT NOT NULL,
-    entity_type TEXT NOT NULL,
-    source_id TEXT NOT NULL,
+    mapping_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0 AND source = trim(source)),
+    entity_type TEXT NOT NULL CHECK (
+        entity_type IN ('competition', 'season', 'team', 'player', 'match')
+    ),
+    source_id TEXT NOT NULL CHECK (
+        length(trim(source_id)) > 0 AND source_id = trim(source_id)
+    ),
     entity_id TEXT NOT NULL REFERENCES entities(entity_id),
-    valid_from TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    valid_from TEXT NOT NULL CHECK (
+        length(valid_from) = 27
+        AND substr(valid_from, 11, 1) = 'T'
+        AND substr(valid_from, 20, 1) = '.'
+        AND substr(valid_from, 27, 1) = 'Z'
+        AND julianday(valid_from) IS NOT NULL
+    ),
     valid_to TEXT,
-    match_rule TEXT NOT NULL,
+    match_rule TEXT NOT NULL CHECK (
+        match_rule IN ('source_id', 'exact_alias', 'fuzzy_alias', 'manual_override')
+    ),
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-    created_at TEXT NOT NULL,
-    audit_note TEXT NOT NULL,
-    PRIMARY KEY (source, entity_type, source_id, valid_from)
+    created_at TEXT NOT NULL CHECK (
+        length(created_at) = 27
+        AND substr(created_at, 11, 1) = 'T'
+        AND substr(created_at, 20, 1) = '.'
+        AND substr(created_at, 27, 1) = 'Z'
+        AND julianday(created_at) IS NOT NULL
+    ),
+    created_by TEXT NOT NULL CHECK (
+        length(trim(created_by)) > 0 AND created_by = trim(created_by)
+    ),
+    audit_note TEXT NOT NULL CHECK (
+        length(trim(audit_note)) > 0 AND audit_note = trim(audit_note)
+    ),
+    supersedes_mapping_id TEXT REFERENCES source_mappings(mapping_id),
+    CHECK (
+        valid_to IS NULL OR (
+            length(valid_to) = 27
+            AND substr(valid_to, 11, 1) = 'T'
+            AND substr(valid_to, 20, 1) = '.'
+            AND substr(valid_to, 27, 1) = 'Z'
+            AND julianday(valid_to) IS NOT NULL
+            AND valid_to > valid_from
+        )
+    ),
+    CHECK (
+        (version = 1 AND supersedes_mapping_id IS NULL)
+        OR (version > 1 AND supersedes_mapping_id IS NOT NULL)
+    ),
+    UNIQUE (source, entity_type, source_id, version)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS source_mappings_current
-ON source_mappings(source, entity_type, source_id)
-WHERE valid_to IS NULL;
 
 CREATE TABLE IF NOT EXISTS match_versions (
     match_id TEXT NOT NULL REFERENCES matches(match_id),

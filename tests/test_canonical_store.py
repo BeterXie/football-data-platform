@@ -10,6 +10,7 @@ from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import CompetitionId, RawAssetId, SeasonId
 from football_data_platform.domain.models import CollectionAttemptOutcome, MatchStatus
 from football_data_platform.storage.canonical import (
+    SCHEMA_VERSION,
     CanonicalConflictError,
     CanonicalStore,
 )
@@ -293,7 +294,7 @@ def test_initialize_migrates_v1_match_versions_and_collection_attempts(
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 6
+            == SCHEMA_VERSION
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(match_versions)")}
         assert "round_name" in columns
@@ -367,7 +368,7 @@ def test_initialize_migrates_v2_attempt_source_id_from_raw_asset(tmp_path: Path)
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 6
+            == SCHEMA_VERSION
         )
         row = connection.execute(
             "SELECT source_id FROM collection_attempts "
@@ -395,7 +396,7 @@ def test_initialize_migrates_v4_to_official_lineup_contract_schema(tmp_path: Pat
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 6
+            == SCHEMA_VERSION
         )
         columns = {
             row["name"]
@@ -523,7 +524,7 @@ def test_initialize_rebuilds_real_v5_official_contract_table_without_losing_lega
         contract_count = connection.execute(
             "SELECT COUNT(*) FROM official_lineup_contracts"
         ).fetchone()[0]
-    assert version == 6
+    assert version == SCHEMA_VERSION
     assert tuple(row) == (
         "official-lineup-contract:legacy",
         "raw-asset:legacy",
@@ -642,7 +643,7 @@ def test_initialize_rebuilds_v3_prematch_events_with_v4_constraints(
     with store.connect() as connection:
         assert (
             connection.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone()[0]
-            == 6
+            == SCHEMA_VERSION
         )
         rows = connection.execute(
             "SELECT record_id, match_id, match_version, team_id, player_id, event_type, "

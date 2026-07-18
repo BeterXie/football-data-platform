@@ -17,13 +17,20 @@
 迁移、标签、时间和 manifest 修改的深回归尚未取得一次统一通过记录；此前分组测试只能证明对应
 局部合同。最终测试数量和全量质量门禁结果须在全部修改落定后重新运行并归档，不在计划正文写死。
 
-canonical 数据库已升级到 schema v6。官方阵容来源使用 JSON schema 2（parser
-`official-lineup-json/1`）和 canonical official-lineup contract v2：raw 在解析前归档，来源比赛、
-球队和 22 个来源球员绑定到平台 ID，双方首发、精确 `fact_evidence` 和 content-addressed contract
-在同一事务写入。重放会重新解析 RawArchive 字节并核对当前映射、双方 11 人及 22 条 canonical
-starter facts；legacy contract v1 和 DTO 写入路径均不能重新认证正式阵容。FBref match-report
-contract 同样会从 raw 重放 parser、比赛身份、90 分钟赛果和生产表集合，summary-only preview
-不能满足完整报告门禁。
+canonical 数据库已通过原子迁移升级到 schema v7。source mapping 现在保存稳定 `mapping_id`、
+单调版本、创建者、被替代映射和 UTC 半开有效区间；当前版本唯一、实体类型、版本连续性、区间
+不重叠、只允许关闭当前版本及历史不可删除等规则由 SQL 约束和 trigger 强制执行。冲突、修订
+事件、人工决定、证据和同组候选作废标记均为 append-only；`revise_source_mapping` 以预期当前
+`mapping_id` 执行 CAS，并对完全相同的人工 override 幂等。`resolve_source_mapping` 可按显式版本或
+`as_of` 重放历史；未映射或低置信度候选可进入持久化冲突队列。这只是 R02 的第一切片，现有下游
+合同尚未精确 pin `mapping_id`/version，也尚未完成跨源生产解析、重资格化和重算闭环。
+
+官方阵容来源使用 JSON schema 2（parser `official-lineup-json/1`）和 canonical official-lineup
+contract v2：raw 在解析前归档，来源比赛、球队和 22 个来源球员绑定到平台 ID，双方首发、精确
+`fact_evidence` 和 content-addressed contract 在同一事务写入。重放会重新解析 RawArchive 字节并
+核对按 `observed_at` 取得的映射、双方 11 人及 22 条 canonical starter facts；legacy contract v1
+和 DTO 写入路径均不能重新认证正式阵容。FBref match-report contract 同样会从 raw 重放 parser、
+比赛身份、90 分钟赛果和生产表集合，summary-only preview 不能满足完整报告门禁。
 
 正式预测已使用 prediction schema v4 和 score-grid-composition schema v2。持久化预测的共享
 校验入口会重新加载并校验 snapshot、snapshot manifest、model run、prediction manifest、完整
@@ -113,8 +120,11 @@ dataset 的 train 与 holdout 两条 sample 均因赛前 snapshot/资格不满�
 holdout 都为空。model gate 以 `no_eligible_train_split` 失败，prediction 与 evaluation 均
 unavailable；这不是模型质量、真实市场基准或 ROI 证据，也不证明真实来源全季采集。
 
-以下边界继续保持 Open：R02 映射修订/冲突/override 账本；除 typed result 外其余五类 canonical
-fact 的内容与证据重放 verifier；从来源字节推导比分和 `known_at` 的版本化
+以下边界继续保持 Open：R02 下游 exact `mapping_id`/version pin（当前仅以 `observed_at` 维持
+legacy 稳定性）、aliases/candidate confidence policy、现有 resolver 自动入队整合、player 与
+provider-scoped Football-Data mapping、映射修订后的下游 requalification/recompute，以及完整跨源
+生产验证；除 typed result 外其余五类 canonical fact 的内容与证据重放 verifier；从来源字节推导
+比分和 `known_at` 的版本化
 `result-observation/parser-normalization` contract；`file-sha256` 引用对应文件字节的定位和复验；
 operator-owned、versioned `SourceRegistry`，以及行级 schedule `known_at` 元数据的生产签发与审计；
 snapshot completeness vNext；结构化球队/球员单场观察与画像独立重算；comparison 创建 CLI；
@@ -179,12 +189,18 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
 
 ### FDP-R02：Football-Data 与 FBref 跨源身份分裂
 
-- 严重度：P1；状态：Open。
-- 当前实现证据：当前 source mapping 表保存来源、来源 ID、平台 ID、有效时间、匹配规则、置信度
-  和审计备注；fallback 解析路径要求复用注册球队和已映射比赛，Football-Data 赔率列不会进入
-  模型输入。
-- 剩余缺口：存储层没有关闭当前映射并创建 revision 的受控 API，也没有持久化冲突队列、人工
-  override 的理由/证据账本和按旧版本重算能力；现有冲突主要直接失败，不能满足完整修订审计。
+- 严重度：P1；状态：Open（schema v7 版本化映射与审计存储第一切片已实现；跨源生产闭环未完成）。
+- 当前实现证据：schema v7 以原子迁移把 source mapping 升级为稳定 `mapping_id`、单调 version、
+  `created_by`、`supersedes_mapping_id` 和 UTC 半开有效区间。SQL 约束、唯一索引和 trigger 会拒绝
+  错误实体类型、版本跳跃、重叠区间、多个 current、越权更新/删除及不完整修订。冲突、revision
+  event、decision、evidence 和 sibling obsoletion 均追加写入；未映射或低置信度候选可排入持久化
+  队列。受控人工 override 使用 expected-current `mapping_id` 做 CAS，对完全相同的重试幂等，并
+  保留理由、操作者和证据。resolver 支持 current、显式 version 和 UTC `as_of` 历史重放。fallback
+  解析路径仍要求复用注册球队和已映射比赛，Football-Data 赔率列不会进入模型输入。
+- 剩余缺口：下游 contract 尚未精确 pin `mapping_id`/version，当前只靠 `observed_at` 保持 legacy
+  映射稳定；aliases 与 candidate confidence policy 尚未形成版本化契约，现有 resolver 也未自动
+  整合冲突入队。player mapping、provider-scoped Football-Data ID 解析、映射修订后的 downstream
+  requalification/recompute、既有重复数据迁移以及完整跨源生产验证仍未完成。
 - 设计依据：总体设计第 7、17 节；ADR-0015、ADR-0017、ADR-0022。
 - 初始复现/根因：Football-Data 适配器由展示名生成来源实体，下游直接创建球队和比赛，未先解析
   带审计的来源映射，因此同一球队和比赛被重复建档。
@@ -192,8 +208,10 @@ paper ledger 的 prediction capture mode 持久化与 prospective ROI 分层；�
   fallback 赛程/赛果必须复用已解析的球队、比赛及比赛版本，改期不创建新 `match_id`。
 - 依赖顺序：先稳定映射契约和数据库唯一/外键约束，再迁移适配器和既有重复数据。
 - 明确非目标：不依靠模糊名称在下游自动合并；不让 Football-Data 赔率或统计进入模型。
-- 验收测试/证据：先导入 FBref 的 2 队/2 场，再导入对应 fallback，canonical 数量不增加且
-  赛果挂到原比赛；低置信度、同名和冲突映射进入人工复核并保留诊断。
+- 验收测试/证据：当前负向测试已覆盖 schema v7 原子迁移、版本/区间/append-only SQL 约束、
+  unmapped/低置信度冲突入队、CAS/幂等人工修订、sibling obsolete 和按 version/`as_of` 重放。完整
+  验收仍须先导入 FBref 的 2 队/2 场，再导入 provider-scoped Football-Data fallback，证明 canonical
+  数量不增加、赛果挂到原比赛，且修订后下游按精确映射版本重新资格判定和重算。
 - 完成定义：所有 downstream join 使用 platform ID；重复导入幂等；修订映射可重算并保留
   旧版本及审计证据。
 

@@ -1078,6 +1078,7 @@ def verify_official_lineup_contract(
     mapped_match_id = canonical.mapped_match_ids(
         source=parsed.match_mapping_source,
         source_ids=(parsed.source_match_id,),
+        as_of=contract.observed_at,
     ).get(parsed.source_match_id)
     if mapped_match_id != contract.match_id:
         raise ValueError("official lineup replay match mapping conflicts with its contract")
@@ -1091,12 +1092,14 @@ def verify_official_lineup_contract(
         team = canonical.mapped_team(
             source=parsed.team_mapping_source,
             source_id=parsed_team.source_team_id,
+            as_of=contract.observed_at,
         )
         players: list[PlayerId] = []
         for player in parsed_team.starters:
             player_id = canonical.mapped_player(
                 source=parsed.player_mapping_source,
                 source_id=player.source_player_id,
+                as_of=contract.observed_at,
             ).id
             players.append(player_id)
             replayed_bindings.append(

@@ -619,6 +619,64 @@ def test_successful_manifest_replays_match_report_contract_on_load(
         archive.load_artifact_manifest(manifest.artifact_id)
 
 
+def test_match_report_manifest_replays_mapping_visible_at_contract_observation(
+    tmp_path: Path,
+) -> None:
+    _, _, canonical, archive, manifest, contract = _persisted_match_report_manifest(tmp_path)
+    current = canonical.resolve_source_mapping(
+        source="fbref-schedule",
+        entity_type="match",
+        source_id=contract.source_match_id,
+    )
+    candidate = next(
+        match_id
+        for match_id in canonical.match_ids_for_season(SeasonId("season:eng.1.2025-26"))
+        if match_id != contract.match_id
+    )
+    proposed_at = contract.observed_at + timedelta(minutes=1)
+    conflict = canonical.propose_source_mapping(
+        source="fbref-schedule",
+        entity_type="match",
+        source_id=contract.source_match_id,
+        candidate_entity_id=candidate,
+        proposed_at=proposed_at,
+        actor="resolver:test",
+        reason="later match identity candidate",
+        evidence_refs=("raw-asset:later-match-candidate",),
+    )
+    canonical.revise_source_mapping(
+        source="fbref-schedule",
+        entity_type="match",
+        source_id=contract.source_match_id,
+        conflict_id=conflict.conflict_id,  # type: ignore[union-attr]
+        expected_current_mapping_id=current.mapping_id,
+        candidate_entity_id=candidate,
+        effective_at=proposed_at + timedelta(minutes=1),
+        actor="operator:test",
+        reason="accepted later match identity",
+        evidence_refs=("ticket:later-match-review",),
+    )
+
+    assert (
+        canonical.resolve_source_mapping(
+            source="fbref-schedule",
+            entity_type="match",
+            source_id=contract.source_match_id,
+        ).entity_id
+        == candidate
+    )
+    assert (
+        canonical.resolve_source_mapping(
+            source="fbref-schedule",
+            entity_type="match",
+            source_id=contract.source_match_id,
+            as_of=contract.observed_at,
+        ).entity_id
+        == contract.match_id
+    )
+    assert archive.load_artifact_manifest(manifest.artifact_id) == manifest
+
+
 @pytest.mark.parametrize("tamper", ("current_mapping", "canonical_fact"))
 def test_successful_manifest_replays_official_lineup_contract_on_load(
     tmp_path: Path,
@@ -628,6 +686,7 @@ def test_successful_manifest_replays_official_lineup_contract_on_load(
 
     with canonical.connect() as connection:
         if tamper == "current_mapping":
+            connection.execute("DROP TRIGGER source_mappings_no_delete")
             connection.execute(
                 "DELETE FROM source_mappings WHERE source = ? AND entity_type = 'player' "
                 "AND source_id = ? AND valid_to IS NULL",
@@ -641,6 +700,65 @@ def test_successful_manifest_replays_official_lineup_contract_on_load(
 
     with pytest.raises(ArchiveConflictError, match="input reference is unavailable or invalid"):
         archive.load_artifact_manifest(manifest.artifact_id)
+
+
+def test_official_lineup_manifest_replays_mapping_visible_at_contract_observation(
+    tmp_path: Path,
+) -> None:
+    canonical, archive, manifest, contract, source = _persisted_official_lineup_manifest(tmp_path)
+    binding = contract.source_bindings[0]
+    candidate = canonical.resolve_or_create_player(
+        source="review-candidate",
+        source_id="later-player-identity",
+        canonical_name="Later Player Identity",
+        observed_at=contract.observed_at + timedelta(seconds=1),
+        raw_asset_id=contract.raw_asset_id,
+    )
+    current = canonical.resolve_source_mapping(
+        source=source,
+        entity_type="player",
+        source_id=binding.source_player_id,
+    )
+    proposed_at = contract.observed_at + timedelta(minutes=1)
+    conflict = canonical.propose_source_mapping(
+        source=source,
+        entity_type="player",
+        source_id=binding.source_player_id,
+        candidate_entity_id=candidate.id,
+        proposed_at=proposed_at,
+        actor="resolver:test",
+        reason="later player identity candidate",
+        evidence_refs=("raw-asset:later-player-candidate",),
+    )
+    canonical.revise_source_mapping(
+        source=source,
+        entity_type="player",
+        source_id=binding.source_player_id,
+        conflict_id=conflict.conflict_id,  # type: ignore[union-attr]
+        expected_current_mapping_id=current.mapping_id,
+        candidate_entity_id=candidate.id,
+        effective_at=proposed_at + timedelta(minutes=1),
+        actor="operator:test",
+        reason="accepted later player identity",
+        evidence_refs=("ticket:later-player-review",),
+    )
+
+    assert (
+        canonical.mapped_player(
+            source=source,
+            source_id=binding.source_player_id,
+        ).id
+        == candidate.id
+    )
+    assert (
+        canonical.mapped_player(
+            source=source,
+            source_id=binding.source_player_id,
+            as_of=contract.observed_at,
+        ).id
+        == binding.player_id
+    )
+    assert archive.load_artifact_manifest(manifest.artifact_id) == manifest
 
 
 @pytest.mark.parametrize("tamper", ("goals", "evidence", "raw_bytes"))
