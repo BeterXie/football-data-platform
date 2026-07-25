@@ -7,18 +7,53 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from enum import StrEnum
+from typing import Any, Protocol
 
+from football_data_platform.domain.contributions import (
+    EXPECTED_GOALS_COMPOSITION_VERSION,
+    ContributionCalibration,
+    calibrated_multipliers,
+    contribution_calibration_payload,
+    parse_contribution_calibration,
+    validate_contribution_calibration_policy,
+    validate_snapshot_contribution_policy,
+)
 from football_data_platform.domain.ids import (
     MarketSnapshotId,
     MatchId,
     ModelRunId,
     PredictionId,
+    RawAssetId,
     SnapshotId,
 )
-from football_data_platform.domain.models import require_utc
-from football_data_platform.domain.snapshots import CaptureMode
+from football_data_platform.domain.models import RawAsset, require_utc
+from football_data_platform.domain.snapshots import (
+    CaptureMode,
+    PreMatchSnapshot,
+    SnapshotSourceValidator,
+    verify_current_snapshot,
+    verify_snapshot,
+)
+from football_data_platform.domain.training import (
+    ModelRunArtifact,
+    ModelRunStatus,
+    verify_model_run_artifact,
+)
+from football_data_platform.domain.training_qualification import (
+    CURRENT_SCORE_FEATURE_PROJECTION_VERSION,
+)
 from football_data_platform.models.score_grid import DixonColesGrid
+
+PREDICTION_SCHEMA_VERSION = 4
+SCORE_GRID_COMPOSITION_SCHEMA_VERSION = 2
+SCORE_GRID_COMPOSITION_ARTIFACT_TYPE = "score-grid-composition"
+SCORE_GRID_COMPOSITION_CODE_VERSION = "football-data-platform/0.1.0"
+LEGACY_COMPOSITION_VERSION = "legacy-inline/1"
+MARKET_SNAPSHOT_SCHEMA_VERSION = 2
+LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION = 1
+MARKET_PERIOD_90_MINUTES = "90m"
+MAX_ABSOLUTE_MARKET_LINE = 100.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +82,42 @@ class ScoreCell:
 
 
 @dataclass(frozen=True, slots=True)
+class PredictionContribution:
+    """The immutable contribution detail retained by a score prediction.
+
+    ``ExpectedGoalsContribution`` lives in the feature layer.  Predictions
+    intentionally carry this small domain copy so the persisted prediction
+    does not depend on importing or reconstructing feature objects later.
+    """
+
+    contribution_key: str
+    lambda_home_multiplier: float
+    lambda_away_multiplier: float
+    source_ref: str
+    version: str
+    calibration: ContributionCalibration
+
+    def __post_init__(self) -> None:
+        _require_text(self.contribution_key, "contribution_key")
+        _require_text(self.source_ref, "source_ref")
+        _require_text(self.version, "version")
+        for name, value in (
+            ("lambda_home_multiplier", self.lambda_home_multiplier),
+            ("lambda_away_multiplier", self.lambda_away_multiplier),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        validate_contribution_calibration_policy(self)
+        expected_home, expected_away = calibrated_multipliers(self.calibration)
+        if not math.isclose(
+            self.lambda_home_multiplier, expected_home, rel_tol=1e-12, abs_tol=1e-12
+        ) or not math.isclose(
+            self.lambda_away_multiplier, expected_away, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError("prediction multipliers do not match calibration parameters")
+
+
+@dataclass(frozen=True, slots=True)
 class ScorePrediction:
     id: PredictionId
     schema_version: int
@@ -57,6 +128,7 @@ class ScorePrediction:
     model_run_id: ModelRunId
     model_version: str
     generated_at: datetime
+    snapshot_as_of: datetime
     lambda_home: float
     lambda_away: float
     rho: float
@@ -65,6 +137,31 @@ class ScorePrediction:
     markets: tuple[MarketView, ...]
     normalization_residual: float
     input_refs: tuple[str, ...]
+    baseline_lambda_home: float | None = None
+    baseline_lambda_away: float | None = None
+    contribution_keys: tuple[str, ...] = ()
+    contribution_multipliers: tuple[PredictionContribution, ...] = ()
+    composition_version: str = EXPECTED_GOALS_COMPOSITION_VERSION
+    calibration_versions: tuple[str, ...] = ()
+    composition_artifact_ref: str | None = None
+
+    @property
+    def contributions(self) -> tuple[PredictionContribution, ...]:
+        """Compatibility alias for callers that use the feature terminology."""
+
+        return self.contribution_multipliers
+
+    @property
+    def composition_ref(self) -> str | None:
+        """Short alias used by report and registry consumers."""
+
+        return self.composition_artifact_ref
+
+    @property
+    def grid_artifact_ref(self) -> str | None:
+        """The composition artifact contains the canonical Dixon-Coles grid."""
+
+        return self.composition_artifact_ref
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +177,39 @@ class MatchResult90:
             raise ValueError("goals must not be negative")
         require_utc(self.known_at, "known_at")
         _require_text(self.source_ref, "source_ref")
+
+
+class MarketDataKind(StrEnum):
+    REAL = "real"
+    SYNTHETIC = "synthetic"
+
+
+class MarketStatus(StrEnum):
+    OPEN = "open"
+    SUSPENDED = "suspended"
+    CLOSED = "closed"
+
+
+class MarketSourceValidator(Protocol):
+    def load(self, asset_id: RawAssetId) -> RawAsset: ...
+
+    def verify(self, asset: RawAsset | RawAssetId) -> None: ...
+
+
+class PersistedPredictionContextValidator(Protocol):
+    """Authority that replays a formal prediction with its exact snapshot."""
+
+    def load_verified_prediction_context(
+        self, reference: str
+    ) -> tuple[ScorePrediction, PreMatchSnapshot]: ...
+
+
+class ModelRunValidator(Protocol):
+    def load_model_run(self, model_run_id: str) -> ModelRunArtifact: ...
+
+
+class MatchResultValidator(Protocol):
+    def verify_match_result(self, result: MatchResult90) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,26 +230,160 @@ class MarketSnapshot:
     match_id: MatchId
     source: str
     market_type: str
+    status: MarketStatus
+    data_kind: MarketDataKind
     observed_at: datetime
     quotes: tuple[MarketQuote, ...]
     raw_asset_ref: str
+    period: str | None = None
+    line: float | None = None
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version
+            not in {LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION, MARKET_SNAPSHOT_SCHEMA_VERSION}
+        ):
+            raise ValueError(f"unsupported market snapshot schema_version {self.schema_version!r}")
         _require_text(self.source, "source")
         _require_text(self.market_type, "market_type")
-        _require_text(self.raw_asset_ref, "raw_asset_ref")
+        if not isinstance(self.status, MarketStatus):
+            raise TypeError("status must be a MarketStatus")
+        if not isinstance(self.data_kind, MarketDataKind):
+            raise TypeError("data_kind must be a MarketDataKind")
+        RawAssetId(self.raw_asset_ref)
         require_utc(self.observed_at, "observed_at")
+        if not self.quotes or any(not isinstance(quote, MarketQuote) for quote in self.quotes):
+            raise ValueError("market snapshot requires market quotes")
         outcomes = [quote.outcome for quote in self.quotes]
         if len(outcomes) != len(set(outcomes)):
             raise ValueError("market snapshot contains duplicate outcomes")
+        if self.schema_version == LEGACY_MARKET_SNAPSHOT_SCHEMA_VERSION:
+            if self.period is not None or self.line is not None:
+                raise ValueError("legacy market snapshots cannot contain period or line")
+            return
+        if self.period != MARKET_PERIOD_90_MINUTES:
+            raise ValueError("formal market snapshots require period='90m'")
+        _validate_market_snapshot_line(self.market_type, self.line)
+
+
+class MarketSnapshotValidator(Protocol):
+    """Authority that loads a fully verified persisted market snapshot.
+
+    Implementations must validate the complete semantic snapshot, including
+    its raw lineage, before returning it.  Callers still compare the returned
+    object with their candidate so an ID cannot authorize different content.
+    """
+
+    def load_verified_market_snapshot(self, snapshot_id: str) -> MarketSnapshot: ...
+
+
+def build_market_snapshot(
+    *,
+    match_id: MatchId,
+    market_type: str,
+    status: MarketStatus,
+    data_kind: MarketDataKind,
+    quotes: tuple[MarketQuote, ...],
+    raw_asset: RawAsset,
+    period: str = MARKET_PERIOD_90_MINUTES,
+    line: float | None = None,
+) -> MarketSnapshot:
+    """Build an immutable market document whose metadata cites one raw observation."""
+
+    if not isinstance(raw_asset, RawAsset):
+        raise TypeError("raw_asset must be a RawAsset")
+    fields = {
+        "match_id": match_id,
+        "source": raw_asset.source,
+        "market_type": market_type,
+        "status": status,
+        "data_kind": data_kind,
+        "observed_at": raw_asset.observed_at,
+        "quotes": quotes,
+        "raw_asset_ref": raw_asset.id.value,
+        "period": period,
+        "line": line,
+    }
+    identity = _market_snapshot_identity(
+        schema_version=MARKET_SNAPSHOT_SCHEMA_VERSION,
+        **fields,
+    )
+    digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
+    return MarketSnapshot(
+        id=MarketSnapshotId(f"market-snapshot:{digest}"),
+        schema_version=MARKET_SNAPSHOT_SCHEMA_VERSION,
+        **fields,
+    )
+
+
+def verify_market_snapshot(
+    snapshot: MarketSnapshot,
+    *,
+    source_validator: MarketSourceValidator,
+) -> None:
+    """Verify immutable raw lineage and the content-derived market identity."""
+
+    raw_asset_id = RawAssetId(snapshot.raw_asset_ref)
+    try:
+        source_validator.verify(raw_asset_id)
+        raw_asset = source_validator.load(raw_asset_id)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("market snapshot raw evidence is unavailable or invalid") from error
+    if (
+        raw_asset.id != raw_asset_id
+        or raw_asset.source != snapshot.source
+        or raw_asset.observed_at != snapshot.observed_at
+    ):
+        raise ValueError("market snapshot source metadata does not match raw evidence")
+    identity = _market_snapshot_identity(
+        schema_version=snapshot.schema_version,
+        match_id=snapshot.match_id,
+        source=snapshot.source,
+        market_type=snapshot.market_type,
+        status=snapshot.status,
+        data_kind=snapshot.data_kind,
+        observed_at=snapshot.observed_at,
+        quotes=snapshot.quotes,
+        raw_asset_ref=snapshot.raw_asset_ref,
+        period=snapshot.period,
+        line=snapshot.line,
+    )
+    digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
+    if snapshot.id != MarketSnapshotId(f"market-snapshot:{digest}"):
+        raise ValueError("market snapshot identity does not match its canonical content")
+
+
+def verify_authoritative_market_snapshot(
+    snapshot: MarketSnapshot,
+    *,
+    validator: MarketSnapshotValidator,
+) -> None:
+    """Require an exact snapshot returned by an authoritative semantic store."""
+
+    if not isinstance(snapshot, MarketSnapshot):
+        raise TypeError("snapshot must be a MarketSnapshot")
+    try:
+        load_verified = validator.load_verified_market_snapshot
+    except AttributeError as error:
+        raise ValueError(
+            "market snapshot validator does not provide authoritative semantic lookup"
+        ) from error
+    try:
+        stored = load_verified(snapshot.id.value)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("authoritative market snapshot is unavailable or invalid") from error
+    if not isinstance(stored, MarketSnapshot):
+        raise ValueError("authoritative market snapshot validator returned an invalid record")
+    if stored != snapshot:
+        raise ValueError("market snapshot does not match its authoritative record")
 
 
 def build_score_prediction(
     *,
-    match_id: MatchId,
-    snapshot_id: SnapshotId,
-    capture_mode: CaptureMode,
-    snapshot_quality_status: str,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
     model_run_id: ModelRunId,
     model_version: str,
     generated_at: datetime,
@@ -128,13 +392,99 @@ def build_score_prediction(
     rho: float,
     max_goals: int,
     input_refs: tuple[str, ...],
+    model_run_validator: ModelRunValidator | None = None,
+    expected_goals: Any | None = None,
+    composition: Any | None = None,
+    composition_artifact_ref: str | None = None,
+    calibration_versions: tuple[str, ...] | None = None,
 ) -> ScorePrediction:
-    """Build the one score distribution consumed by every football market view."""
+    """Build the one score distribution consumed by every football market view.
 
+    ``expected_goals`` (or its ``composition`` alias) is mandatory because a
+    formal prediction must retain the baseline and every auditable feature
+    contribution.  Historical ``legacy-inline/1`` payloads remain historical
+    bytes; they cannot be used to create a new formal prediction.
+    """
+
+    return _build_score_prediction(
+        snapshot=snapshot,
+        snapshot_validator=snapshot_validator,
+        model_run_id=model_run_id,
+        model_version=model_version,
+        generated_at=generated_at,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
+        rho=rho,
+        max_goals=max_goals,
+        input_refs=input_refs,
+        model_run_validator=model_run_validator,
+        expected_goals=expected_goals,
+        composition=composition,
+        composition_artifact_ref=composition_artifact_ref,
+        calibration_versions=calibration_versions,
+        enforce_current=True,
+    )
+
+
+def _build_score_prediction(
+    *,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
+    model_run_id: ModelRunId,
+    model_version: str,
+    generated_at: datetime,
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    max_goals: int,
+    input_refs: tuple[str, ...],
+    model_run_validator: ModelRunValidator | None,
+    expected_goals: Any | None,
+    composition: Any | None,
+    composition_artifact_ref: str | None,
+    calibration_versions: tuple[str, ...] | None,
+    enforce_current: bool,
+) -> ScorePrediction:
+    if enforce_current:
+        verify_current_snapshot(snapshot, source_validator=snapshot_validator)
+    else:
+        verify_snapshot(snapshot, source_validator=snapshot_validator)
     require_utc(generated_at, "generated_at")
     _require_text(model_version, "model_version")
-    if snapshot_quality_status != "ready":
+    if snapshot.quality_status != "ready":
         raise ValueError("formal score predictions require a ready snapshot")
+    if generated_at < snapshot.as_of:
+        raise ValueError("prediction generated_at cannot precede snapshot as_of")
+    if enforce_current and generated_at >= snapshot.scheduled_kickoff_used:
+        raise ValueError(
+            "formal prediction generated_at must precede snapshot scheduled_kickoff_used"
+        )
+    if expected_goals is not None and composition is not None:
+        raise ValueError("pass only one of expected_goals or composition")
+    expected_goals = expected_goals if expected_goals is not None else composition
+    (
+        baseline_lambda_home,
+        baseline_lambda_away,
+        contribution_keys,
+        contribution_multipliers,
+        composition_version,
+        resolved_calibration_versions,
+        composition_input_refs,
+    ) = _prediction_composition_metadata(
+        expected_goals,
+        lambda_home=lambda_home,
+        lambda_away=lambda_away,
+        calibration_versions=calibration_versions,
+    )
+    _verify_prediction_composition_sources(
+        snapshot,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contributions=contribution_multipliers,
+    )
+    normalized_input_refs = tuple(
+        sorted({*input_refs, snapshot.id.value, model_run_id.value, *composition_input_refs})
+    )
     grid = DixonColesGrid(lambda_home, lambda_away, rho=rho, max_goals=max_goals)
     result = grid.result_probabilities()
     handicap = grid.handicap_probabilities(-1)
@@ -145,15 +495,44 @@ def build_score_prediction(
         _market_view("total_goals", "0-6,7+", totals),
     )
     cells = tuple(ScoreCell(**cell) for cell in grid.score_cells())
+    composition_payload = _score_grid_composition_payload_from_values(
+        match_id=snapshot.match_id,
+        snapshot_id=snapshot.id,
+        model_run_id=model_run_id,
+        model_version=model_version,
+        generated_at=generated_at,
+        snapshot_as_of=snapshot.as_of,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contribution_keys=contribution_keys,
+        contribution_multipliers=contribution_multipliers,
+        composition_version=composition_version,
+        calibration_versions=resolved_calibration_versions,
+        lambda_home=grid.lambda_home,
+        lambda_away=grid.lambda_away,
+        rho=grid.rho,
+        max_goals=grid.max_goals,
+        normalization_residual=grid.normalization_residual,
+        score_cells=cells,
+        input_refs=normalized_input_refs,
+    )
+    expected_composition_ref = score_grid_composition_artifact_id(composition_payload)
+    if (
+        composition_artifact_ref is not None
+        and composition_artifact_ref != expected_composition_ref
+    ):
+        raise ValueError("composition_artifact_ref does not match its content")
+    composition_artifact_ref = expected_composition_ref
     payload = {
-        "schema_version": 1,
-        "match_id": match_id.value,
-        "snapshot_id": snapshot_id.value,
-        "capture_mode": capture_mode.value,
-        "snapshot_quality_status": snapshot_quality_status,
+        "schema_version": PREDICTION_SCHEMA_VERSION,
+        "match_id": snapshot.match_id.value,
+        "snapshot_id": snapshot.id.value,
+        "capture_mode": snapshot.capture_mode.value,
+        "snapshot_quality_status": snapshot.quality_status,
         "model_run_id": model_run_id.value,
         "model_version": model_version,
         "generated_at": _timestamp(generated_at),
+        "snapshot_as_of": _timestamp(snapshot.as_of),
         "lambda_home": grid.lambda_home,
         "lambda_away": grid.lambda_away,
         "rho": grid.rho,
@@ -161,19 +540,29 @@ def build_score_prediction(
         "score_cells": [_score_cell_payload(cell) for cell in cells],
         "markets": [_market_payload(market) for market in markets],
         "normalization_residual": grid.normalization_residual,
-        "input_refs": sorted(set(input_refs)),
+        "input_refs": list(normalized_input_refs),
+        "baseline_lambda_home": baseline_lambda_home,
+        "baseline_lambda_away": baseline_lambda_away,
+        "contribution_keys": list(contribution_keys),
+        "contribution_multipliers": [
+            _prediction_contribution_payload(item) for item in contribution_multipliers
+        ],
+        "composition_version": composition_version,
+        "calibration_versions": list(resolved_calibration_versions),
+        "composition_artifact_ref": composition_artifact_ref,
     }
     digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
-    return ScorePrediction(
+    prediction = ScorePrediction(
         id=PredictionId(f"prediction:{digest}"),
-        schema_version=1,
-        match_id=match_id,
-        snapshot_id=snapshot_id,
-        capture_mode=capture_mode,
-        snapshot_quality_status=snapshot_quality_status,
+        schema_version=PREDICTION_SCHEMA_VERSION,
+        match_id=snapshot.match_id,
+        snapshot_id=snapshot.id,
+        capture_mode=snapshot.capture_mode,
+        snapshot_quality_status=snapshot.quality_status,
         model_run_id=model_run_id,
         model_version=model_version,
         generated_at=generated_at,
+        snapshot_as_of=snapshot.as_of,
         lambda_home=grid.lambda_home,
         lambda_away=grid.lambda_away,
         rho=grid.rho,
@@ -181,7 +570,121 @@ def build_score_prediction(
         score_cells=cells,
         markets=markets,
         normalization_residual=grid.normalization_residual,
-        input_refs=tuple(sorted(set(input_refs))),
+        input_refs=normalized_input_refs,
+        baseline_lambda_home=baseline_lambda_home,
+        baseline_lambda_away=baseline_lambda_away,
+        contribution_keys=contribution_keys,
+        contribution_multipliers=contribution_multipliers,
+        composition_version=composition_version,
+        calibration_versions=resolved_calibration_versions,
+        composition_artifact_ref=composition_artifact_ref,
+    )
+    verify_score_prediction(prediction, model_run_validator=model_run_validator)
+    if enforce_current and model_run_validator is not None:
+        _verify_current_score_projection(prediction, model_run_validator)
+    return prediction
+
+
+def verify_score_prediction(
+    prediction: ScorePrediction,
+    *,
+    model_run_validator: ModelRunValidator | None = None,
+) -> None:
+    """Rebuild the canonical grid and verify the prediction content identity."""
+
+    if not isinstance(prediction, ScorePrediction):
+        raise TypeError("prediction must be a ScorePrediction")
+    if prediction.schema_version != PREDICTION_SCHEMA_VERSION:
+        raise ValueError(f"unsupported prediction schema_version {prediction.schema_version!r}")
+    if not isinstance(prediction.id, PredictionId):
+        raise TypeError("prediction id must be a PredictionId")
+    if not isinstance(prediction.match_id, MatchId):
+        raise TypeError("prediction match_id must be a MatchId")
+    if not isinstance(prediction.snapshot_id, SnapshotId):
+        raise TypeError("prediction snapshot_id must be a SnapshotId")
+    if not isinstance(prediction.model_run_id, ModelRunId):
+        raise TypeError("prediction model_run_id must be a ModelRunId")
+    if not isinstance(prediction.capture_mode, CaptureMode):
+        raise TypeError("prediction capture_mode must be a CaptureMode")
+    require_utc(prediction.generated_at, "prediction generated_at")
+    require_utc(prediction.snapshot_as_of, "prediction snapshot_as_of")
+    if prediction.generated_at < prediction.snapshot_as_of:
+        raise ValueError("prediction generated_at cannot precede snapshot_as_of")
+    if prediction.snapshot_quality_status != "ready":
+        raise ValueError("formal score prediction must cite a ready snapshot")
+    _require_text(prediction.model_version, "model_version")
+    if (
+        prediction.input_refs != tuple(sorted(set(prediction.input_refs)))
+        or prediction.snapshot_id.value not in prediction.input_refs
+        or any(not isinstance(item, str) or not item for item in prediction.input_refs)
+    ):
+        raise ValueError("prediction input_refs must be unique, sorted, and cite the snapshot")
+    _verify_prediction_composition_metadata(prediction)
+
+    grid = DixonColesGrid(
+        prediction.lambda_home,
+        prediction.lambda_away,
+        rho=prediction.rho,
+        max_goals=prediction.max_goals,
+    )
+    expected_cells = tuple(ScoreCell(**cell) for cell in grid.score_cells())
+    expected_markets = (
+        _market_view("result_90", None, grid.result_probabilities()),
+        _market_view("home_handicap_3way", "-1", grid.handicap_probabilities(-1)),
+        _market_view("total_goals", "0-6,7+", grid.total_goals_probabilities()),
+    )
+    if prediction.score_cells != expected_cells:
+        raise ValueError("prediction score cells do not match its Dixon-Coles grid")
+    if prediction.markets != expected_markets:
+        raise ValueError("prediction market views do not match its Dixon-Coles grid")
+    if prediction.normalization_residual != grid.normalization_residual:
+        raise ValueError("prediction normalization residual does not match its grid")
+
+    payload = prediction_payload(prediction)
+    payload.pop("id")
+    digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+    if prediction.id != PredictionId(f"prediction:{digest}"):
+        raise ValueError("prediction identity does not match its canonical content")
+    composition_payload = score_grid_composition_payload(prediction)
+    expected_composition_ref = score_grid_composition_artifact_id(composition_payload)
+    if prediction.composition_artifact_ref != expected_composition_ref:
+        raise ValueError("prediction composition artifact reference does not match its content")
+    if model_run_validator is not None:
+        _verify_prediction_model_run(prediction, model_run_validator)
+
+
+def verify_prediction_snapshot(
+    prediction: ScorePrediction,
+    *,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
+    model_run_validator: ModelRunValidator | None = None,
+) -> None:
+    """Verify a formal prediction against its validated prematch snapshot."""
+
+    verify_snapshot(snapshot, source_validator=snapshot_validator)
+    verify_score_prediction(prediction, model_run_validator=model_run_validator)
+    if model_run_validator is not None:
+        _verify_current_score_projection(prediction, model_run_validator)
+    if prediction.snapshot_id != snapshot.id:
+        raise ValueError("prediction snapshot_id does not match the validated snapshot")
+    if prediction.match_id != snapshot.match_id:
+        raise ValueError("prediction match_id does not match the validated snapshot")
+    if prediction.snapshot_as_of != snapshot.as_of:
+        raise ValueError("prediction snapshot_as_of does not match the validated snapshot")
+    if prediction.capture_mode != snapshot.capture_mode:
+        raise ValueError("prediction capture_mode does not match the validated snapshot")
+    if prediction.snapshot_quality_status != snapshot.quality_status:
+        raise ValueError("prediction quality does not match the validated snapshot")
+    if prediction.generated_at >= snapshot.scheduled_kickoff_used:
+        raise ValueError(
+            "formal prediction generated_at must precede snapshot scheduled_kickoff_used"
+        )
+    _verify_prediction_composition_sources(
+        snapshot,
+        baseline_lambda_home=prediction.baseline_lambda_home,
+        baseline_lambda_away=prediction.baseline_lambda_away,
+        contributions=prediction.contribution_multipliers,
     )
 
 
@@ -196,6 +699,7 @@ def prediction_payload(prediction: ScorePrediction) -> dict[str, Any]:
         "model_run_id": prediction.model_run_id.value,
         "model_version": prediction.model_version,
         "generated_at": _timestamp(prediction.generated_at),
+        "snapshot_as_of": _timestamp(prediction.snapshot_as_of),
         "lambda_home": prediction.lambda_home,
         "lambda_away": prediction.lambda_away,
         "rho": prediction.rho,
@@ -204,20 +708,65 @@ def prediction_payload(prediction: ScorePrediction) -> dict[str, Any]:
         "markets": [_market_payload(market) for market in prediction.markets],
         "normalization_residual": prediction.normalization_residual,
         "input_refs": list(prediction.input_refs),
+        "baseline_lambda_home": prediction.baseline_lambda_home,
+        "baseline_lambda_away": prediction.baseline_lambda_away,
+        "contribution_keys": list(prediction.contribution_keys),
+        "contribution_multipliers": [
+            _prediction_contribution_payload(item) for item in prediction.contribution_multipliers
+        ],
+        "composition_version": prediction.composition_version,
+        "calibration_versions": list(prediction.calibration_versions),
+        "composition_artifact_ref": prediction.composition_artifact_ref,
     }
 
 
-def parse_prediction_payload(payload: dict[str, Any]) -> ScorePrediction:
+def parse_prediction_payload(
+    payload: dict[str, Any],
+    *,
+    snapshot: PreMatchSnapshot,
+    snapshot_validator: SnapshotSourceValidator,
+    model_run_validator: ModelRunValidator | None = None,
+) -> ScorePrediction:
     """Validate one prediction document; mixed or unknown schemas fail explicitly."""
 
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != PREDICTION_SCHEMA_VERSION:
         raise ValueError(f"unsupported prediction schema_version {payload.get('schema_version')!r}")
     try:
-        prediction = build_score_prediction(
-            match_id=MatchId(str(payload["match_id"])),
-            snapshot_id=SnapshotId(str(payload["snapshot_id"])),
-            capture_mode=CaptureMode(str(payload["capture_mode"])),
-            snapshot_quality_status=str(payload["snapshot_quality_status"]),
+        contribution_payloads = payload.get("contribution_multipliers", ())
+        if not isinstance(contribution_payloads, (list, tuple)):
+            raise ValueError("contribution_multipliers must be a sequence")
+        from football_data_platform.features.contributions import (
+            ExpectedGoals,
+            ExpectedGoalsContribution,
+        )
+
+        contributions = tuple(
+            ExpectedGoalsContribution(
+                contribution_key=str(item["contribution_key"]),
+                lambda_home_multiplier=float(item["lambda_home_multiplier"]),
+                lambda_away_multiplier=float(item["lambda_away_multiplier"]),
+                source_ref=str(item["source_ref"]),
+                version=str(item["version"]),
+                calibration=parse_contribution_calibration(item["calibration"]),
+            )
+            for item in contribution_payloads
+        )
+        expected_goals = ExpectedGoals(
+            lambda_home=float(payload["lambda_home"]),
+            lambda_away=float(payload["lambda_away"]),
+            contribution_keys=tuple(str(item) for item in payload["contribution_keys"]),
+            input_refs=tuple(
+                str(item) for contribution in contributions for item in (contribution.source_ref,)
+            ),
+            baseline_lambda_home=float(payload["baseline_lambda_home"]),
+            baseline_lambda_away=float(payload["baseline_lambda_away"]),
+            composition_version=str(payload["composition_version"]),
+            contributions=contributions,
+            calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
+        )
+        prediction = _build_score_prediction(
+            snapshot=snapshot,
+            snapshot_validator=snapshot_validator,
             model_run_id=ModelRunId(str(payload["model_run_id"])),
             model_version=str(payload["model_version"]),
             generated_at=datetime.fromisoformat(
@@ -228,12 +777,350 @@ def parse_prediction_payload(payload: dict[str, Any]) -> ScorePrediction:
             rho=float(payload["rho"]),
             max_goals=int(payload["max_goals"]),
             input_refs=tuple(str(item) for item in payload["input_refs"]),
+            model_run_validator=model_run_validator,
+            expected_goals=expected_goals,
+            composition=None,
+            composition_artifact_ref=str(payload["composition_artifact_ref"]),
+            calibration_versions=tuple(str(item) for item in payload["calibration_versions"]),
+            enforce_current=False,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid prediction schema: {error}") from error
     if prediction_payload(prediction) != payload:
         raise ValueError("prediction payload does not match its canonical score grid")
     return prediction
+
+
+def _verify_prediction_composition_sources(
+    snapshot: PreMatchSnapshot,
+    *,
+    baseline_lambda_home: float,
+    baseline_lambda_away: float,
+    contributions: tuple[PredictionContribution, ...],
+) -> None:
+    baseline_features = [
+        feature for feature in snapshot.features if feature.name == "team_baseline"
+    ]
+    if len(baseline_features) != 1 or not isinstance(baseline_features[0].value, dict):
+        raise ValueError("formal composition requires one team_baseline snapshot feature")
+    baseline_value = baseline_features[0].value
+    for name, actual, expected in (
+        ("home", baseline_lambda_home, baseline_value.get("lambda_home")),
+        ("away", baseline_lambda_away, baseline_value.get("lambda_away")),
+    ):
+        if (
+            not isinstance(expected, (int, float))
+            or isinstance(expected, bool)
+            or not math.isclose(actual, float(expected), rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            raise ValueError(f"expected-goals {name} baseline does not match the snapshot")
+
+    validate_snapshot_contribution_policy(snapshot, contributions)
+
+
+def _prediction_composition_metadata(
+    expected_goals: Any | None,
+    *,
+    lambda_home: float,
+    lambda_away: float,
+    calibration_versions: tuple[str, ...] | None,
+) -> tuple[
+    float,
+    float,
+    tuple[str, ...],
+    tuple[PredictionContribution, ...],
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    if expected_goals is None:
+        raise ValueError(
+            "formal score predictions require expected_goals composition; "
+            "legacy-inline/1 is read-only"
+        )
+
+    try:
+        baseline_home = float(expected_goals.baseline_lambda_home)
+        baseline_away = float(expected_goals.baseline_lambda_away)
+        raw_keys = tuple(str(item) for item in expected_goals.contribution_keys)
+        raw_contributions = tuple(expected_goals.contributions)
+        composition_version = str(expected_goals.composition_version)
+        raw_input_refs = tuple(str(item) for item in expected_goals.input_refs)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("expected_goals does not satisfy the composition contract") from error
+    if (
+        not math.isfinite(baseline_home)
+        or not math.isfinite(baseline_away)
+        or baseline_home <= 0
+        or baseline_away <= 0
+    ):
+        raise ValueError("expected-goals baseline lambdas must be finite and positive")
+    _require_text(composition_version, "composition_version")
+    if composition_version != EXPECTED_GOALS_COMPOSITION_VERSION:
+        raise ValueError("formal score predictions require expected-goals-composition/2")
+    contributions = tuple(_prediction_contribution(item) for item in raw_contributions)
+    keys = tuple(item.contribution_key for item in contributions)
+    if raw_keys != keys:
+        raise ValueError("expected-goals contribution keys do not match contribution details")
+    if keys != tuple(sorted(set(keys))):
+        raise ValueError("expected-goals contribution keys must be unique and sorted")
+    source_refs = tuple(item.source_ref for item in contributions)
+    input_refs = tuple(sorted(set((*raw_input_refs, *source_refs))))
+    if any(not item for item in input_refs):
+        raise ValueError("expected-goals input refs must be non-empty")
+    composed_home = baseline_home * math.prod(item.lambda_home_multiplier for item in contributions)
+    composed_away = baseline_away * math.prod(item.lambda_away_multiplier for item in contributions)
+    if not math.isclose(composed_home, lambda_home, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("expected-goals home lambda does not match prediction")
+    if not math.isclose(composed_away, lambda_away, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("expected-goals away lambda does not match prediction")
+    contribution_versions = tuple(sorted({item.version for item in contributions}))
+    embedded_calibrations = tuple(
+        sorted(set(tuple(getattr(expected_goals, "calibration_versions", ()))))
+    )
+    if embedded_calibrations != contribution_versions:
+        raise ValueError("expected-goals calibration versions do not match contributions")
+    if calibration_versions is not None and tuple(sorted(set(calibration_versions))) != (
+        contribution_versions
+    ):
+        raise ValueError("calibration_versions do not match contribution calibration versions")
+    resolved_calibration_versions = contribution_versions
+    return (
+        baseline_home,
+        baseline_away,
+        keys,
+        contributions,
+        composition_version,
+        resolved_calibration_versions,
+        input_refs,
+    )
+
+
+def _prediction_contribution(value: Any) -> PredictionContribution:
+    try:
+        return PredictionContribution(
+            contribution_key=str(value.contribution_key),
+            lambda_home_multiplier=float(value.lambda_home_multiplier),
+            lambda_away_multiplier=float(value.lambda_away_multiplier),
+            source_ref=str(value.source_ref),
+            version=str(value.version),
+            calibration=value.calibration,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("invalid expected-goals contribution") from error
+
+
+def _verify_prediction_composition_metadata(prediction: ScorePrediction) -> None:
+    for name, value in (
+        ("baseline_lambda_home", prediction.baseline_lambda_home),
+        ("baseline_lambda_away", prediction.baseline_lambda_away),
+    ):
+        if value is None or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"prediction {name} must be finite and positive")
+    _require_text(prediction.composition_version, "composition_version")
+    if prediction.composition_version != EXPECTED_GOALS_COMPOSITION_VERSION:
+        raise ValueError("formal prediction has an unsupported composition version")
+    if prediction.contribution_keys != tuple(sorted(set(prediction.contribution_keys))):
+        raise ValueError("prediction contribution keys must be unique and sorted")
+    if any(not isinstance(item, str) or not item for item in prediction.contribution_keys):
+        raise ValueError("prediction contribution keys must be non-empty text")
+    if any(
+        not isinstance(item, PredictionContribution) for item in prediction.contribution_multipliers
+    ):
+        raise TypeError("prediction contribution multipliers must be PredictionContribution values")
+    contribution_keys = tuple(item.contribution_key for item in prediction.contribution_multipliers)
+    if contribution_keys != prediction.contribution_keys:
+        raise ValueError("prediction contribution keys do not match multiplier details")
+    if prediction.calibration_versions != tuple(sorted(set(prediction.calibration_versions))):
+        raise ValueError("prediction calibration_versions must be unique and sorted")
+    if any(not isinstance(item, str) or not item for item in prediction.calibration_versions):
+        raise ValueError("prediction calibration_versions must be non-empty text")
+    expected_calibration_versions = tuple(
+        sorted({item.version for item in prediction.contribution_multipliers})
+    )
+    if prediction.calibration_versions != expected_calibration_versions:
+        raise ValueError("prediction calibration versions do not match contribution details")
+    for item in prediction.contribution_multipliers:
+        validate_contribution_calibration_policy(item)
+        PredictionContribution(
+            contribution_key=item.contribution_key,
+            lambda_home_multiplier=item.lambda_home_multiplier,
+            lambda_away_multiplier=item.lambda_away_multiplier,
+            source_ref=item.source_ref,
+            version=item.version,
+            calibration=item.calibration,
+        )
+        if item.source_ref not in prediction.input_refs:
+            raise ValueError("prediction contribution source is missing from input_refs")
+    calculated_home = prediction.baseline_lambda_home * math.prod(
+        item.lambda_home_multiplier for item in prediction.contribution_multipliers
+    )
+    calculated_away = prediction.baseline_lambda_away * math.prod(
+        item.lambda_away_multiplier for item in prediction.contribution_multipliers
+    )
+    if not math.isclose(calculated_home, prediction.lambda_home, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("prediction home lambda is not reproducible from its composition")
+    if not math.isclose(calculated_away, prediction.lambda_away, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("prediction away lambda is not reproducible from its composition")
+    if prediction.composition_artifact_ref is None:
+        raise ValueError("prediction requires a composition artifact reference")
+    _require_content_ref(prediction.composition_artifact_ref, "composition_artifact_ref")
+
+
+def score_grid_composition_payload(prediction: ScorePrediction) -> dict[str, Any]:
+    """Return the canonical derived payload referenced by a prediction."""
+
+    return _score_grid_composition_payload_from_values(
+        match_id=prediction.match_id,
+        snapshot_id=prediction.snapshot_id,
+        model_run_id=prediction.model_run_id,
+        model_version=prediction.model_version,
+        generated_at=prediction.generated_at,
+        snapshot_as_of=prediction.snapshot_as_of,
+        baseline_lambda_home=prediction.baseline_lambda_home,
+        baseline_lambda_away=prediction.baseline_lambda_away,
+        contribution_keys=prediction.contribution_keys,
+        contribution_multipliers=prediction.contribution_multipliers,
+        composition_version=prediction.composition_version,
+        calibration_versions=prediction.calibration_versions,
+        lambda_home=prediction.lambda_home,
+        lambda_away=prediction.lambda_away,
+        rho=prediction.rho,
+        max_goals=prediction.max_goals,
+        normalization_residual=prediction.normalization_residual,
+        score_cells=prediction.score_cells,
+        input_refs=prediction.input_refs,
+    )
+
+
+def _score_grid_composition_payload_from_values(
+    *,
+    match_id: MatchId,
+    snapshot_id: SnapshotId,
+    model_run_id: ModelRunId,
+    model_version: str,
+    generated_at: datetime,
+    snapshot_as_of: datetime,
+    baseline_lambda_home: float | None,
+    baseline_lambda_away: float | None,
+    contribution_keys: tuple[str, ...],
+    contribution_multipliers: tuple[PredictionContribution, ...],
+    composition_version: str,
+    calibration_versions: tuple[str, ...],
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    max_goals: int,
+    normalization_residual: float,
+    score_cells: tuple[ScoreCell, ...],
+    input_refs: tuple[str, ...],
+) -> dict[str, Any]:
+    contributions = [_prediction_contribution_payload(item) for item in contribution_multipliers]
+    grid = {
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+        "rho": rho,
+        "max_goals": max_goals,
+        "normalization_residual": normalization_residual,
+        "score_cells": [_score_cell_payload(item) for item in score_cells],
+    }
+    return {
+        "schema_version": SCORE_GRID_COMPOSITION_SCHEMA_VERSION,
+        "artifact_type": SCORE_GRID_COMPOSITION_ARTIFACT_TYPE,
+        "match_id": match_id.value,
+        "snapshot_id": snapshot_id.value,
+        "model_run_id": model_run_id.value,
+        "model_version": model_version,
+        "generated_at": _timestamp(generated_at),
+        "snapshot_as_of": _timestamp(snapshot_as_of),
+        "baseline_lambda_home": baseline_lambda_home,
+        "baseline_lambda_away": baseline_lambda_away,
+        "contribution_keys": list(contribution_keys),
+        "contribution_multipliers": contributions,
+        "composition_version": composition_version,
+        "calibration_versions": list(calibration_versions),
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
+        "rho": rho,
+        "max_goals": max_goals,
+        "normalization_residual": normalization_residual,
+        "score_cells": grid["score_cells"],
+        "input_refs": list(input_refs),
+        "grid": grid,
+    }
+
+
+def score_grid_composition_output_ref(payload: dict[str, Any]) -> str:
+    digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+    return f"score-grid-composition:{digest}"
+
+
+def score_grid_composition_artifact_id(payload: dict[str, Any]) -> str:
+    """Return the immutable content reference for a composition payload.
+
+    The reference is deliberately derived from the payload only.  Runtime
+    metadata belongs to the derived manifest and must not change the logical
+    composition identity or force the prediction builder to duplicate storage
+    envelope hashing rules.
+    """
+
+    return score_grid_composition_output_ref(payload)
+
+
+def _prediction_contribution_payload(item: PredictionContribution) -> dict[str, Any]:
+    return {
+        "contribution_key": item.contribution_key,
+        "lambda_home_multiplier": item.lambda_home_multiplier,
+        "lambda_away_multiplier": item.lambda_away_multiplier,
+        "source_ref": item.source_ref,
+        "version": item.version,
+        "calibration": contribution_calibration_payload(item.calibration),
+    }
+
+
+def _verify_prediction_model_run(
+    prediction: ScorePrediction,
+    validator: ModelRunValidator,
+) -> None:
+    try:
+        artifact = validator.load_model_run(prediction.model_run_id.value)
+        verify_model_run_artifact(artifact)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("prediction model run is unavailable or invalid") from error
+    if artifact.model_run_id != prediction.model_run_id.value:
+        raise ValueError("prediction model run validator returned a different model run")
+    if artifact.status is not ModelRunStatus.SUCCEEDED:
+        raise ValueError("formal score prediction requires a successful model run")
+    if artifact.task != "score-model":
+        raise ValueError("prediction model run must target the score-model task")
+    if artifact.model_version != prediction.model_version:
+        raise ValueError("prediction model_version does not match its model run")
+    if artifact.ended_at > prediction.generated_at:
+        raise ValueError("prediction cannot precede its model run completion")
+
+
+def _verify_current_score_projection(
+    prediction: ScorePrediction,
+    validator: ModelRunValidator,
+) -> None:
+    try:
+        artifact = validator.load_model_run(prediction.model_run_id.value)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("prediction model run is unavailable or invalid") from error
+    if artifact.feature_version != CURRENT_SCORE_FEATURE_PROJECTION_VERSION:
+        raise ValueError("formal prediction requires the current score feature projection")
+
+
+def verify_match_result_source(
+    result: MatchResult90,
+    validator: MatchResultValidator,
+) -> None:
+    """Verify one result against an immutable canonical source when configured."""
+
+    try:
+        validator.verify_match_result(result)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("result source evidence is unavailable or invalid") from error
 
 
 def result_probabilities(prediction: ScorePrediction) -> dict[str, float]:
@@ -275,6 +1162,60 @@ def _market_payload(market: MarketView) -> dict[str, Any]:
     }
 
 
+def _market_snapshot_identity(
+    *,
+    schema_version: int,
+    match_id: MatchId,
+    source: str,
+    market_type: str,
+    status: MarketStatus,
+    data_kind: MarketDataKind,
+    observed_at: datetime,
+    quotes: tuple[MarketQuote, ...],
+    raw_asset_ref: str,
+    period: str | None,
+    line: float | None,
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": schema_version,
+        "match_id": match_id.value,
+        "source": source,
+        "market_type": market_type,
+        "status": status.value,
+        "data_kind": data_kind.value,
+        "observed_at": _timestamp(observed_at),
+        "quotes": [
+            {"outcome": quote.outcome, "decimal_odds": quote.decimal_odds} for quote in quotes
+        ],
+        "raw_asset_ref": raw_asset_ref,
+    }
+    if schema_version == MARKET_SNAPSHOT_SCHEMA_VERSION:
+        payload["period"] = period
+        payload["line"] = line
+    return payload
+
+
+def _validate_market_snapshot_line(market_type: str, line: float | None) -> None:
+    result_markets = {"result_90", "result", "1x2"}
+    total_markets = {"total_goals", "totals"}
+    handicap_markets = {"asian_handicap", "handicap", "home_handicap_3way"}
+    if market_type in result_markets:
+        if line is not None:
+            raise ValueError("result_90 market snapshots cannot contain a line")
+        return
+    if market_type not in total_markets | handicap_markets:
+        raise ValueError(f"unsupported formal market_type {market_type!r}")
+    if (
+        not isinstance(line, (int, float))
+        or isinstance(line, bool)
+        or not math.isfinite(line)
+        or abs(line) > MAX_ABSOLUTE_MARKET_LINE
+    ):
+        raise ValueError("line markets require a finite, reasonable line")
+    if market_type in total_markets and line <= 0:
+        raise ValueError("total-goals market lines must be positive")
+
+
 def _score_cell_payload(cell: ScoreCell) -> dict[str, int | float]:
     return {
         "home_goals": cell.home_goals,
@@ -300,3 +1241,11 @@ def _timestamp(value: datetime) -> str:
 def _require_text(value: str, field_name: str) -> None:
     if not value or value.strip() != value:
         raise ValueError(f"{field_name} must be non-empty text without surrounding whitespace")
+
+
+def _require_content_ref(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value.startswith("score-grid-composition:"):
+        raise ValueError(f"{field_name} must be a score-grid-composition reference")
+    digest = value.removeprefix("score-grid-composition:")
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(f"{field_name} must contain a 64-character content digest")

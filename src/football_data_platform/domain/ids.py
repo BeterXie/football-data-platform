@@ -78,4 +78,9 @@ class MarketSnapshotId(PlatformId):
     prefix: ClassVar[str] = "market-snapshot"
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class CollectionAttemptId(PlatformId):
+    prefix: ClassVar[str] = "collection-attempt"
+
+
 EntityId: TypeAlias = CompetitionId | SeasonId | TeamId | PlayerId | MatchId

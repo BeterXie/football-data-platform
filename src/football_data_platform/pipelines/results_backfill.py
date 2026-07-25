@@ -61,29 +61,36 @@ def ingest_results_backfill(
     match_ids: list[str] = []
     result_ids: list[str] = []
     for fixture in parsed.matches:
-        home = canonical.resolve_or_create_team(
+        home_definition = season.team("football-data", fixture.home_source_id)
+        away_definition = season.team("football-data", fixture.away_source_id)
+        home = canonical.resolve_registered_team(
             source="football-data",
             source_id=fixture.home_source_id,
-            canonical_name=fixture.home_name,
+            team_id=home_definition.id,
+            canonical_name=home_definition.name,
+            observed_name=fixture.home_name,
             competition_id=competition.id,
             observed_at=observed_at,
             raw_asset_id=asset.id,
         )
-        away = canonical.resolve_or_create_team(
+        away = canonical.resolve_registered_team(
             source="football-data",
             source_id=fixture.away_source_id,
-            canonical_name=fixture.away_name,
+            team_id=away_definition.id,
+            canonical_name=away_definition.name,
+            observed_name=fixture.away_name,
             competition_id=competition.id,
             observed_at=observed_at,
             raw_asset_id=asset.id,
         )
-        match, version = canonical.resolve_or_create_match(
+        match, version = canonical.resolve_or_create_round_robin_match(
             source="football-data-schedule",
             source_id=fixture.source_fixture_id,
             competition_id=competition.id,
             season_id=season.id,
             home_team_id=home.id,
             away_team_id=away.id,
+            round_name=fixture.round_name,
             kickoff_at=fixture.kickoff_at,
             status=fixture.status,
             observed_at=observed_at,
@@ -106,7 +113,9 @@ def ingest_results_backfill(
     coverage = assess_season_coverage(
         parsed,
         season,
-        attempted_fixture_ids=set(),
+        source="football-data",
+        canonical=canonical,
+        archive=archive,
     )
     return ResultsBackfillResult(
         asset.id.value,

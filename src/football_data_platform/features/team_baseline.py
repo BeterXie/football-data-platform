@@ -11,6 +11,10 @@ from typing import Any
 
 from football_data_platform.domain.models import require_utc
 
+TEAM_BASELINE_SCHEMA_VERSION = 2
+TEAM_BASELINE_COORDINATE_VERSION = "away-mean-neutral/1"
+TEAM_BASELINE_INPUT_TRANSFORM_V3 = "team-baseline-input/3"
+
 
 @dataclass(frozen=True, slots=True)
 class TeamMatchProcess:
@@ -22,6 +26,7 @@ class TeamMatchProcess:
     home_xg: float
     away_xg: float
     source_ref: str
+    source_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         require_utc(self.kickoff_at, "kickoff_at")
@@ -29,6 +34,13 @@ class TeamMatchProcess:
         for name, value in (("home_xg", self.home_xg), ("away_xg", self.away_xg)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        refs = self.source_refs or (self.source_ref,)
+        if (
+            any(not isinstance(ref, str) or not ref or ref.strip() != ref for ref in refs)
+            or len(refs) != len(set(refs))
+            or self.source_ref not in refs
+        ):
+            raise ValueError("team match source refs must be unique canonical text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +64,7 @@ class TeamBaselineArtifact:
     teams: tuple[TeamStrength, ...]
     input_refs: tuple[str, ...]
     quality_status: str
+    coordinate_version: str = TEAM_BASELINE_COORDINATE_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,13 +79,14 @@ def build_team_baseline(
     as_of: datetime,
     half_life_days: float,
     iterations: int,
-    transform_version: str = "team-baseline/1",
+    transform_version: str = "team-baseline/2",
 ) -> BaselineBuildResult:
     """Build a baseline using only observations knowable at ``as_of``."""
 
     require_utc(as_of, "as_of")
     if not math.isfinite(half_life_days) or half_life_days <= 0:
         raise ValueError("half_life_days must be finite and positive")
+    half_life_days = float(half_life_days)
     if iterations < 1:
         raise ValueError("iterations must be positive")
     eligible = tuple(
@@ -82,7 +96,12 @@ def build_team_baseline(
     )
     excluded = tuple(
         sorted(
-            observation.source_ref for observation in observations if observation not in eligible
+            {
+                reference
+                for observation in observations
+                if observation not in eligible
+                for reference in _observation_source_refs(observation)
+            }
         )
     )
     if not eligible:
@@ -93,23 +112,36 @@ def build_team_baseline(
         for observation in eligible
     )
     total_weight = math.fsum(weight for _, weight in weighted_matches)
-    league_xg = math.fsum(
-        weight * (observation.home_xg + observation.away_xg)
-        for observation, weight in weighted_matches
-    ) / (2.0 * total_weight)
-    if league_xg <= 0:
-        raise ValueError("league xG mean must be positive")
     away_xg = math.fsum(weight * observation.away_xg for observation, weight in weighted_matches)
     home_xg = math.fsum(weight * observation.home_xg for observation, weight in weighted_matches)
-    home_advantage = home_xg / away_xg if away_xg > 0 else 1.0
+    # Use the away scoring mean as the neutral coordinate.  Home observations
+    # are venue-adjusted before fitting strengths, and the advantage is applied
+    # exactly once when producing the home lambda.  The previous overall mean
+    # coordinate multiplied by the home ratio a second time.
+    league_xg = away_xg / total_weight
+    if league_xg <= 0:
+        raise ValueError("away league xG mean must be positive")
+    home_advantage = home_xg / away_xg if home_xg > 0 and away_xg > 0 else 1.0
+    if not math.isfinite(home_advantage) or home_advantage <= 0:
+        raise ValueError("home advantage must be finite and positive")
 
     team_observations: dict[str, list[tuple[float, float, str, float]]] = {}
     for observation, weight in weighted_matches:
         team_observations.setdefault(observation.home_team_id, []).append(
-            (observation.home_xg, observation.away_xg, observation.away_team_id, weight)
+            (
+                observation.home_xg / home_advantage,
+                observation.away_xg,
+                observation.away_team_id,
+                weight,
+            )
         )
         team_observations.setdefault(observation.away_team_id, []).append(
-            (observation.away_xg, observation.home_xg, observation.home_team_id, weight)
+            (
+                observation.away_xg,
+                observation.home_xg / home_advantage,
+                observation.home_team_id,
+                weight,
+            )
         )
     attack = dict.fromkeys(team_observations, 1.0)
     defense = dict.fromkeys(team_observations, 1.0)
@@ -144,9 +176,18 @@ def build_team_baseline(
         )
         for team_id in sorted(team_observations)
     )
-    input_refs = tuple(sorted({observation.source_ref for observation in eligible}))
+    input_refs = tuple(
+        sorted(
+            {
+                reference
+                for observation in eligible
+                for reference in _observation_source_refs(observation)
+            }
+        )
+    )
     identity = {
-        "schema_version": 1,
+        "schema_version": TEAM_BASELINE_SCHEMA_VERSION,
+        "coordinate_version": TEAM_BASELINE_COORDINATE_VERSION,
         "as_of": _timestamp(as_of),
         "transform_version": transform_version,
         "half_life_days": half_life_days,
@@ -160,7 +201,7 @@ def build_team_baseline(
     digest = hashlib.sha256(_canonical_json(identity)).hexdigest()
     artifact = TeamBaselineArtifact(
         artifact_id=f"team-baseline:{digest}",
-        schema_version=1,
+        schema_version=TEAM_BASELINE_SCHEMA_VERSION,
         as_of=as_of,
         transform_version=transform_version,
         half_life_days=half_life_days,
@@ -170,8 +211,14 @@ def build_team_baseline(
         teams=teams,
         input_refs=input_refs,
         quality_status="ready",
+        coordinate_version=TEAM_BASELINE_COORDINATE_VERSION,
     )
+    verify_team_baseline_artifact(artifact)
     return BaselineBuildResult(artifact, excluded)
+
+
+def _observation_source_refs(observation: TeamMatchProcess) -> tuple[str, ...]:
+    return observation.source_refs or (observation.source_ref,)
 
 
 def expected_goals_from_baseline(
@@ -180,6 +227,7 @@ def expected_goals_from_baseline(
     home_team_id: str,
     away_team_id: str,
 ) -> tuple[float, float]:
+    verify_team_baseline_artifact(baseline)
     strengths = {team.team_id: team for team in baseline.teams}
     try:
         home = strengths[home_team_id]
@@ -214,3 +262,107 @@ def _canonical_json(value: Any) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def team_baseline_identity(artifact: TeamBaselineArtifact) -> dict[str, Any]:
+    """Return the content that determines a baseline artifact ID."""
+
+    return {
+        "schema_version": artifact.schema_version,
+        "coordinate_version": artifact.coordinate_version,
+        "as_of": _timestamp(artifact.as_of),
+        "transform_version": artifact.transform_version,
+        "half_life_days": artifact.half_life_days,
+        "iterations": artifact.iterations,
+        "league_xg_per_team": artifact.league_xg_per_team,
+        "home_advantage": artifact.home_advantage,
+        "teams": [asdict(team) for team in artifact.teams],
+        "input_refs": list(artifact.input_refs),
+        "quality_status": artifact.quality_status,
+    }
+
+
+def team_baseline_payload(artifact: TeamBaselineArtifact) -> dict[str, Any]:
+    """Return a stable, complete JSON payload for derived storage."""
+
+    verify_team_baseline_artifact(artifact)
+    return {"artifact_id": artifact.artifact_id, **team_baseline_identity(artifact)}
+
+
+def parse_team_baseline_payload(payload: Any) -> TeamBaselineArtifact:
+    """Parse and verify one persisted baseline payload."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("team baseline payload must be an object")
+    try:
+        as_of = datetime.fromisoformat(str(payload["as_of"]).replace("Z", "+00:00"))
+        teams = tuple(TeamStrength(**item) for item in payload["teams"])
+        artifact = TeamBaselineArtifact(
+            artifact_id=str(payload["artifact_id"]),
+            schema_version=int(payload["schema_version"]),
+            as_of=as_of,
+            transform_version=str(payload["transform_version"]),
+            half_life_days=float(payload["half_life_days"]),
+            iterations=int(payload["iterations"]),
+            league_xg_per_team=float(payload["league_xg_per_team"]),
+            home_advantage=float(payload["home_advantage"]),
+            teams=teams,
+            input_refs=tuple(str(item) for item in payload["input_refs"]),
+            quality_status=str(payload["quality_status"]),
+            coordinate_version=str(
+                payload.get("coordinate_version", TEAM_BASELINE_COORDINATE_VERSION)
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid team baseline payload: {error}") from error
+    verify_team_baseline_artifact(artifact)
+    if team_baseline_payload(artifact) != payload:
+        raise ValueError("team baseline payload is not canonical")
+    return artifact
+
+
+def verify_team_baseline_artifact(artifact: TeamBaselineArtifact) -> None:
+    """Verify the immutable identity and quality contract of a baseline."""
+
+    if not isinstance(artifact, TeamBaselineArtifact):
+        raise TypeError("baseline must be a TeamBaselineArtifact")
+    if artifact.schema_version != TEAM_BASELINE_SCHEMA_VERSION:
+        raise ValueError("unsupported team baseline schema version")
+    if artifact.coordinate_version != TEAM_BASELINE_COORDINATE_VERSION:
+        raise ValueError("unsupported team baseline coordinate version")
+    require_utc(artifact.as_of, "baseline as_of")
+    if (
+        not artifact.transform_version
+        or artifact.transform_version.strip() != artifact.transform_version
+    ):
+        raise ValueError("baseline transform_version must be non-empty text")
+    if (
+        not math.isfinite(artifact.half_life_days)
+        or artifact.half_life_days <= 0
+        or artifact.iterations < 1
+        or not math.isfinite(artifact.league_xg_per_team)
+        or artifact.league_xg_per_team <= 0
+        or not math.isfinite(artifact.home_advantage)
+        or artifact.home_advantage <= 0
+    ):
+        raise ValueError("baseline calibration values must be finite and positive")
+    if artifact.quality_status != "ready" or not artifact.teams:
+        raise ValueError("team baseline artifact is not ready")
+    team_ids = [team.team_id for team in artifact.teams]
+    if len(team_ids) != len(set(team_ids)):
+        raise ValueError("team baseline contains duplicate teams")
+    for team in artifact.teams:
+        if (
+            not team.team_id
+            or not math.isfinite(team.attack)
+            or team.attack <= 0
+            or not math.isfinite(team.defense)
+            or team.defense <= 0
+            or team.sample_matches < 1
+        ):
+            raise ValueError("team baseline contains invalid team strength")
+    if not artifact.input_refs or any(not ref or ref.strip() != ref for ref in artifact.input_refs):
+        raise ValueError("team baseline requires input references")
+    digest = hashlib.sha256(_canonical_json(team_baseline_identity(artifact))).hexdigest()
+    if artifact.artifact_id != f"team-baseline:{digest}":
+        raise ValueError("team baseline artifact identity does not match its content")

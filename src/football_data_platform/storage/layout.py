@@ -30,6 +30,18 @@ class DataLayout:
     def derived(self) -> Path:
         return self.root / "derived"
 
+    @property
+    def paper_ledger(self) -> Path:
+        """Derived append-only paper betting ledger root."""
+
+        return self.derived / "paper-ledger"
+
+    @property
+    def paper_betting_ledger(self) -> Path:
+        """Compatibility alias for the paper ledger root."""
+
+        return self.paper_ledger
+
     def ensure(self) -> DataLayout:
         for layer in (self.raw, self.canonical, self.derived):
             layer.mkdir(parents=True, exist_ok=True)

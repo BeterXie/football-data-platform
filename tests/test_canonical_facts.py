@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7,15 +8,23 @@ import pytest
 
 from football_data_platform.config import load_competition_registry
 from football_data_platform.domain.ids import CompetitionId, SeasonId
-from football_data_platform.domain.lifecycle import Qualification, assess_lifecycle
+from football_data_platform.domain.lifecycle import (
+    MatchAvailability,
+    Qualification,
+    assess_lifecycle,
+)
 from football_data_platform.domain.models import MatchStatus
+from football_data_platform.domain.predictions import MatchResult90
+from football_data_platform.sources.prematch import SourceDescriptor, SourceKind, SourceRegistry
 from football_data_platform.storage.canonical import CanonicalStore
-from football_data_platform.storage.facts import CanonicalFactStore
+from football_data_platform.storage.facts import CanonicalFactStore, load_verified_match_result
 from football_data_platform.storage.layout import DataLayout
 from football_data_platform.storage.raw import RawArchive
 
 NOW = datetime(2026, 7, 16, 5, 0, tzinfo=UTC)
 ROOT = Path(__file__).parents[1]
+COMPETITION_ID = CompetitionId("competition:eng.1")
+SEASON_ID = SeasonId("season:eng.1.2025-26")
 
 
 @pytest.fixture
@@ -60,7 +69,15 @@ def fact_context(tmp_path: Path):
         observed_at=NOW,
         raw_asset_id=asset.id,
     )
-    return canonical, CanonicalFactStore(canonical), asset, teams, match, version
+    source_registry = SourceRegistry((SourceDescriptor("fbref", SourceKind.NEWS, "fbref"),))
+    return (
+        canonical,
+        CanonicalFactStore(canonical, source_registry=source_registry),
+        asset,
+        teams,
+        match,
+        version,
+    )
 
 
 def test_result_and_team_observations_are_versioned_and_idempotent(fact_context) -> None:
@@ -91,6 +108,56 @@ def test_result_and_team_observations_are_versioned_and_idempotent(fact_context)
     assert first == replay
     assert first.observation_version == 1
     assert correction.observation_version == 2
+
+
+def test_canonical_result_validator_matches_source_ref_and_payload(fact_context) -> None:
+    _, facts, asset, _, match, version = fact_context
+    stored = facts.append_result_90(
+        match_id=match.id,
+        match_version=version.version,
+        home_goals=2,
+        away_goals=1,
+        known_at=NOW,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    result = MatchResult90(match.id, 2, 1, NOW, stored.record_id)
+
+    facts.verify_match_result(result)
+    with pytest.raises(ValueError, match="canonical fact"):
+        facts.verify_match_result(replace(result, source_ref="canonical:forged"))
+    with pytest.raises(ValueError, match="canonical fact"):
+        facts.verify_match_result(replace(result, home_goals=3))
+
+
+def test_verified_result_rejects_backdated_fact_observation(fact_context) -> None:
+    canonical, facts, asset, _, match, version = fact_context
+    stored = facts.append_result_90(
+        match_id=match.id,
+        match_version=version.version,
+        home_goals=2,
+        away_goals=1,
+        known_at=NOW,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    backdated = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with canonical.connect() as connection:
+        connection.execute(
+            "UPDATE match_results_90 SET observed_at = ? WHERE record_id = ?",
+            (backdated, stored.record_id),
+        )
+        connection.execute(
+            "UPDATE fact_evidence SET observed_at = ? WHERE record_id = ?",
+            (backdated, stored.record_id),
+        )
+
+    with pytest.raises(ValueError, match="observed_at does not match"):
+        load_verified_match_result(
+            stored.record_id,
+            archive=RawArchive(DataLayout(canonical.path.parents[1])),
+            canonical=canonical,
+        )
 
 
 def test_missing_is_preserved_and_readiness_explains_it(fact_context) -> None:
@@ -126,11 +193,44 @@ def test_missing_is_preserved_and_readiness_explains_it(fact_context) -> None:
     assert any(reason.endswith(":xg") for reason in result.reason_codes)
 
 
+def test_team_baseline_rejects_unexpected_team_stats_and_diagnostics() -> None:
+    required = frozenset({"goals", "xg", "shots", "shots_on_target"})
+    availability = MatchAvailability(
+        match_status=MatchStatus.FINISHED,
+        team_ids=("team:home", "team:away"),
+        snapshots=(),
+        result_90_present=True,
+        team_stat_fields={
+            "team:home": required,
+            "team:away": required,
+            "team:third": required,
+        },
+        starters={},
+        player_observation_ids=frozenset(),
+        team_stat_refs={
+            "team:home": "fact:team_match_observations:home",
+            "team:away": "fact:team_match_observations:away",
+            "team:third": "fact:team_match_observations:third",
+        },
+        team_stat_diagnostics={"team:fourth": "typed_team_fact_replay_invalid"},
+    )
+
+    result = next(
+        item
+        for item in assess_lifecycle(availability, evaluated_at=NOW).qualifications
+        if item.qualification is Qualification.TEAM_BASELINE
+    )
+
+    assert not result.passed
+    assert "unexpected_team_stat:team:third" in result.reason_codes
+    assert "typed_team_fact_replay_invalid:team:fourth" in result.reason_codes
+
+
 def test_unconfirmed_event_cannot_modify_features(fact_context) -> None:
     canonical, facts, asset, teams, match, _ = fact_context
     evidence = facts.add_news_evidence(
-        source="club-site",
-        url="https://club.example/news",
+        source="fbref",
+        url="https://fbref.example/report-1",
         title="Training update",
         published_at=NOW - timedelta(hours=2),
         observed_at=NOW,
@@ -167,4 +267,310 @@ def test_fact_observation_cannot_predate_when_it_became_known(fact_context) -> N
             known_at=NOW,
             observed_at=NOW - timedelta(minutes=1),
             raw_asset_id=asset.id,
+        )
+
+
+def test_availability_excludes_facts_known_after_as_of(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    future = NOW + timedelta(hours=1)
+    archive = RawArchive(DataLayout(canonical.path.parent.parent))
+    future_asset = archive.archive(
+        b"future result",
+        source="result-test",
+        source_id="future-result",
+        url="https://result.example/future-result",
+        observed_at=future,
+        target_event_time=future,
+        collector_version="result-test/1",
+        media_type="application/octet-stream",
+    )
+    canonical.register_raw_asset(future_asset)
+    facts.append_result_90(
+        match_id=match.id,
+        match_version=version.version,
+        home_goals=1,
+        away_goals=0,
+        known_at=future,
+        observed_at=future,
+        raw_asset_id=future_asset.id,
+    )
+    facts.append_team_observation(
+        match_id=match.id,
+        match_version=version.version,
+        team_id=teams[0].id,
+        stats={"goals": 1, "xg": 1.2, "shots": 9, "shots_on_target": 4},
+        known_at=future,
+        observed_at=future,
+        raw_asset_id=asset.id,
+    )
+
+    historical = facts.availability(match.id, as_of=NOW)
+    latest = facts.availability(match.id)
+
+    assert not historical.result_90_present
+    assert teams[0].id.value not in historical.team_stat_fields
+    assert historical.as_of == NOW
+    assert latest.result_90_present
+    assert teams[0].id.value not in latest.team_stat_fields
+    assert latest.team_stat_diagnostics == {teams[0].id.value: "typed_team_fact_replay_invalid"}
+
+
+def test_result_requires_a_finished_match_version(fact_context) -> None:
+    canonical, facts, asset, teams, _, _ = fact_context
+    scheduled, version = canonical.resolve_or_create_match(
+        source="fbref-schedule",
+        source_id="scheduled-fixture",
+        competition_id=COMPETITION_ID,
+        season_id=SEASON_ID,
+        home_team_id=teams[0].id,
+        away_team_id=teams[1].id,
+        kickoff_at=NOW + timedelta(days=1),
+        status=MatchStatus.SCHEDULED,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="finished match version"):
+        facts.append_result_90(
+            match_id=scheduled.id,
+            match_version=version.version,
+            home_goals=1,
+            away_goals=0,
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_team_observation_rejects_a_non_participant(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    foreign = canonical.resolve_or_create_team(
+        source="fbref",
+        source_id="foreign-team",
+        canonical_name="Foreign Team",
+        competition_id=COMPETITION_ID,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="does not belong to match"):
+        facts.append_team_observation(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=foreign.id,
+            stats={"goals": 1},
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_player_observation_and_lineup_reject_cross_team_assignment(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="cross-team-player",
+        canonical_name="Cross Team Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    facts.append_player_observation(
+        match_id=match.id,
+        match_version=version.version,
+        team_id=teams[0].id,
+        player_id=player.id,
+        role="FW",
+        minutes=90,
+        metrics={"goals": 1},
+        known_at=NOW,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="already assigned to"):
+        facts.append_player_observation(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[1].id,
+            player_id=player.id,
+            role="FW",
+            minutes=90,
+            metrics={"goals": 1},
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+    with pytest.raises(ValueError, match="already assigned to"):
+        facts.append_lineup_fact(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[1].id,
+            player_id=player.id,
+            lineup_role="starter",
+            official=False,
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_lineup_rejects_a_non_participant_team(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    foreign = canonical.resolve_or_create_team(
+        source="fbref",
+        source_id="foreign-lineup-team",
+        canonical_name="Foreign Lineup Team",
+        competition_id=COMPETITION_ID,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="foreign-lineup-player",
+        canonical_name="Foreign Lineup Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="does not belong to match"):
+        facts.append_lineup_fact(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=foreign.id,
+            player_id=player.id,
+            lineup_role="starter",
+            official=False,
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+
+def test_lineup_fact_rejects_caller_claimed_official_provenance(fact_context) -> None:
+    canonical, facts, asset, teams, match, version = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="forged-official-player",
+        canonical_name="Forged Official Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="append_official_lineup"):
+        facts.append_lineup_fact(
+            match_id=match.id,
+            match_version=version.version,
+            team_id=teams[0].id,
+            player_id=player.id,
+            lineup_role="starter",
+            official=True,
+            known_at=NOW,
+            observed_at=NOW,
+            raw_asset_id=asset.id,
+        )
+
+    with canonical.connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM lineup_facts WHERE player_id = ?",
+                (player.id.value,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_prematch_event_rejects_a_non_participant_team(fact_context) -> None:
+    canonical, facts, asset, teams, match, _ = fact_context
+    foreign = canonical.resolve_or_create_team(
+        source="fbref",
+        source_id="foreign-event-team",
+        canonical_name="Foreign Event Team",
+        competition_id=COMPETITION_ID,
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    evidence = facts.add_news_evidence(
+        source="fbref",
+        url="https://fbref.example/report-1",
+        title="Foreign event",
+        published_at=NOW - timedelta(hours=1),
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="does not belong to match"):
+        facts.add_prematch_event(
+            match_id=match.id,
+            team_id=foreign.id,
+            player_id=None,
+            event_type="injury",
+            occurred_at=None,
+            known_at=NOW,
+            confirmation_status="unconfirmed",
+            evidence_refs=(evidence.record_id,),
+        )
+
+
+def test_prematch_event_rejects_registered_player_without_match_assignment(
+    fact_context,
+) -> None:
+    canonical, facts, asset, _, match, _ = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="unassigned-event-player",
+        canonical_name="Unassigned Event Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    evidence = facts.add_news_evidence(
+        source="fbref",
+        url="https://fbref.example/report-1",
+        title="Unassigned player event",
+        published_at=NOW - timedelta(hours=1),
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="has no assignment for match"):
+        facts.add_prematch_event(
+            match_id=match.id,
+            team_id=None,
+            player_id=player.id,
+            event_type="injury",
+            occurred_at=None,
+            known_at=NOW,
+            confirmation_status="unconfirmed",
+            evidence_refs=(evidence.record_id,),
+        )
+
+
+def test_prematch_event_rejects_team_without_matching_player_assignment(fact_context) -> None:
+    canonical, facts, asset, teams, match, _ = fact_context
+    player = canonical.resolve_or_create_player(
+        source="fbref",
+        source_id="unassigned-team-event-player",
+        canonical_name="Unassigned Team Event Player",
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+    evidence = facts.add_news_evidence(
+        source="fbref",
+        url="https://fbref.example/report-1",
+        title="Unassigned team player event",
+        published_at=NOW - timedelta(hours=1),
+        observed_at=NOW,
+        raw_asset_id=asset.id,
+    )
+
+    with pytest.raises(ValueError, match="has no assignment for match"):
+        facts.add_prematch_event(
+            match_id=match.id,
+            team_id=teams[0].id,
+            player_id=player.id,
+            event_type="injury",
+            occurred_at=None,
+            known_at=NOW,
+            confirmation_status="unconfirmed",
+            evidence_refs=(evidence.record_id,),
         )

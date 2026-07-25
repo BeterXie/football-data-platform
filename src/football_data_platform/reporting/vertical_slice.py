@@ -26,8 +26,19 @@ def render_vertical_slice_report(summary: Mapping[str, Any]) -> str:
         f"`{coverage['expected_matches']}` matches",
         f"- Current evidence: `{coverage['actual_teams']}` teams / "
         f"`{coverage['actual_matches']}` matches",
-        f"- Full-season gate: `{'pass' if coverage['complete'] else 'not-yet-pass'}`",
+        "- Full-season fixture/attempt gate: "
+        f"`{'pass' if coverage['attempt_coverage_complete'] else 'not-yet-pass'}`",
+        "- Full FBref report-success gate: "
+        f"`{'pass' if coverage['report_collection_complete'] else 'not-yet-pass'}`",
         f"- Missing match-report attempts: `{len(coverage['missing_collection_attempts'])}`",
+        "- Attempt identity mismatches: "
+        f"`{len(coverage.get('attempt_identity_mismatch_fixture_ids', ()))}`",
+        f"- Invalid report contracts: `{len(coverage.get('report_contract_diagnostics', ()))}`",
+        "- Attempt states: "
+        + ", ".join(
+            f"`{status}={coverage['fixture_status_counts'].get(status, 0)}`"
+            for status in ("missing", "pending", "blocked", "failed", "succeeded")
+        ),
         f"- Blocking diagnostics: `{', '.join(coverage['blocking_diagnostics']) or 'none'}`",
         "",
         "## Prematch Snapshots",
@@ -40,25 +51,38 @@ def render_vertical_slice_report(summary: Mapping[str, Any]) -> str:
         )
         if snapshot["missing_fields"]:
             lines.append(f"  Missing fields: `{', '.join(snapshot['missing_fields'])}`")
+    lines.extend(["", "## Model", ""])
+    if prediction.get("available") is False:
+        lines.append(f"- Prediction: `unavailable ({prediction['reason']})`")
+        model_gate = summary["training"]["model_gate"]
+        lines.append(f"- Model gate: `fail ({model_gate['reason']})`")
+        lines.append(f"- Failed model run: `{model_gate['model_run_id']}`")
+    else:
+        lines.extend(
+            [
+                f"- Prediction: `{prediction['id']}`",
+                f"- Model: `{prediction['model_version']}`",
+                f"- Expected goals: `{prediction['lambda_home']:.4f}` / "
+                f"`{prediction['lambda_away']:.4f}`",
+                f"- Dixon-Coles rho: `{prediction['rho']:.4f}`",
+                f"- Score-grid residual: `{prediction['normalization_residual']:.3e}`",
+            ]
+        )
+    lines.extend(["", "## Evaluation", ""])
+    if evaluation.get("available") is False:
+        lines.append(f"- Evaluation: `unavailable ({evaluation['reason']})`")
+    else:
+        lines.extend(
+            [
+                f"- Cohort: `{evaluation['capture_mode']}`",
+                f"- Actual result: `{evaluation['actual_score']}`",
+                f"- Result Brier: `{evaluation['result_brier']:.6f}`",
+                f"- Result LogLoss: `{evaluation['result_log_loss']:.6f}`",
+                f"- Exact-score LogLoss: `{evaluation['score_log_loss']:.6f}`",
+            ]
+        )
     lines.extend(
         [
-            "",
-            "## Model",
-            "",
-            f"- Prediction: `{prediction['id']}`",
-            f"- Model: `{prediction['model_version']}`",
-            f"- Expected goals: `{prediction['lambda_home']:.4f}` / "
-            f"`{prediction['lambda_away']:.4f}`",
-            f"- Dixon-Coles rho: `{prediction['rho']:.4f}`",
-            f"- Score-grid residual: `{prediction['normalization_residual']:.3e}`",
-            "",
-            "## Evaluation",
-            "",
-            f"- Cohort: `{evaluation['capture_mode']}`",
-            f"- Actual result: `{evaluation['actual_score']}`",
-            f"- Result Brier: `{evaluation['result_brier']:.6f}`",
-            f"- Result LogLoss: `{evaluation['result_log_loss']:.6f}`",
-            f"- Exact-score LogLoss: `{evaluation['score_log_loss']:.6f}`",
             "- Market benchmark: `unavailable (no real timestamped market snapshot)`",
             "",
             "## Training Readiness",

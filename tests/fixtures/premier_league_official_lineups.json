@@ -1,7 +1,10 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source": "golden-official-lineup-fixture",
-  "schedule_published_at": "2025-06-18T08:00:00Z",
+  "source_match_id": "2025-2026:cff3d9bb:18bb7c10",
+  "match_mapping_source": "fbref-schedule",
+  "team_mapping_source": "fbref",
+  "player_mapping_source": "golden-official-lineup-fixture",
   "published_at": "2025-08-23T12:55:00Z",
   "teams": [
     {

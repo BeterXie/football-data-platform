@@ -35,6 +35,7 @@ class ScheduleMatch:
     home_goals: int | None
     away_goals: int | None
     report_url: str | None
+    fixture_known_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ class ParseDiagnostic:
     message: str
     row_number: int | None = None
     subject_id: str | None = None
+    table_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ class ScheduleParseResult:
     matches: tuple[ScheduleMatch, ...]
     diagnostics: tuple[ParseDiagnostic, ...]
     rows_seen: int
+    fixture_known_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,15 +62,28 @@ class FetchDiagnostic:
     http_status: int | None
     message: str
     observed_at: datetime
+    body: bytes | None = None
 
-    def as_dict(self) -> dict[str, str | int | None]:
-        return {
+    @property
+    def response_body(self) -> bytes | None:
+        """Compatibility alias for callers that describe the response explicitly."""
+
+        return self.body
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
             "code": self.code,
             "url": self.url,
             "http_status": self.http_status,
             "message": self.message,
             "observed_at": self.observed_at.isoformat().replace("+00:00", "Z"),
         }
+        if self.body is not None:
+            # Keep command summaries bounded; callers archive ``body`` itself as raw evidence.
+            payload["body_present"] = True
+            payload["body_size_bytes"] = len(self.body)
+            payload["body_preview"] = self.body[:512].decode("utf-8", errors="replace")
+        return payload
 
 
 class FBrefFetchError(RuntimeError):
@@ -108,6 +124,7 @@ class _ScheduleTableParser(HTMLParser):
         self.current_cell: _Cell | None = None
         self.current_stat: str | None = None
         self.rows: list[dict[str, _Cell]] = []
+        self.fixture_known_at_values: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -115,8 +132,14 @@ class _ScheduleTableParser(HTMLParser):
             table_id = attributes.get("id") or ""
             if table_id.startswith("sched_"):
                 self.in_schedule_table = True
+                fixture_known_at = attributes.get("data-fdp-fixture-known-at")
+                if fixture_known_at:
+                    self.fixture_known_at_values.append(fixture_known_at)
         elif self.in_schedule_table and tag == "tr":
             self.current_row = {}
+            fixture_known_at = attributes.get("data-fdp-fixture-known-at")
+            if fixture_known_at:
+                self.current_row["__fdp_fixture_known_at"] = _Cell(text_parts=[fixture_known_at])
         elif self.in_schedule_table and self.current_row is not None and tag in {"td", "th"}:
             self.current_stat = attributes.get("data-stat")
             self.current_cell = _Cell()
@@ -179,12 +202,14 @@ def fetch_schedule(
             status = getattr(response, "status", 200)
     except urllib.error.HTTPError as error:
         code = "blocked_by_access_control" if error.code in {403, 429} else "http_error"
+        body = _read_http_error_body(error)
         diagnostic = FetchDiagnostic(
             code=code,
             url=url,
             http_status=error.code,
             message=f"FBref request failed with HTTP {error.code}",
             observed_at=observed_at,
+            body=body,
         )
         exception_type = (
             FBrefAccessBlockedError if code == "blocked_by_access_control" else FBrefFetchError
@@ -209,6 +234,7 @@ def fetch_schedule(
                 http_status=status,
                 message="FBref returned an access-control challenge",
                 observed_at=observed_at,
+                body=content,
             )
         )
     return content, observed_at
@@ -232,6 +258,7 @@ def parse_schedule(
                 http_status=None,
                 message="FBref payload contains an access-control challenge",
                 observed_at=datetime.now(UTC),
+                body=html.encode("utf-8"),
             )
         )
 
@@ -247,7 +274,7 @@ def parse_schedule(
     seen_fixture_ids: set[str] = set()
     for row_number, row in enumerate(table_parser.rows, start=1):
         try:
-            match = _parse_row(
+            match, kickoff = _parse_row(
                 row,
                 competition=competition,
                 season=season,
@@ -258,6 +285,15 @@ def parse_schedule(
             continue
         if match is None:
             continue
+        if kickoff is not None and kickoff.diagnostic_code is not None:
+            diagnostics.append(
+                ParseDiagnostic(
+                    kickoff.diagnostic_code,
+                    kickoff.diagnostic_message or "fixture kickoff is unknown",
+                    row_number,
+                    match.source_fixture_id,
+                )
+            )
         if match.source_fixture_id in seen_fixture_ids:
             diagnostics.append(
                 ParseDiagnostic(
@@ -275,7 +311,28 @@ def parse_schedule(
         diagnostics.append(
             ParseDiagnostic("schedule_table_missing", "no FBref schedule table found")
         )
-    return ScheduleParseResult(tuple(matches), tuple(diagnostics), len(table_parser.rows))
+    return ScheduleParseResult(
+        tuple(matches),
+        tuple(diagnostics),
+        len(table_parser.rows),
+        _fixture_known_at(table_parser.fixture_known_at_values),
+    )
+
+
+def _fixture_known_at(values: list[str]) -> datetime | None:
+    """Parse optional replay metadata carried by the bundled schedule fixture."""
+
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise ValueError("schedule fixture has conflicting known-at metadata")
+    try:
+        value = datetime.fromisoformat(values[0].replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("schedule fixture known-at metadata must be an ISO timestamp") from error
+    if value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0:
+        raise ValueError("schedule fixture known-at metadata must use UTC")
+    return value.astimezone(UTC)
 
 
 def _parse_row(
@@ -284,11 +341,11 @@ def _parse_row(
     competition: CompetitionDefinition,
     season: SeasonDefinition,
     page_url: str,
-) -> ScheduleMatch | None:
+) -> tuple[ScheduleMatch | None, _KickoffParse | None]:
     home = row.get("home_team")
     away = row.get("away_team")
     if home is None and away is None:
-        return None
+        return None, None
     if home is None or away is None:
         raise ValueError("fixture has only one team")
     home_source_id = _id_from_href(home.href, _TEAM_ID, "home team")
@@ -297,14 +354,6 @@ def _parse_row(
         raise ValueError("fixture has an empty team name")
 
     round_name = _optional_text(row, "round")
-    source_fixture_id = ":".join(
-        (
-            season.source("fbref").season_id,
-            round_name or "unassigned",
-            home_source_id,
-            away_source_id,
-        )
-    )
     match_report = row.get("match_report")
     report_url = (
         urljoin(page_url, match_report.href)
@@ -316,7 +365,10 @@ def _parse_row(
         if match_report is not None and match_report.href
         else None
     )
-    kickoff_at = _parse_kickoff(row, competition.timezone)
+    source_fixture_id = source_match_id or ":".join(
+        (season.source("fbref").season_id, home_source_id, away_source_id)
+    )
+    kickoff = _parse_kickoff(row, competition.timezone)
     score_text = _optional_text(row, "score")
     home_goals: int | None = None
     away_goals: int | None = None
@@ -328,37 +380,77 @@ def _parse_row(
             status = MatchStatus.FINISHED
         elif "postpon" in score_text.casefold():
             status = MatchStatus.POSTPONED
+        elif "cancel" in score_text.casefold():
+            status = MatchStatus.CANCELLED
         else:
             raise ValueError(f"unrecognized score value {score_text!r}")
 
-    return ScheduleMatch(
-        source_fixture_id=source_fixture_id,
-        source_match_id=source_match_id,
-        round_name=round_name,
-        kickoff_at=kickoff_at,
-        home_source_id=home_source_id,
-        home_name=home.text,
-        away_source_id=away_source_id,
-        away_name=away.text,
-        status=status,
-        home_goals=home_goals,
-        away_goals=away_goals,
-        report_url=report_url,
+    return (
+        ScheduleMatch(
+            source_fixture_id=source_fixture_id,
+            source_match_id=source_match_id,
+            round_name=round_name,
+            kickoff_at=kickoff.value,
+            home_source_id=home_source_id,
+            home_name=home.text,
+            away_source_id=away_source_id,
+            away_name=away.text,
+            status=status,
+            home_goals=home_goals,
+            away_goals=away_goals,
+            report_url=report_url,
+            fixture_known_at=_row_fixture_known_at(row),
+        ),
+        kickoff,
     )
 
 
-def _parse_kickoff(row: dict[str, _Cell], timezone_name: str) -> datetime | None:
+@dataclass(frozen=True, slots=True)
+class _KickoffParse:
+    value: datetime | None
+    diagnostic_code: str | None = None
+    diagnostic_message: str | None = None
+
+
+def _parse_kickoff(row: dict[str, _Cell], timezone_name: str) -> _KickoffParse:
     date_text = _optional_text(row, "date")
     time_text = _optional_text(row, "start_time") or _optional_text(row, "time")
     if not date_text:
-        return None
+        return _KickoffParse(
+            None,
+            "kickoff_missing",
+            "fixture has no date; kickoff is unknown",
+        )
     if not time_text:
-        time_text = "00:00"
+        return _KickoffParse(
+            None,
+            "kickoff_missing",
+            "fixture has no start_time; kickoff is unknown",
+        )
     try:
         local = datetime.strptime(f"{date_text} {time_text[:5]}", "%Y-%m-%d %H:%M")
-    except ValueError as error:
-        raise ValueError(f"invalid kickoff {date_text!r} {time_text!r}") from error
-    return local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC)
+    except ValueError:
+        return _KickoffParse(
+            None,
+            "kickoff_invalid",
+            f"invalid kickoff {date_text!r} {time_text!r}; kickoff is unknown",
+        )
+    return _KickoffParse(local.replace(tzinfo=ZoneInfo(timezone_name)).astimezone(UTC))
+
+
+def _row_fixture_known_at(row: dict[str, _Cell]) -> datetime | None:
+    cell = row.get("__fdp_fixture_known_at")
+    if cell is None:
+        return None
+    return _fixture_known_at([cell.text])
+
+
+def _read_http_error_body(error: urllib.error.HTTPError) -> bytes | None:
+    try:
+        body = error.read()
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, bytes) else None
 
 
 def _id_from_href(href: str | None, pattern: re.Pattern[str], label: str) -> str:
